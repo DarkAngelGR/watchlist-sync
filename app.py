@@ -1,0 +1,894 @@
+#!/usr/bin/env python3
+"""
+watchlist-sync
+--------------
+Sign in with your Plex account in the web UI, point it at Sonarr (and
+optionally Radarr / Bazarr), and it will keep polling the watchlists of you
+and every friend you share the server with:
+  * shows  -> Sonarr (by TVDB id)
+  * movies -> Radarr (by TMDB id)
+  * Bazarr is told to re-sync so new titles appear there for subtitles
+
+Friends' watchlists are read through Plex's community GraphQL API with the
+owner's token; each friend's Plex privacy setting for "Watchlist" must be
+"Friends only" (or wider).
+"""
+import base64
+import hmac
+import json
+import logging
+import os
+import re
+import sqlite3
+import sys
+import threading
+import time
+import uuid
+import xml.etree.ElementTree as ET
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlencode
+
+import requests
+
+log = logging.getLogger("watchlist-sync")
+HERE = os.path.dirname(os.path.abspath(__file__))
+PLEXTV = "https://plex.tv"
+PRODUCT = "watchlist-sync"
+
+
+# --------------------------------------------------------------------------- settings
+def as_bool(v):
+    return v if isinstance(v, bool) else str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+# key: (env var, default, type). Env vars are defaults; anything saved in the UI wins.
+FIELDS = {
+    "plex_token": ("PLEX_TOKEN", "", str),
+    "interval_min": ("SYNC_INTERVAL_MINUTES", 15, int),
+    "include_owner": ("INCLUDE_OWNER", True, bool),
+    "include_friends": ("INCLUDE_FRIENDS", True, bool),
+    "only_server_users": ("ONLY_SERVER_USERS", True, bool),
+    "user_allow": ("USER_ALLOWLIST", "", str),
+    "user_block": ("USER_BLOCKLIST", "", str),
+    "tag_by_user": ("TAG_BY_USER", True, bool),
+    "dry_run": ("DRY_RUN", True, bool),
+    "sonarr_url": ("SONARR_URL", "", str),
+    "sonarr_api_key": ("SONARR_API_KEY", "", str),
+    "sonarr_quality_profile": ("SONARR_QUALITY_PROFILE", "", str),
+    "sonarr_root_folder": ("SONARR_ROOT_FOLDER", "", str),
+    "sonarr_monitor": ("SONARR_MONITOR", "all", str),
+    "sonarr_series_type": ("SONARR_SERIES_TYPE", "standard", str),
+    "sonarr_search": ("SONARR_SEARCH_ON_ADD", True, bool),
+    "radarr_url": ("RADARR_URL", "", str),
+    "radarr_api_key": ("RADARR_API_KEY", "", str),
+    "radarr_quality_profile": ("RADARR_QUALITY_PROFILE", "", str),
+    "radarr_root_folder": ("RADARR_ROOT_FOLDER", "", str),
+    "radarr_min_availability": ("RADARR_MINIMUM_AVAILABILITY", "released", str),
+    "radarr_search": ("RADARR_SEARCH_ON_ADD", True, bool),
+    "bazarr_url": ("BAZARR_URL", "", str),
+    "bazarr_api_key": ("BAZARR_API_KEY", "", str),
+}
+SECRETS = ("plex_token", "sonarr_api_key", "radarr_api_key", "bazarr_api_key")
+
+
+def cast(typ, v):
+    if typ is bool:
+        return as_bool(v)
+    if typ is int:
+        return max(1, int(v))
+    return str(v if v is not None else "").strip()
+
+
+class Settings:
+    def __init__(self, state):
+        self.state = state
+
+    def _saved(self):
+        return json.loads(self.state.get("settings", "{}"))
+
+    def all(self):
+        d = {}
+        for k, (env_name, default, typ) in FIELDS.items():
+            raw = os.environ.get(env_name)
+            d[k] = cast(typ, raw) if raw not in (None, "") else default
+        d.update(self._saved())
+        return d
+
+    def update(self, changes):
+        saved = self._saved()
+        for k, v in changes.items():
+            if k not in FIELDS:
+                continue
+            if k in SECRETS and v in (None, "") and k != "plex_token":
+                continue  # blank secret in the form = keep the existing one
+            saved[k] = cast(FIELDS[k][2], v)
+        self.state.set("settings", json.dumps(saved))
+
+    def public(self):
+        """Settings safe to send to the browser (secrets replaced by 'is set' flags)."""
+        d = self.all()
+        for k in SECRETS:
+            d[k + "_set"] = bool(d.pop(k))
+        return d
+
+
+class ArrConfig:
+    def __init__(self, s, prefix):
+        self.url = s[f"{prefix}_url"]
+        self.api_key = s[f"{prefix}_api_key"]
+        self.quality_profile = s[f"{prefix}_quality_profile"]
+        self.root_folder = s[f"{prefix}_root_folder"]
+        self.search = s[f"{prefix}_search"]
+        self.enabled = bool(self.url and self.api_key)
+
+
+class Config:
+    def __init__(self, s):
+        self.plex_token = s["plex_token"]
+        self.interval_min = s["interval_min"]
+        self.include_owner = s["include_owner"]
+        self.include_friends = s["include_friends"]
+        self.only_server_users = s["only_server_users"]
+        self.user_allow = {x.strip().lower() for x in s["user_allow"].split(",") if x.strip()}
+        self.user_block = {x.strip().lower() for x in s["user_block"].split(",") if x.strip()}
+        self.tag_by_user = s["tag_by_user"]
+        self.dry_run = s["dry_run"]
+        self.sonarr = ArrConfig(s, "sonarr")
+        self.sonarr_monitor = s["sonarr_monitor"]
+        self.sonarr_series_type = s["sonarr_series_type"]
+        self.radarr = ArrConfig(s, "radarr")
+        self.radarr_min_availability = s["radarr_min_availability"]
+        self.bazarr_url = s["bazarr_url"]
+        self.bazarr_key = s["bazarr_api_key"]
+
+
+# --------------------------------------------------------------------------- state
+class State:
+    def __init__(self, path):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        self.db = sqlite3.connect(path, check_same_thread=False)
+        self.lock = threading.Lock()
+        with self.db:
+            self.db.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)")
+            self.db.execute("CREATE TABLE IF NOT EXISTS guid_cache (rating_key TEXT PRIMARY KEY, guids TEXT)")
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS handled (service TEXT, ext_id INTEGER, title TEXT, users TEXT, "
+                "result TEXT, ts INTEGER, PRIMARY KEY (service, ext_id))"
+            )
+
+    def get(self, k, default=None):
+        with self.lock:
+            row = self.db.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone()
+        return row[0] if row else default
+
+    def set(self, k, v):
+        with self.lock, self.db:
+            self.db.execute("INSERT OR REPLACE INTO kv VALUES (?,?)", (k, v))
+
+    def cached_guids(self, rk):
+        with self.lock:
+            row = self.db.execute("SELECT guids FROM guid_cache WHERE rating_key=?", (rk,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def cache_guids(self, rk, guids):
+        with self.lock, self.db:
+            self.db.execute("INSERT OR REPLACE INTO guid_cache VALUES (?,?)", (rk, json.dumps(guids)))
+
+    def is_handled(self, service, ext_id):
+        with self.lock:
+            return self.db.execute(
+                "SELECT 1 FROM handled WHERE service=? AND ext_id=?", (service, ext_id)
+            ).fetchone() is not None
+
+    def mark(self, service, ext_id, title, users, result):
+        with self.lock, self.db:
+            self.db.execute(
+                "INSERT OR REPLACE INTO handled VALUES (?,?,?,?,?,?)",
+                (service, ext_id, title, ",".join(sorted(users)), result, int(time.time())),
+            )
+
+    def forget(self, service, ext_id):
+        with self.lock, self.db:
+            self.db.execute("DELETE FROM handled WHERE service=? AND ext_id=?", (service, ext_id))
+
+    def recent(self, limit=200):
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT service, ext_id, title, users, result, ts FROM handled ORDER BY ts DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(zip(("service", "id", "title", "users", "result", "ts"), r)) for r in rows]
+
+
+# --------------------------------------------------------------------------- http
+def request(session, method, url, retries=4, **kw):
+    """HTTP with backoff on 429/5xx and network errors."""
+    kw.setdefault("timeout", 30)
+    r = None
+    for attempt in range(retries + 1):
+        try:
+            r = session.request(method, url, **kw)
+        except requests.RequestException as e:
+            if attempt == retries:
+                raise
+            log.debug("network error %s %s: %s", method, url, e)
+        else:
+            if r.status_code != 429 and r.status_code < 500:
+                return r
+            if attempt == retries:
+                return r
+            retry_after = r.headers.get("Retry-After")
+            if retry_after and retry_after.isdigit():
+                time.sleep(min(int(retry_after), 60))
+                continue
+        time.sleep(2 ** attempt)
+    return r
+
+
+# --------------------------------------------------------------------------- plex sign-in
+def plex_headers(client_id, token=None):
+    h = {
+        "X-Plex-Client-Identifier": client_id,
+        "X-Plex-Product": PRODUCT,
+        "X-Plex-Version": "1.1",
+        "X-Plex-Device-Name": PRODUCT,
+        "Accept": "application/json",
+    }
+    if token:
+        h["X-Plex-Token"] = token
+    return h
+
+
+def plex_create_pin(client_id):
+    s = requests.Session()
+    r = request(s, "POST", f"{PLEXTV}/api/v2/pins", params={"strong": "true"}, headers=plex_headers(client_id))
+    r.raise_for_status()
+    pin = r.json()
+    url = "https://app.plex.tv/auth#?" + urlencode({
+        "clientID": client_id,
+        "code": pin["code"],
+        "context[device][product]": PRODUCT,
+    })
+    return {"id": pin["id"], "url": url}
+
+
+def plex_check_pin(client_id, pin_id):
+    s = requests.Session()
+    r = request(s, "GET", f"{PLEXTV}/api/v2/pins/{int(pin_id)}", headers=plex_headers(client_id))
+    r.raise_for_status()
+    return r.json().get("authToken")
+
+
+def plex_account(client_id, token):
+    s = requests.Session()
+    r = request(s, "GET", f"{PLEXTV}/api/v2/user", headers=plex_headers(client_id, token))
+    r.raise_for_status()
+    d = r.json()
+    return {"username": d.get("username") or d.get("title") or "owner", "thumb": d.get("thumb")}
+
+
+# --------------------------------------------------------------------------- plex data
+class Plex:
+    DISCOVER = "https://discover.provider.plex.tv"
+    COMMUNITY = "https://community.plex.tv/api"
+
+    WATCHLIST_QUERY = """
+    query GetWatchlistHub($uuid: ID = "", $first: PaginationInt!, $after: String) {
+      user(id: $uuid) {
+        watchlist(first: $first, after: $after) {
+          nodes { id title type }
+          pageInfo { hasNextPage endCursor }
+        }
+      }
+    }"""
+
+    FRIENDS_QUERY = """
+    query GetAllFriends {
+      allFriendsV2 { user { id username } }
+    }"""
+
+    def __init__(self, token, client_id, state):
+        self.state = state
+        self.client_id = client_id
+        self.s = requests.Session()
+        self.s.headers.update(plex_headers(client_id, token))
+
+    def _get_json(self, url, **params):
+        r = request(self.s, "GET", url, params=params)
+        r.raise_for_status()
+        return r.json()
+
+    def _graphql(self, query, variables=None):
+        r = request(self.s, "POST", self.COMMUNITY, json={"query": query, "variables": variables or {}})
+        r.raise_for_status()
+        body = r.json()
+        if body.get("errors"):
+            raise RuntimeError(f"Plex GraphQL error: {body['errors']}")
+        return body["data"]
+
+    def ping(self):
+        try:
+            request(self.s, "GET", f"{PLEXTV}/api/v2/ping")
+        except requests.RequestException:
+            pass
+
+    def owner_name(self):
+        data = self._get_json(f"{PLEXTV}/api/v2/user")
+        return data.get("username") or data.get("title") or "owner"
+
+    def own_watchlist(self):
+        start, size = 0, 100
+        while True:
+            mc = self._get_json(
+                f"{self.DISCOVER}/library/sections/watchlist/all",
+                **{"X-Plex-Container-Start": start, "X-Plex-Container-Size": size},
+            ).get("MediaContainer", {})
+            for m in mc.get("Metadata", []) or []:
+                yield str(m["ratingKey"]), m.get("title", "?"), m.get("type", "").lower()
+            start += size
+            if start >= int(mc.get("totalSize", 0)):
+                break
+
+    def friends(self):
+        data = self._graphql(self.FRIENDS_QUERY)
+        return [f["user"] for f in data.get("allFriendsV2", []) if f.get("user")]
+
+    def friend_watchlist(self, user_uuid):
+        after = None
+        while True:
+            variables = {"uuid": user_uuid, "first": 100}
+            if after:
+                variables["after"] = after
+            wl = self._graphql(self.WATCHLIST_QUERY, variables)["user"]["watchlist"]
+            for n in wl.get("nodes", []):
+                yield str(n["id"]), n.get("title", "?"), n.get("type", "").lower()
+            info = wl.get("pageInfo", {})
+            if not (info.get("hasNextPage") and info.get("endCursor")):
+                break
+            after = info["endCursor"]
+
+    def server_usernames(self):
+        """Usernames/titles of everyone the owner shares a server with."""
+        r = request(self.s, "GET", f"{PLEXTV}/api/users", headers={"Accept": "application/xml"})
+        r.raise_for_status()
+        names = set()
+        for u in ET.fromstring(r.content).iter("User"):
+            for attr in ("username", "title"):
+                if u.get(attr):
+                    names.add(u.get(attr).lower())
+        return names
+
+    def guids(self, rating_key):
+        cached = self.state.cached_guids(rating_key)
+        if cached is not None:
+            return cached
+        mc = self._get_json(f"{self.DISCOVER}/library/metadata/{rating_key}", includeGuids=1)
+        meta = (mc.get("MediaContainer", {}).get("Metadata") or [{}])[0]
+        guids = {}
+        for g in meta.get("Guid", []) or []:
+            m = re.match(r"(tvdb|tmdb|imdb)://(.+)", g.get("id", ""))
+            if m:
+                guids[m.group(1)] = m.group(2)
+        if guids:
+            self.state.cache_guids(rating_key, guids)
+        return guids
+
+
+# --------------------------------------------------------------------------- *arr
+def tag_label(username):
+    return "plex-" + (re.sub(r"[^a-z0-9]+", "-", username.lower()).strip("-") or "user")
+
+
+class ArrError(Exception):
+    def __init__(self, status, text):
+        super().__init__(f"HTTP {status}: {text}")
+        self.status = status
+        self.text = text
+
+    @property
+    def already_exists(self):
+        t = self.text.lower()
+        return "already been added" in t or "already exists" in t
+
+
+class Arr:
+    def __init__(self, name, cfg):
+        self.name = name
+        self.cfg = cfg
+        self.base = cfg.url.rstrip("/") + "/api/v3"
+        self.s = requests.Session()
+        self.s.headers.update({"X-Api-Key": cfg.api_key})
+        self._tags = None
+
+    def get(self, path, **params):
+        r = request(self.s, "GET", self.base + path, params=params, retries=1)
+        r.raise_for_status()
+        return r.json()
+
+    def post(self, path, body):
+        r = request(self.s, "POST", self.base + path, json=body, timeout=60)
+        if r.status_code >= 400:
+            raise ArrError(r.status_code, r.text[:500])
+        return r.json()
+
+    def quality_profile_id(self):
+        profiles = self.get("/qualityprofile")
+        want = self.cfg.quality_profile
+        if not profiles:
+            raise RuntimeError(f"{self.name}: no quality profiles found")
+        if want:
+            for p in profiles:
+                if str(p["id"]) == want or p["name"].lower() == want.lower():
+                    return p["id"]
+            raise RuntimeError(f"{self.name}: quality profile '{want}' not found "
+                               f"(have: {', '.join(p['name'] for p in profiles)})")
+        return profiles[0]["id"]
+
+    def root_folder(self):
+        paths = [f["path"] for f in self.get("/rootfolder")]
+        if not paths:
+            raise RuntimeError(f"{self.name}: no root folders configured")
+        want = self.cfg.root_folder
+        if want:
+            for p in paths:
+                if p.rstrip("/") == want.rstrip("/"):
+                    return p
+            raise RuntimeError(f"{self.name}: root folder '{want}' not found (have: {', '.join(paths)})")
+        return paths[0]
+
+    def tag_ids(self, usernames):
+        if self._tags is None:
+            self._tags = {t["label"].lower(): t["id"] for t in self.get("/tag")}
+        ids = []
+        for u in sorted(usernames):
+            label = tag_label(u)
+            if label not in self._tags:
+                self._tags[label] = self.post("/tag", {"label": label})["id"]
+            ids.append(self._tags[label])
+        return ids
+
+    def probe(self):
+        """Used by the UI's Test button: version + choices for the dropdowns."""
+        status = self.get("/system/status")
+        return {
+            "version": status.get("version"),
+            "profiles": [{"id": p["id"], "name": p["name"]} for p in self.get("/qualityprofile")],
+            "roots": [f["path"] for f in self.get("/rootfolder")],
+        }
+
+
+def bazarr_probe(url, key):
+    r = requests.get(url.rstrip("/") + "/api/system/status", headers={"X-API-KEY": key}, timeout=15)
+    r.raise_for_status()
+    data = r.json().get("data", {})
+    return {"version": data.get("bazarr_version")}
+
+
+# --------------------------------------------------------------------------- sync
+class Syncer:
+    def __init__(self, data_dir):
+        self.state = State(os.path.join(data_dir, "watchlist-sync.db"))
+        self.settings = Settings(self.state)
+        self.client_id = self.state.get("client_id")
+        if not self.client_id:
+            self.client_id = f"{PRODUCT}-{uuid.uuid4()}"
+            self.state.set("client_id", self.client_id)
+        self.last_run = {}
+        self.users = []
+        self.running = False
+        self._last_ping = 0
+        self.wake = threading.Event()
+        self.cfg = None
+
+    # -- setup helpers
+    def build(self):
+        cfg = Config(self.settings.all())
+        self.cfg = cfg
+        self.plex = Plex(cfg.plex_token, self.client_id, self.state)
+        self.sonarr = Arr("Sonarr", cfg.sonarr) if cfg.sonarr.enabled else None
+        self.radarr = Arr("Radarr", cfg.radarr) if cfg.radarr.enabled else None
+        return cfg
+
+    def setup_problem(self, cfg):
+        if not cfg.plex_token:
+            return "Sign in with Plex to start syncing."
+        if not (cfg.sonarr.enabled or cfg.radarr.enabled):
+            return "Add Sonarr (or Radarr) in Settings to start syncing."
+        return None
+
+    def user_ok(self, name):
+        n = name.lower()
+        if self.cfg.user_allow and n not in self.cfg.user_allow:
+            return False
+        return n not in self.cfg.user_block
+
+    # -- step 1: gather every watchlisted item and who wants it
+    def collect(self):
+        items = {}  # rating_key -> {"title", "type", "users": set}
+        users = []
+
+        def add(rk, title, typ, user):
+            it = items.setdefault(rk, {"title": title, "type": typ, "users": set()})
+            it["users"].add(user)
+
+        owner = self.plex.owner_name()
+        if self.cfg.include_owner:
+            if self.user_ok(owner):
+                n = 0
+                for rk, title, typ in self.plex.own_watchlist():
+                    add(rk, title, typ, owner)
+                    n += 1
+                users.append({"name": owner, "role": "owner", "items": n, "status": "ok"})
+                log.info("Owner %s: %d watchlist items", owner, n)
+            else:
+                users.append({"name": owner, "role": "owner", "items": None, "status": "excluded"})
+
+        if self.cfg.include_friends:
+            friends = self.plex.friends()
+            allowed = self.plex.server_usernames() if self.cfg.only_server_users else None
+            for f in friends:
+                name = f["username"]
+                if allowed is not None and name.lower() not in allowed:
+                    continue
+                if not self.user_ok(name):
+                    users.append({"name": name, "role": "friend", "items": None, "status": "excluded"})
+                    continue
+                try:
+                    n = 0
+                    for rk, title, typ in self.plex.friend_watchlist(f["id"]):
+                        add(rk, title, typ, name)
+                        n += 1
+                    users.append({"name": name, "role": "friend", "items": n, "status": "ok"})
+                    log.info("Friend %s: %d watchlist items", name, n)
+                except Exception as e:  # private watchlist etc.
+                    users.append({"name": name, "role": "friend", "items": None, "status": "private"})
+                    log.warning("Could not read %s's watchlist (is their Watchlist visibility "
+                                "set to Friends?): %s", name, e)
+        self.users = users
+        return items
+
+    # -- step 2: push to Sonarr / Radarr
+    def run_once(self):
+        cfg = self.build()
+        problem = self.setup_problem(cfg)
+        if problem:
+            self.last_run = {"skipped": problem}
+            log.info("Not syncing yet: %s", problem)
+            return self.last_run
+
+        self.running = True
+        t0 = time.time()
+        summary = {"started": int(t0), "added_series": [], "added_movies": [], "errors": [],
+                   "dry_run": cfg.dry_run}
+        try:
+            if time.time() - self._last_ping > 86400:  # keeps the Plex token from expiring
+                self.plex.ping()
+                self._last_ping = time.time()
+
+            items = self.collect()
+            shows = {k: v for k, v in items.items() if v["type"] == "show"}
+            movies = {k: v for k, v in items.items() if v["type"] == "movie"}
+            summary["shows"], summary["movies"] = len(shows), len(movies)
+            log.info("Collected %d shows and %d movies across all watchlists", len(shows), len(movies))
+
+            if self.sonarr and shows:
+                self._sync_sonarr(shows, summary)
+            if self.radarr and movies:
+                self._sync_radarr(movies, summary)
+            self._nudge_bazarr(summary)
+        except Exception as e:
+            log.exception("Sync cycle failed")
+            summary["errors"].append(str(e))
+        finally:
+            self.running = False
+
+        summary["duration_s"] = round(time.time() - t0, 1)
+        self.last_run = summary
+        log.info("Cycle done in %ss: +%d series, +%d movies, %d errors", summary["duration_s"],
+                 len(summary["added_series"]), len(summary["added_movies"]), len(summary["errors"]))
+        return summary
+
+    def _group_by(self, items, id_type, summary):
+        """Merge watchlist entries that point at the same TVDB/TMDB id."""
+        grouped = {}
+        for rk, it in items.items():
+            try:
+                ext = self.plex.guids(rk).get(id_type)
+            except Exception as e:
+                log.error("Plex metadata lookup failed for '%s': %s", it["title"], e)
+                summary["errors"].append(f"plex:{it['title']}: {e}")
+                continue
+            if not ext:
+                log.debug("No %s id for '%s', skipping", id_type.upper(), it["title"])
+                continue
+            g = grouped.setdefault(int(ext), {"title": it["title"], "users": set()})
+            g["users"] |= it["users"]
+        return grouped
+
+    def _sync_sonarr(self, shows, summary):
+        s = self.sonarr
+        profile_id = s.quality_profile_id()
+        root = s.root_folder()
+        existing = {x.get("tvdbId") for x in s.get("/series")}
+        lang_profile = None
+        try:  # Sonarr v3 needs a language profile; v4 ignores it
+            lp = s.get("/languageprofile")
+            lang_profile = lp[0]["id"] if lp else None
+        except Exception:
+            pass
+
+        grouped = self._group_by(shows, "tvdb", summary)
+        summary["shows"] = len(grouped)
+        for tvdb, it in grouped.items():
+            title = it["title"]
+            try:
+                if self.state.is_handled("sonarr", tvdb):
+                    continue
+                if tvdb in existing:
+                    self.state.mark("sonarr", tvdb, title, it["users"], "already-present")
+                    continue
+                found = s.get("/series/lookup", term=f"tvdb:{tvdb}")
+                if not found:
+                    log.warning("Sonarr lookup found nothing for '%s' (tvdb:%s)", title, tvdb)
+                    continue
+                body = dict(found[0])
+                body.update({
+                    "qualityProfileId": profile_id,
+                    "rootFolderPath": root,
+                    "monitored": True,
+                    "seasonFolder": True,
+                    "seriesType": self.cfg.sonarr_series_type,
+                    "tags": s.tag_ids(it["users"]) if self.cfg.tag_by_user else [],
+                    "addOptions": {
+                        "monitor": self.cfg.sonarr_monitor,
+                        "searchForMissingEpisodes": self.cfg.sonarr.search,
+                        "searchForCutoffUnmetEpisodes": False,
+                    },
+                })
+                if lang_profile:
+                    body["languageProfileId"] = lang_profile
+                who = ", ".join(sorted(it["users"]))
+                if self.cfg.dry_run:
+                    log.info("[dry-run] would add series '%s' (tvdb:%s) for %s", title, tvdb, who)
+                    summary["added_series"].append(title)
+                    continue
+                try:
+                    s.post("/series", body)
+                except ArrError as e:
+                    if e.already_exists:
+                        self.state.mark("sonarr", tvdb, title, it["users"], "already-present")
+                        continue
+                    raise
+                self.state.mark("sonarr", tvdb, title, it["users"], "added")
+                existing.add(tvdb)
+                summary["added_series"].append(title)
+                log.info("Added series '%s' (tvdb:%s) requested by %s", title, tvdb, who)
+            except Exception as e:
+                log.error("Sonarr: failed on '%s': %s", title, e)
+                summary["errors"].append(f"sonarr:{title}: {e}")
+
+    def _sync_radarr(self, movies, summary):
+        r = self.radarr
+        profile_id = r.quality_profile_id()
+        root = r.root_folder()
+        existing = {x.get("tmdbId") for x in r.get("/movie")}
+
+        grouped = self._group_by(movies, "tmdb", summary)
+        summary["movies"] = len(grouped)
+        for tmdb, it in grouped.items():
+            title = it["title"]
+            try:
+                if self.state.is_handled("radarr", tmdb):
+                    continue
+                if tmdb in existing:
+                    self.state.mark("radarr", tmdb, title, it["users"], "already-present")
+                    continue
+                movie = r.get("/movie/lookup/tmdb", tmdbId=tmdb)
+                if isinstance(movie, list):
+                    movie = movie[0] if movie else None
+                if not movie:
+                    log.warning("Radarr lookup found nothing for '%s' (tmdb:%s)", title, tmdb)
+                    continue
+                body = dict(movie)
+                body.update({
+                    "qualityProfileId": profile_id,
+                    "rootFolderPath": root,
+                    "monitored": True,
+                    "minimumAvailability": self.cfg.radarr_min_availability,
+                    "tags": r.tag_ids(it["users"]) if self.cfg.tag_by_user else [],
+                    "addOptions": {"searchForMovie": self.cfg.radarr.search, "monitor": "movieOnly"},
+                })
+                who = ", ".join(sorted(it["users"]))
+                if self.cfg.dry_run:
+                    log.info("[dry-run] would add movie '%s' (tmdb:%s) for %s", title, tmdb, who)
+                    summary["added_movies"].append(title)
+                    continue
+                try:
+                    r.post("/movie", body)
+                except ArrError as e:
+                    if e.already_exists:
+                        self.state.mark("radarr", tmdb, title, it["users"], "already-present")
+                        continue
+                    raise
+                self.state.mark("radarr", tmdb, title, it["users"], "added")
+                existing.add(tmdb)
+                summary["added_movies"].append(title)
+                log.info("Added movie '%s' (tmdb:%s) requested by %s", title, tmdb, who)
+            except Exception as e:
+                log.error("Radarr: failed on '%s': %s", title, e)
+                summary["errors"].append(f"radarr:{title}: {e}")
+
+    def _nudge_bazarr(self, summary):
+        """Make Bazarr pick up the new series/movies now instead of on its next sync."""
+        if not (self.cfg.bazarr_url and self.cfg.bazarr_key) or self.cfg.dry_run:
+            return
+        tasks = []
+        if summary["added_series"]:
+            tasks.append("update_series")
+        if summary["added_movies"]:
+            tasks.append("update_movies")
+        url = self.cfg.bazarr_url.rstrip("/") + "/api/system/tasks"
+        for task in tasks:
+            try:
+                r = requests.post(url, params={"taskid": task},
+                                  headers={"X-API-KEY": self.cfg.bazarr_key}, timeout=30)
+                r.raise_for_status()
+                log.info("Bazarr: triggered %s", task)
+            except Exception as e:
+                log.warning("Bazarr: could not trigger %s: %s", task, e)
+                summary["errors"].append(f"bazarr:{task}: {e}")
+
+
+# --------------------------------------------------------------------------- web ui / api
+def make_handler(syncer, ui_password):
+    with open(os.path.join(HERE, "ui.html"), "rb") as f:
+        page = f.read()
+
+    class H(BaseHTTPRequestHandler):
+        def _send(self, code, obj=None, raw=None, ctype="application/json"):
+            body = raw if raw is not None else json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _authed(self):
+            if not ui_password or self.path.startswith("/health"):
+                return True
+            hdr = self.headers.get("Authorization", "")
+            if hdr.startswith("Basic "):
+                try:
+                    _, pw = base64.b64decode(hdr[6:]).decode().split(":", 1)
+                    if hmac.compare_digest(pw, ui_password):
+                        return True
+                except Exception:
+                    pass
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="watchlist-sync"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return False
+
+        def _body(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            return json.loads(self.rfile.read(n) or b"{}") if n else {}
+
+        def do_GET(self):
+            if not self._authed():
+                return
+            p = self.path.split("?")[0]
+            if p == "/health":
+                return self._send(200, {"ok": True})
+            if p == "/":
+                return self._send(200, raw=page, ctype="text/html; charset=utf-8")
+            if p == "/api/status":
+                cfg = Config(syncer.settings.all())
+                return self._send(200, {
+                    "account": json.loads(syncer.state.get("plex_account", "null")),
+                    "problem": syncer.setup_problem(cfg),
+                    "running": syncer.running,
+                    "interval_min": cfg.interval_min,
+                    "dry_run": cfg.dry_run,
+                    "last_run": syncer.last_run,
+                    "users": syncer.users,
+                    "recent": syncer.state.recent(),
+                })
+            if p == "/api/settings":
+                return self._send(200, syncer.settings.public())
+            m = re.fullmatch(r"/api/plex/pin/(\d+)", p)
+            if m:
+                try:
+                    token = plex_check_pin(syncer.client_id, m.group(1))
+                except Exception as e:
+                    return self._send(502, {"error": str(e)})
+                if not token:
+                    return self._send(200, {"done": False})
+                acct = plex_account(syncer.client_id, token)
+                syncer.settings.update({"plex_token": token})
+                syncer.state.set("plex_account", json.dumps(acct))
+                log.info("Signed in to Plex as %s", acct["username"])
+                syncer.wake.set()
+                return self._send(200, {"done": True, "account": acct})
+            self._send(404, {"error": "not found"})
+
+        def do_POST(self):
+            if not self._authed():
+                return
+            p = self.path.split("?")[0]
+            try:
+                body = self._body()
+            except ValueError:
+                return self._send(400, {"error": "bad json"})
+            if p in ("/sync", "/api/sync"):
+                syncer.wake.set()
+                return self._send(202, {"queued": True})
+            if p == "/api/plex/pin":
+                try:
+                    return self._send(200, plex_create_pin(syncer.client_id))
+                except Exception as e:
+                    return self._send(502, {"error": f"Could not reach plex.tv: {e}"})
+            if p == "/api/plex/logout":
+                syncer.settings.update({"plex_token": ""})
+                syncer.state.set("plex_account", "null")
+                syncer.users = []
+                return self._send(200, {"ok": True})
+            if p == "/api/settings":
+                body.pop("plex_token", None)  # only the sign-in flow sets this
+                syncer.settings.update(body)
+                syncer.wake.set()
+                return self._send(200, syncer.settings.public())
+            m = re.fullmatch(r"/api/test/(sonarr|radarr|bazarr)", p)
+            if m:
+                svc = m.group(1)
+                cur = syncer.settings.all()
+                url = (body.get("url") or cur[f"{svc}_url"]).strip()
+                key = (body.get("api_key") or cur[f"{svc}_api_key"]).strip()
+                if not (url and key):
+                    return self._send(400, {"error": "URL and API key are required"})
+                try:
+                    if svc == "bazarr":
+                        info = bazarr_probe(url, key)
+                    else:
+                        fake = type("C", (), {"url": url, "api_key": key, "quality_profile": "", "root_folder": ""})
+                        info = Arr(svc.title(), fake).probe()
+                    return self._send(200, {"ok": True, **info})
+                except Exception as e:
+                    return self._send(200, {"ok": False, "error": str(e)})
+            self._send(404, {"error": "not found"})
+
+        def log_message(self, *a):
+            pass
+
+    return H
+
+
+# --------------------------------------------------------------------------- main
+def main():
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)-7s %(message)s",
+    )
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+    syncer = Syncer(os.environ.get("DATA_DIR", "/data"))
+    port = int(os.environ.get("PORT", os.environ.get("STATUS_PORT", "8789")))
+    srv = ThreadingHTTPServer(("0.0.0.0", port), make_handler(syncer, os.environ.get("UI_PASSWORD", "")))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    log.info("Web UI on http://<this-host>:%d", port)
+
+    once = "--once" in sys.argv
+    while True:
+        try:
+            syncer.run_once()
+        except Exception:
+            log.exception("Sync cycle failed")
+        if once:
+            break
+        interval = syncer.cfg.interval_min if syncer.cfg else 15
+        syncer.wake.wait(interval * 60)
+        syncer.wake.clear()
+
+
+if __name__ == "__main__":
+    main()
