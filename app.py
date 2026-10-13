@@ -26,7 +26,7 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlencode
+from urllib.parse import unquote, urlencode
 
 import requests
 
@@ -155,6 +155,11 @@ class State:
                 "CREATE TABLE IF NOT EXISTS handled (service TEXT, ext_id INTEGER, title TEXT, users TEXT, "
                 "result TEXT, ts INTEGER, PRIMARY KEY (service, ext_id))"
             )
+            # who has each title on their watchlist right now (refreshed every sync)
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS wants (service TEXT, ext_id INTEGER, user TEXT, "
+                "PRIMARY KEY (service, ext_id, user))"
+            )
 
     def get(self, k, default=None):
         with self.lock:
@@ -186,6 +191,27 @@ class State:
                 "INSERT OR REPLACE INTO handled VALUES (?,?,?,?,?,?)",
                 (service, ext_id, title, ",".join(sorted(users)), result, int(time.time())),
             )
+
+    def set_wants(self, service, grouped):
+        with self.lock, self.db:
+            self.db.execute("DELETE FROM wants WHERE service=?", (service,))
+            self.db.executemany(
+                "INSERT OR IGNORE INTO wants VALUES (?,?,?)",
+                [(service, ext_id, u.lower()) for ext_id, it in grouped.items() for u in it["users"]],
+            )
+
+    def wanters(self, service, ext_id):
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT user FROM wants WHERE service=? AND ext_id=?", (service, ext_id)).fetchall()
+        return {r[0] for r in rows}
+
+    def added_rows(self):
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT service, ext_id, title, users FROM handled WHERE result='added'").fetchall()
+        return [{"service": s, "id": i, "title": t, "users": {x.lower() for x in (u or "").split(",") if x}}
+                for s, i, t, u in rows]
 
     def forget(self, service, ext_id):
         with self.lock, self.db:
@@ -446,6 +472,34 @@ class Arr:
             ids.append(self._tags[label])
         return ids
 
+    def find(self, ext_id):
+        """Return the series/movie object in Sonarr/Radarr for a TVDB/TMDB id, or None."""
+        key, path = ("tvdbId", "/series") if self.name == "Sonarr" else ("tmdbId", "/movie")
+        for x in self.get(path):
+            if x.get(key) == ext_id:
+                return x
+        return None
+
+    def delete(self, obj):
+        path = "/series" if self.name == "Sonarr" else "/movie"
+        excl = "addImportListExclusion" if self.name == "Sonarr" else "addImportExclusion"
+        r = request(self.s, "DELETE", f"{self.base}{path}/{obj['id']}",
+                    params={"deleteFiles": "true", excl: "false"}, timeout=120)
+        if r.status_code >= 400:
+            raise ArrError(r.status_code, r.text[:500])
+
+    def remove_tag(self, obj, username):
+        tags = {t["label"].lower(): t["id"] for t in self.get("/tag")}
+        tid = tags.get(tag_label(username))
+        if tid is None or tid not in obj.get("tags", []):
+            return
+        path = "/series" if self.name == "Sonarr" else "/movie"
+        body = dict(obj)
+        body["tags"] = [t for t in obj["tags"] if t != tid]
+        r = request(self.s, "PUT", f"{self.base}{path}/{obj['id']}", json=body, timeout=60)
+        if r.status_code >= 400:
+            raise ArrError(r.status_code, r.text[:500])
+
     def probe(self):
         """Used by the UI's Test button: version + choices for the dropdowns."""
         status = self.get("/system/status")
@@ -478,6 +532,8 @@ class Syncer:
         self._last_ping = 0
         self.wake = threading.Event()
         self.cfg = None
+        self.lock = threading.Lock()      # one sync or exclusion at a time
+        self.action = None                # progress/result of the last exclude, shown in the UI
 
     # -- setup helpers
     def build(self):
@@ -548,6 +604,10 @@ class Syncer:
 
     # -- step 2: push to Sonarr / Radarr
     def run_once(self):
+        with self.lock:
+            return self._run_once()
+
+    def _run_once(self):
         cfg = self.build()
         problem = self.setup_problem(cfg)
         if problem:
@@ -587,6 +647,94 @@ class Syncer:
                  len(summary["added_series"]), len(summary["added_movies"]), len(summary["errors"]))
         return summary
 
+    # -- excluding a user
+    def deletion_plan(self, username):
+        """What excluding `username` would delete vs keep.
+
+        Only titles watchlist-sync itself added are considered. A title is kept if any
+        other user who isn't excluded requested it or still has it on their watchlist."""
+        user = username.lower()
+        cfg = Config(self.settings.all())
+        excluded = cfg.user_block | {user}
+        delete, keep = [], []
+        for row in self.state.added_rows():
+            wanted_now = self.state.wanters(row["service"], row["id"])
+            if user not in row["users"] | wanted_now:
+                continue
+            others = sorted((row["users"] | wanted_now) - excluded)
+            if cfg.user_allow:
+                others = [o for o in others if o in cfg.user_allow]
+            item = {"service": row["service"], "id": row["id"], "title": row["title"], "others": others}
+            (keep if others else delete).append(item)
+        key = lambda x: x["title"].lower()
+        return {"user": username, "delete": sorted(delete, key=key), "keep": sorted(keep, key=key),
+                "dry_run": cfg.dry_run}
+
+    def _set_blocked(self, username, blocked):
+        cur = [x.strip() for x in self.settings.all()["user_block"].split(",") if x.strip()]
+        cur = [x for x in cur if x.lower() != username.lower()]
+        if blocked:
+            cur.append(username)
+        self.settings.update({"user_block": ", ".join(cur)})
+        for u in self.users:
+            if u["name"].lower() == username.lower():
+                u["status"] = "excluded" if blocked else "ok"
+                if blocked:
+                    u["items"] = None
+
+    def include_user(self, username):
+        self._set_blocked(username, False)
+        self.wake.set()
+
+    def exclude_user(self, username, delete_media):
+        """Block the user now; delete their media in the background."""
+        plan = self.deletion_plan(username)
+        self._set_blocked(username, True)
+        self.action = {"user": username, "state": "running", "deleted": [], "untagged": [], "errors": [],
+                       "total": len(plan["delete"]) if delete_media else 0}
+        threading.Thread(target=self._do_exclude, args=(username, plan, delete_media), daemon=True).start()
+        return plan
+
+    def _do_exclude(self, username, plan, delete_media):
+        act = self.action
+        with self.lock:
+            try:
+                cfg = self.build()
+                arrs = {"sonarr": self.sonarr, "radarr": self.radarr}
+                log.info("Excluded %s", username)
+                if delete_media:
+                    for it in plan["delete"]:
+                        arr = arrs.get(it["service"])
+                        try:
+                            if cfg.dry_run:
+                                log.info("[dry-run] would delete '%s' and its files", it["title"])
+                                act["deleted"].append(it["title"])
+                                continue
+                            if not arr:
+                                raise RuntimeError(f"{it['service'].title()} isn't configured")
+                            obj = arr.find(it["id"])
+                            if obj:
+                                arr.delete(obj)
+                            self.state.forget(it["service"], it["id"])
+                            act["deleted"].append(it["title"])
+                            log.info("Deleted '%s' and its files (requested by %s)", it["title"], username)
+                        except Exception as e:
+                            act["errors"].append(f"{it['title']}: {e}")
+                            log.error("Could not delete '%s': %s", it["title"], e)
+                # titles other people still want: just drop this user's tag
+                if cfg.tag_by_user and not cfg.dry_run:
+                    for it in plan["keep"]:
+                        arr = arrs.get(it["service"])
+                        try:
+                            obj = arr.find(it["id"]) if arr else None
+                            if obj:
+                                arr.remove_tag(obj, username)
+                                act["untagged"].append(it["title"])
+                        except Exception as e:
+                            act["errors"].append(f"{it['title']} (tag): {e}")
+            finally:
+                act["state"] = "done"
+
     def _group_by(self, items, id_type, summary):
         """Merge watchlist entries that point at the same TVDB/TMDB id."""
         grouped = {}
@@ -618,6 +766,7 @@ class Syncer:
 
         grouped = self._group_by(shows, "tvdb", summary)
         summary["shows"] = len(grouped)
+        self.state.set_wants("sonarr", grouped)
         for tvdb, it in grouped.items():
             title = it["title"]
             try:
@@ -674,6 +823,7 @@ class Syncer:
 
         grouped = self._group_by(movies, "tmdb", summary)
         summary["movies"] = len(grouped)
+        self.state.set_wants("radarr", grouped)
         for tmdb, it in grouped.items():
             title = it["title"]
             try:
@@ -793,9 +943,13 @@ def make_handler(syncer, ui_password):
                     "last_run": syncer.last_run,
                     "users": syncer.users,
                     "recent": syncer.state.recent(),
+                    "action": syncer.action,
                 })
             if p == "/api/settings":
                 return self._send(200, syncer.settings.public())
+            m = re.fullmatch(r"/api/users/([^/]+)/plan", p)
+            if m:
+                return self._send(200, syncer.deletion_plan(unquote(m.group(1))))
             m = re.fullmatch(r"/api/plex/pin/(\d+)", p)
             if m:
                 try:
@@ -838,6 +992,16 @@ def make_handler(syncer, ui_password):
                 syncer.settings.update(body)
                 syncer.wake.set()
                 return self._send(200, syncer.settings.public())
+            m = re.fullmatch(r"/api/users/([^/]+)/(exclude|include)", p)
+            if m:
+                name = unquote(m.group(1))
+                if m.group(2) == "include":
+                    syncer.include_user(name)
+                    return self._send(200, {"ok": True})
+                if syncer.action and syncer.action.get("state") == "running":
+                    return self._send(409, {"error": "Another exclusion is still running"})
+                plan = syncer.exclude_user(name, bool(body.get("delete")))
+                return self._send(200, {"ok": True, "plan": plan})
             m = re.fullmatch(r"/api/test/(sonarr|radarr|bazarr)", p)
             if m:
                 svc = m.group(1)

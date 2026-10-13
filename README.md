@@ -31,6 +31,15 @@ Settings, login and history live in `watchlist-sync/data/`.
 
 Only your login is needed. Each friend must set their Plex account **Privacy → Watchlist** to **Friends only** (or wider). The **Users** card shows who is readable and who is private. Managed Plex Home users (no own plex.tv account) aren't covered.
 
+## Excluding a user
+
+In the **Users** card, click **Exclude…** next to someone. Before anything happens you see:
+
+- **What gets deleted:** titles watchlist-sync added *only* because of that user. They're removed from Sonarr/Radarr **together with their downloaded files**. You can untick this to just stop syncing their watchlist.
+- **What's kept:** titles someone else also requested or still has on their watchlist. Those stay; only the user's `plex-<name>` tag is removed.
+
+Anything that was already in your library before watchlist-sync is never deleted. With **Dry run** on, nothing is deleted, the result just shows what would have been. **Include again** brings the user back; their titles are re-added on the next sync.
+
 ## Security
 
 The UI has no login by default and stores your Plex sign-in, so keep it on your LAN / Tailscale and don't route it through the Cloudflare tunnel. To add a password, set `UI_PASSWORD=...` in docker-compose (any username works).

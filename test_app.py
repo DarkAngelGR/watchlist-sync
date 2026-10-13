@@ -23,10 +23,22 @@ class Resp:
 USERS_XML = b'<MediaContainer><User id="1" title="Maria" username="maria"/><User id="2" title="nikos" username="nikos"/></MediaContainer>'
 META = {"101": ["tvdb://81189", "tmdb://1396"], "102": ["tmdb://27205", "imdb://tt1375666"],
         "201": ["tvdb://305288"], "202": ["tvdb://81189"], "203": ["tvdb://999"]}
-sonarr_series, radarr_movies = [{"tvdbId": 999}], []
+sonarr_series, radarr_movies = [{"id": 1, "tvdbId": 999, "tags": []}], []
+tags = {}
 
 
 def fake(self, method, url, params=None, json=None, headers=None, timeout=None):
+    m = re.search(r"/api/v3/(series|movie)/(\d+)$", url)
+    if m and method in ("DELETE", "PUT"):
+        coll = sonarr_series if m.group(1) == "series" else radarr_movies
+        calls.append((method, url, params, json))
+        idx = next(i for i, x in enumerate(coll) if x["id"] == int(m.group(2)))
+        if method == "DELETE":
+            assert params.get("deleteFiles") == "true"
+            coll.pop(idx)
+        else:
+            coll[idx] = json
+        return Resp(200, {})
     calls.append((method, url, params, json))
     if url.endswith("/api/v2/pins") and method == "POST":
         return Resp(body={"id": 4242, "code": "abcd"})
@@ -80,22 +92,23 @@ def fake(self, method, url, params=None, json=None, headers=None, timeout=None):
         return Resp(404, {})
     if url.endswith("/tag"):
         if method == "POST":
-            return Resp(body={"id": len(json["label"]), "label": json["label"]})
-        return Resp(body=[])
+            tags[json["label"]] = len(tags) + 1
+            return Resp(body={"id": tags[json["label"]], "label": json["label"]})
+        return Resp(body=[{"id": i, "label": l} for l, i in tags.items()])
     if url.endswith("/series") and method == "GET":
         return Resp(body=sonarr_series)
     if url.endswith("/series/lookup"):
         tid = int(params["term"].split(":")[1])
         return Resp(body=[{"title": f"show{tid}", "tvdbId": tid, "seasons": []}])
     if url.endswith("/series") and method == "POST":
-        sonarr_series.append({"tvdbId": json["tvdbId"]})
+        sonarr_series.append({"id": len(sonarr_series) + 100, "tvdbId": json["tvdbId"], "tags": json["tags"], "title": json["title"]})
         return Resp(201, json)
     if url.endswith("/movie") and method == "GET":
         return Resp(body=radarr_movies)
     if "/movie/lookup/tmdb" in url:
         return Resp(body={"title": "Inception", "tmdbId": params["tmdbId"]})
     if url.endswith("/movie") and method == "POST":
-        radarr_movies.append({"tmdbId": json["tmdbId"]})
+        radarr_movies.append({"id": len(radarr_movies) + 200, "tmdbId": json["tmdbId"], "tags": json["tags"]})
         return Resp(201, json)
     raise AssertionError(f"unexpected {method} {url}")
 
@@ -167,6 +180,59 @@ assert not any("/library/metadata/" in c[1] for c in calls), "guids should be ca
 assert not any("system/tasks" in c[1] for c in calls)
 st = call("/api/status")
 assert {u["name"]: u["status"] for u in st["users"]} == {"aggelos": "ok", "maria": "ok", "nikos": "private"}, st["users"]
+# --- exclude maria: Stranger Things only she wanted -> deleted; Breaking Bad shared with owner -> kept, untagged
+import time as _t
+def wait_action():
+    for _ in range(100):
+        a = call("/api/status")["action"]
+        if a and a["state"] == "done":
+            return a
+        _t.sleep(0.05)
+    raise AssertionError("exclusion never finished")
+
+plan = call("/api/users/maria/plan")
+assert [x["title"] for x in plan["delete"]] == ["Stranger Things"], plan
+assert [(x["title"], x["others"]) for x in plan["keep"]] == [("Breaking Bad", ["aggelos"])], plan
+assert all(x["title"] != "Already There" for x in plan["delete"] + plan["keep"])  # never ours to delete
+calls.clear()
+call("/api/users/maria/exclude", {"delete": True})
+act = wait_action()
+assert act["deleted"] == ["Stranger Things"] and act["untagged"] == ["Breaking Bad"] and not act["errors"], act
+dels = [c for c in calls if c[0] == "DELETE"]
+assert len(dels) == 1 and dels[0][2]["deleteFiles"] == "true"
+assert 305288 not in {x["tvdbId"] for x in sonarr_series}
+bb = next(x for x in sonarr_series if x["tvdbId"] == 81189)
+assert tags["plex-maria"] not in bb["tags"] and tags["plex-aggelos"] in bb["tags"], bb
+assert 999 in {x["tvdbId"] for x in sonarr_series}  # pre-existing show untouched
+assert "maria" in s.settings.all()["user_block"]
+# next sync must not re-add what we deleted
+r3 = s.run_once()
+assert not r3["added_series"], r3
+assert 305288 not in {x["tvdbId"] for x in sonarr_series}
+assert {u["name"]: u["status"] for u in call("/api/status")["users"]}["maria"] == "excluded"
+
+# --- include her again -> Stranger Things comes back
+call("/api/users/maria/include", {})
+assert "maria" not in s.settings.all()["user_block"]
+r4 = s.run_once()
+assert r4["added_series"] == ["Stranger Things"], r4
+
+# --- exclude without deleting -> nothing removed
+calls.clear()
+call("/api/users/maria/exclude", {"delete": False})
+wait_action()
+assert not [c for c in calls if c[0] == "DELETE"]
+call("/api/users/maria/include", {}); s.run_once()
+
+# --- dry run: plan shown, nothing deleted
+s.settings.update({"dry_run": True}); calls.clear()
+call("/api/users/aggelos/exclude", {"delete": True})
+act = wait_action()
+assert act["deleted"] == ["Inception"], act   # Breaking Bad kept: maria wants it
+assert not [c for c in calls if c[0] in ("DELETE", "PUT")]
+call("/api/users/aggelos/include", {})
+print("exclusion tests OK")
+
 call("/api/plex/logout", {})
 assert call("/api/status")["account"] is None and not s.settings.all()["plex_token"]
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])

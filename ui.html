@@ -56,6 +56,17 @@ legend{padding:0 6px;font-weight:600}
 .ok{color:var(--ok)} .bad{color:var(--bad)}
 .actions{display:flex;gap:10px;align-items:center}
 .hidden{display:none}
+button.danger{background:var(--bad);border-color:var(--bad);color:#fff;font-weight:600}
+button.link{background:none;border:0;padding:2px 0;color:var(--mute);text-decoration:underline;font-size:13px}
+dialog{border:1px solid var(--line);border-radius:14px;background:var(--card);color:var(--ink);padding:0;width:min(560px,calc(100vw - 32px));max-height:85vh}
+dialog::backdrop{background:rgba(0,0,0,.45)}
+dialog .body{padding:18px 20px;overflow:auto;max-height:calc(85vh - 70px)}
+dialog .foot{display:flex;gap:10px;justify-content:flex-end;padding:12px 20px;border-top:1px solid var(--line)}
+dialog h3{margin:0 0 8px;font-size:17px}
+dialog ul{margin:6px 0 12px;padding-left:20px;font-size:14px}
+dialog li{margin:2px 0}
+.optbox{display:flex;gap:8px;align-items:flex-start;padding:10px 12px;border:1px solid var(--line);border-radius:10px;margin:10px 0;font-size:14px}
+.optbox input{margin-top:3px}
 </style>
 </head>
 <body>
@@ -68,6 +79,7 @@ legend{padding:0 6px;font-weight:600}
   </header>
 
   <div id="banner" class="card banner hidden"></div>
+  <div id="actionBox" class="card banner hidden"></div>
 
   <div class="grid">
     <section class="card">
@@ -154,6 +166,11 @@ legend{padding:0 6px;font-weight:600}
   </section>
 </div>
 
+<dialog id="exDlg">
+  <div class="body" id="exBody"></div>
+  <div class="foot"><button id="exCancel">Cancel</button><button id="exGo" class="danger">Exclude</button></div>
+</dialog>
+
 <script>
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -171,6 +188,7 @@ const ago = ts => {
 };
 
 let lastStatus = null;
+let dismissed = null;
 
 function renderStatus(st){
   lastStatus = st;
@@ -183,6 +201,20 @@ function renderStatus(st){
   if (st.problem){ b.classList.remove("hidden"); b.innerHTML = "<strong>Almost there.</strong> " + esc(st.problem); }
   else if (st.dry_run){ b.classList.remove("hidden"); b.innerHTML = "<strong>Dry run is on.</strong> Nothing is being added yet — check the list below, then untick “Dry run” in Settings."; }
   else b.classList.add("hidden");
+
+  // exclusion progress / result
+  const ac = st.action, box = $("#actionBox");
+  if (ac && !(ac.state === "done" && dismissed === ac.user + ac.deleted.length)){
+    box.classList.remove("hidden");
+    const verb = st.dry_run ? "Would delete" : "Deleted";
+    box.innerHTML = ac.state === "running"
+      ? `<strong>Excluding ${esc(ac.user)}…</strong> ${ac.total ? `deleting ${ac.deleted.length + ac.errors.length} of ${ac.total}` : ""}`
+      : `<strong>${esc(ac.user)} is excluded.</strong> ${ac.deleted.length ? `${verb} ${ac.deleted.length}: ${ac.deleted.map(esc).join(", ")}.` : "Nothing was deleted."}
+         ${ac.untagged.length ? `<div class="small mute">Kept for other users: ${ac.untagged.map(esc).join(", ")}</div>` : ""}
+         ${ac.errors.map(e => `<div class="err">${esc(e)}</div>`).join("")}
+         <div style="margin-top:8px"><button class="link" id="dismissAct">Dismiss</button></div>`;
+    const d = $("#dismissAct"); if (d) d.onclick = () => { dismissed = ac.user + ac.deleted.length; box.classList.add("hidden"); };
+  } else box.classList.add("hidden");
 
   // account
   const a = st.account;
@@ -214,10 +246,15 @@ function renderStatus(st){
   // users
   if (st.users && st.users.length){
     const note = {ok:"", private:"Watchlist is private — they need to set Watchlist visibility to Friends in their Plex privacy settings", excluded:"Excluded in settings"};
-    $("#usersBox").innerHTML = `<table><tr><th>User</th><th>Role</th><th>Watchlist</th><th></th></tr>${
+    $("#usersBox").innerHTML = `<table><tr><th>User</th><th>Role</th><th>Watchlist</th><th>Status</th><th></th></tr>${
       st.users.map(u => `<tr><td>${esc(u.name)}</td><td class="mute">${u.role}</td>
         <td>${u.items ?? "—"}</td><td><span class="tag ${u.status}">${u.status === "ok" ? "readable" : u.status}</span>
-        ${note[u.status] ? `<div class="small mute">${note[u.status]}</div>` : ""}</td></tr>`).join("")}</table>`;
+        ${note[u.status] ? `<div class="small mute">${note[u.status]}</div>` : ""}</td>
+        <td style="text-align:right">${u.status === "excluded"
+          ? `<button class="link" data-include="${esc(u.name)}">Include again</button>`
+          : `<button class="link" data-exclude="${esc(u.name)}">Exclude…</button>`}</td></tr>`).join("")}</table>`;
+    $("#usersBox").querySelectorAll("[data-exclude]").forEach(b => b.onclick = () => openExclude(b.dataset.exclude));
+    $("#usersBox").querySelectorAll("[data-include]").forEach(b => b.onclick = () => includeUser(b.dataset.include));
     $("#usersBox").classList.remove("mute","small");
   }
 
@@ -259,6 +296,41 @@ async function login(){
     if (res.error){ msg.textContent = res.error; return; }
   }
   msg.textContent = "Timed out — try again.";
+}
+
+const dlg = $("#exDlg");
+let exUser = null;
+async function openExclude(name){
+  exUser = name;
+  const plan = await api("/api/users/" + encodeURIComponent(name) + "/plan");
+  const li = arr => arr.map(x => `<li>${esc(x.title)} <span class="mute small">· ${x.service === "sonarr" ? "Sonarr" : "Radarr"}</span></li>`).join("");
+  const n = plan.delete.length;
+  $("#exBody").innerHTML = `
+    <h3>Exclude ${esc(name)}?</h3>
+    <p class="small mute" style="margin-top:0">Their watchlist will stop syncing. You can include them again later.</p>
+    ${n ? `<label class="optbox"><input type="checkbox" id="exDelete" checked>
+             <span><strong>Also delete ${n} title${n > 1 ? "s" : ""} they requested</strong>, including the downloaded files${plan.dry_run ? " <span class='mute'>(dry run is on — nothing will actually be deleted)</span>" : ""}.</span></label>
+           <ul>${li(plan.delete)}</ul>`
+        : `<p class="small">Nothing to delete — no titles were added only because of ${esc(name)}.</p>`}
+    ${plan.keep.length ? `<div class="small mute">Kept because someone else wants them too:</div>
+           <ul class="small">${plan.keep.map(x => `<li>${esc(x.title)} <span class="mute">· ${x.others.map(esc).join(", ")}</span></li>`).join("")}</ul>` : ""}
+    <p class="small mute">Only titles watchlist-sync added are ever deleted — anything that was already in your library stays.</p>`;
+  const go = $("#exGo");
+  const sync = () => { const c = $("#exDelete"); go.textContent = c && c.checked ? `Exclude and delete ${n}` : "Exclude only"; };
+  sync(); const c = $("#exDelete"); if (c) c.onchange = sync;
+  dlg.showModal();
+}
+$("#exCancel").onclick = () => dlg.close();
+$("#exGo").onclick = async () => {
+  const c = $("#exDelete");
+  dlg.close();
+  const res = await api("/api/users/" + encodeURIComponent(exUser) + "/exclude", {method:"POST", body: JSON.stringify({delete: !!(c && c.checked)})});
+  if (res.error) alert(res.error);
+  dismissed = null; refresh(); loadSettings();
+};
+async function includeUser(name){
+  await api("/api/users/" + encodeURIComponent(name) + "/include", {method:"POST", body:"{}"});
+  refresh(); loadSettings();
 }
 
 async function logout(){
