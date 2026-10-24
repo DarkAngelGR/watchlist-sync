@@ -920,7 +920,15 @@ class Syncer:
             data = self._suggest[1]
         else:
             r = Arr("Radarr", cfg.radarr)
-            raw = r.get("/importlist/movie", includeRecommendations="true") or []
+            # Recommendations alone can be empty (no import lists, few movies);
+            # trending and popular keep the list useful. The TV ranks by taste.
+            try:
+                raw = r.get("/importlist/movie", includeRecommendations="true",
+                            includeTrending="true", includePopular="true") or []
+            except requests.RequestException as e:
+                if isinstance(e, requests.HTTPError):
+                    raise
+                raise RuntimeError(f"watchlist-sync can't reach Radarr at {cfg.radarr.url}") from e
             data = [tv_movie(m) for m in raw
                     if m.get("tmdbId") and not m.get("isExisting") and not m.get("isExcluded")]
             self._suggest = (now, data)
@@ -1081,7 +1089,8 @@ def make_handler(syncer, ui_password):
                     return self._send(200, syncer.tv_suggestions())
                 except Exception as e:
                     log.warning("TV suggestions failed: %s", e)
-                    return self._send(502, {"error": f"Could not get suggestions from Radarr: {e}"})
+                    msg = str(e) if isinstance(e, RuntimeError) else f"Could not get suggestions from Radarr: {e}"
+                    return self._send(502, {"error": msg})
             m = re.fullmatch(r"/api/users/([^/]+)/plan", p)
             if m:
                 return self._send(200, syncer.deletion_plan(unquote(m.group(1))))

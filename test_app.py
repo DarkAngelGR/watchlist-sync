@@ -51,7 +51,7 @@ def fake(self, method, url, params=None, json=None, headers=None, timeout=None):
         return Resp(200, {})
     calls.append((method, url, params, json))
     if url.endswith("/importlist/movie"):
-        assert params.get("includeRecommendations") == "true"
+        assert params.get("includeRecommendations") == params.get("includeTrending") == params.get("includePopular") == "true"
         return Resp(body=IMPORTLIST)
     if url.endswith("/api/v2/pins") and method == "POST":
         return Resp(body={"id": 4242, "code": "abcd"})
@@ -302,6 +302,19 @@ auth = {"Authorization": "Basic " + b64.b64encode(b"tv:pw").decode()}
 assert raw("/api/tv", headers=auth, server=b2)[0] == 200
 assert raw("/api/tv/request", "OPTIONS", server=b2)[0] == 204      # preflight needs no password
 srv2.shutdown()
+orig = requests.Session.request
+def down(self, method, url, **kw):
+    if "importlist" in url:
+        raise requests.ConnectTimeout("timed out")
+    return orig(self, method, url, **kw)
+requests.Session.request = down
+s._suggest = None
+try:
+    call("/api/tv/suggestions"); raise AssertionError("expected 502")
+except urllib.error.HTTPError as e:
+    err = json.loads(e.read())["error"]
+    assert e.code == 502 and err == "watchlist-sync can't reach Radarr at http://localhost:7878", err
+requests.Session.request = orig
 print("tv tests OK")
 
 call("/api/plex/logout", {})
