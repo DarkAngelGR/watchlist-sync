@@ -400,39 +400,6 @@ class Plex:
 
 
 # --------------------------------------------------------------------------- *arr
-SUGGEST_TTL = 30 * 60   # Radarr's Discover list is slow to build; cache it
-SUGGEST_MAX = 400
-
-
-def tmdb_img(url, size):
-    """TMDB image URLs from Radarr point at the full-size original; TVs only need
-    a display-sized copy (w342 posters, w1280 backdrops)."""
-    return re.sub(r"/t/p/[^/]+/", f"/t/p/{size}/", url) if url else ""
-
-
-def tv_movie(m):
-    """The fields a TV client needs from a Radarr movie resource."""
-    imgs = {i.get("coverType"): i.get("remoteUrl") or "" for i in m.get("images") or []}
-    ratings = m.get("ratings") or {}
-
-    def score(src):
-        try:
-            return round(float((ratings.get(src) or {}).get("value") or 0), 1)
-        except (TypeError, ValueError):
-            return 0
-    imdb, tmdb, rt = score("imdb"), score("tmdb"), score("rottenTomatoes")  # rt is 0-100
-    return {
-        "tmdbId": m["tmdbId"], "type": "movie", "title": m.get("title", "?"), "year": m.get("year") or 0,
-        "genres": m.get("genres") or [],
-        "rating": imdb or tmdb,          # one 0-10 score, IMDb preferred
-        "imdb": imdb, "tmdb": tmdb, "rt": rt,
-        "overview": m.get("overview") or "", "runtime": m.get("runtime") or 0,
-        "certification": m.get("certification") or "",
-        "poster": tmdb_img(imgs.get("poster"), "w342"), "backdrop": tmdb_img(imgs.get("fanart"), "w1280"),
-        "recommended": bool(m.get("isRecommendation")),
-    }
-
-
 def tag_label(username):
     return "plex-" + (re.sub(r"[^a-z0-9]+", "-", username.lower()).strip("-") or "user")
 
@@ -567,7 +534,6 @@ class Syncer:
         self.cfg = None
         self.lock = threading.Lock()      # one sync or exclusion at a time
         self.action = None                # progress/result of the last exclude, shown in the UI
-        self._suggest = None              # (fetched_at, [tv_movie]) for TV clients
 
     # -- setup helpers
     def build(self):
@@ -907,86 +873,25 @@ class Syncer:
         })
         return body
 
-    # -- TV clients (FlexPlex): suggest movies you don't have, add one on request
-    def _owner(self):
-        acct = json.loads(self.state.get("plex_account", "null") or "null") or {}
-        return acct.get("username") or "owner"
+    # -- TV clients (FlexPlex): status line, and "sync now" after a Watchlist add
+    @staticmethod
+    def _reachable(arr_cfg):
+        """Can we open a connection to this Sonarr/Radarr? (3 s, no API key needed)"""
+        if not arr_cfg.enabled:
+            return None
+        try:
+            requests.get(arr_cfg.url.rstrip("/") + "/ping", timeout=3)
+            return True
+        except requests.RequestException:
+            return False
 
     def tv_info(self):
         cfg = Config(self.settings.all())
         return {"product": PRODUCT, "radarr": cfg.radarr.enabled, "sonarr": cfg.sonarr.enabled,
-                "dry_run": cfg.dry_run}
-
-    def tv_suggestions(self):
-        """Radarr's Discover list (TMDB recommendations from your library plus your
-        import lists), minus what you have, excluded or already requested."""
-        cfg = Config(self.settings.all())
-        if not cfg.radarr.enabled:
-            return {"movies": [], "dry_run": cfg.dry_run, "problem": "Radarr isn't set up in watchlist-sync."}
-        now = time.time()
-        if self._suggest and now - self._suggest[0] < SUGGEST_TTL:
-            data = self._suggest[1]
-        else:
-            r = Arr("Radarr", cfg.radarr)
-            # Recommendations alone can be empty (no import lists, few movies);
-            # trending and popular keep the list useful. The TV ranks by taste.
-            try:
-                # Fail fast (the TV is waiting) if Radarr is down or the URL is wrong.
-                requests.get(cfg.radarr.url.rstrip("/") + "/ping", timeout=5)
-                raw = r.get("/importlist/movie", includeRecommendations="true",
-                            includeTrending="true", includePopular="true") or []
-            except requests.RequestException as e:
-                if isinstance(e, requests.HTTPError):
-                    raise
-                raise RuntimeError(f"watchlist-sync can't reach Radarr at {cfg.radarr.url}") from e
-            data = [tv_movie(m) for m in raw
-                    if m.get("tmdbId") and not m.get("isExisting") and not m.get("isExcluded")]
-            self._suggest = (now, data)
-        movies = [m for m in data if not self.state.is_handled("radarr", m["tmdbId"])]
-        return {"movies": movies[:SUGGEST_MAX], "dry_run": cfg.dry_run}
-
-    def tv_request(self, tmdb, title=""):
-        """Add one movie to Radarr now (tagged for the server owner), like a
-        watchlist addition but without waiting for the next sync."""
-        cfg = Config(self.settings.all())
-        if not cfg.radarr.enabled:
-            return {"ok": False, "error": "Radarr isn't set up in watchlist-sync."}
-        if not self.lock.acquire(timeout=20):
-            return {"ok": False, "error": "A sync is running; try again in a moment."}
-        try:
-            owner = self._owner()
-            r = Arr("Radarr", cfg.radarr)
-            if self.state.is_handled("radarr", tmdb):
-                return {"ok": True, "status": "already-requested"}
-            if any(x.get("tmdbId") == tmdb for x in r.get("/movie")):
-                self.state.mark("radarr", tmdb, title, [owner], "already-present")
-                return {"ok": True, "status": "already-present"}
-            movie = r.get("/movie/lookup/tmdb", tmdbId=tmdb)
-            if isinstance(movie, list):
-                movie = movie[0] if movie else None
-            if not movie:
-                return {"ok": False, "error": "Radarr couldn't find this movie."}
-            title = movie.get("title") or title
-            body = self._radarr_body(r, cfg, movie, [owner], r.quality_profile_id(), r.root_folder())
-            if cfg.dry_run:
-                log.info("[dry-run] TV request: would add movie '%s' (tmdb:%s)", title, tmdb)
-                return {"ok": True, "status": "dry-run", "title": title}
-            try:
-                r.post("/movie", body)
-            except ArrError as e:
-                if not e.already_exists:
-                    raise
-                self.state.mark("radarr", tmdb, title, [owner], "already-present")
-                return {"ok": True, "status": "already-present", "title": title}
-            self.state.mark("radarr", tmdb, title, [owner], "added")
-            log.info("Added movie '%s' (tmdb:%s) requested from a TV", title, tmdb)
-            self._nudge_bazarr({"added_series": [], "added_movies": [title], "errors": []}, cfg)
-            return {"ok": True, "status": "added", "title": title}
-        except Exception as e:
-            log.error("TV request for tmdb:%s failed: %s", tmdb, e)
-            return {"ok": False, "error": str(e)}
-        finally:
-            self.lock.release()
+                "radarr_url": cfg.radarr.url if cfg.radarr.enabled else "",
+                "sonarr_url": cfg.sonarr.url if cfg.sonarr.enabled else "",
+                "radarr_ok": self._reachable(cfg.radarr), "sonarr_ok": self._reachable(cfg.sonarr),
+                "dry_run": cfg.dry_run, "signed_in": bool(cfg.plex_token)}
 
     def _nudge_bazarr(self, summary, cfg=None):
         """Make Bazarr pick up the new series/movies now instead of on its next sync."""
@@ -1094,13 +999,6 @@ def make_handler(syncer, ui_password):
                 return self._send(200, syncer.settings.public())
             if p == "/api/tv":
                 return self._send(200, syncer.tv_info())
-            if p == "/api/tv/suggestions":
-                try:
-                    return self._send(200, syncer.tv_suggestions())
-                except Exception as e:
-                    log.warning("TV suggestions failed: %s", e)
-                    msg = str(e) if isinstance(e, RuntimeError) else f"Could not get suggestions from Radarr: {e}"
-                    return self._send(502, {"error": msg})
             m = re.fullmatch(r"/api/users/([^/]+)/plan", p)
             if m:
                 return self._send(200, syncer.deletion_plan(unquote(m.group(1))))
@@ -1131,13 +1029,10 @@ def make_handler(syncer, ui_password):
             if p in ("/sync", "/api/sync"):
                 syncer.wake.set()
                 return self._send(202, {"queued": True})
-            if p == "/api/tv/request":
-                try:
-                    tmdb = int(body.get("tmdbId"))
-                except (TypeError, ValueError):
-                    return self._send(400, {"error": "tmdbId is required"})
-                res = syncer.tv_request(tmdb, str(body.get("title") or ""))
-                return self._send(200 if res.get("ok") else 502, res)
+            if p == "/api/tv/sync":
+                # A TV just added something to the Plex Watchlist: sync now.
+                syncer.wake.set()
+                return self._send(202, {"queued": True})
             if p == "/api/plex/pin":
                 try:
                     return self._send(200, plex_create_pin(syncer.client_id))
