@@ -414,10 +414,18 @@ def tv_movie(m):
     """The fields a TV client needs from a Radarr movie resource."""
     imgs = {i.get("coverType"): i.get("remoteUrl") or "" for i in m.get("images") or []}
     ratings = m.get("ratings") or {}
-    rating = (ratings.get("tmdb") or {}).get("value") or (ratings.get("imdb") or {}).get("value") or 0
+
+    def score(src):
+        try:
+            return round(float((ratings.get(src) or {}).get("value") or 0), 1)
+        except (TypeError, ValueError):
+            return 0
+    imdb, tmdb, rt = score("imdb"), score("tmdb"), score("rottenTomatoes")  # rt is 0-100
     return {
         "tmdbId": m["tmdbId"], "type": "movie", "title": m.get("title", "?"), "year": m.get("year") or 0,
-        "genres": m.get("genres") or [], "rating": round(float(rating), 1),
+        "genres": m.get("genres") or [],
+        "rating": imdb or tmdb,          # one 0-10 score, IMDb preferred
+        "imdb": imdb, "tmdb": tmdb, "rt": rt,
         "overview": m.get("overview") or "", "runtime": m.get("runtime") or 0,
         "certification": m.get("certification") or "",
         "poster": tmdb_img(imgs.get("poster"), "w342"), "backdrop": tmdb_img(imgs.get("fanart"), "w1280"),

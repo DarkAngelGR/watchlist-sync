@@ -28,7 +28,7 @@ tags = {}
 IMG = "https://image.tmdb.org/t/p/original/"
 IMPORTLIST = [
     {"tmdbId": 438631, "title": "Dune", "year": 2021, "genres": ["Science Fiction", "Adventure"],
-     "ratings": {"tmdb": {"value": 7.8}}, "overview": "Spice.", "isRecommendation": True,
+     "ratings": {"tmdb": {"value": 7.8}, "imdb": {"value": 8.0}, "rottenTomatoes": {"value": 83}}, "overview": "Spice.", "isRecommendation": True,
      "images": [{"coverType": "poster", "remoteUrl": IMG + "dune.jpg"}, {"coverType": "fanart", "remoteUrl": IMG + "dune-bg.jpg"}]},
     {"tmdbId": 27205, "title": "Inception", "isExisting": True},          # already in Radarr
     {"tmdbId": 555, "title": "Excluded One", "isExcluded": True},
@@ -257,7 +257,8 @@ titles = [m["title"] for m in sug["movies"]]
 assert titles == ["Dune", "Dune: Part Two"], titles          # existing + excluded filtered out
 dune = sug["movies"][0]
 assert dune["poster"] == "https://image.tmdb.org/t/p/w342/dune.jpg", dune
-assert dune["backdrop"] == "https://image.tmdb.org/t/p/w1280/dune-bg.jpg" and dune["rating"] == 7.8
+assert dune["backdrop"] == "https://image.tmdb.org/t/p/w1280/dune-bg.jpg" and dune["rating"] == 8.0  # IMDb preferred
+assert (dune["imdb"], dune["tmdb"], dune["rt"]) == (8.0, 7.8, 83), dune
 assert sug["movies"][1]["rating"] == 8.6 and sug["movies"][1]["poster"] == ""
 calls.clear()
 res = call("/api/tv/request", {"tmdbId": 438631, "title": "Dune"})
