@@ -923,6 +923,8 @@ class Syncer:
             # Recommendations alone can be empty (no import lists, few movies);
             # trending and popular keep the list useful. The TV ranks by taste.
             try:
+                # Fail fast (the TV is waiting) if Radarr is down or the URL is wrong.
+                requests.get(cfg.radarr.url.rstrip("/") + "/ping", timeout=5)
                 raw = r.get("/importlist/movie", includeRecommendations="true",
                             includeTrending="true", includePopular="true") or []
             except requests.RequestException as e:

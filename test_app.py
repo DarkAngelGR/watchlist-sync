@@ -50,6 +50,8 @@ def fake(self, method, url, params=None, json=None, headers=None, timeout=None):
             coll[idx] = json
         return Resp(200, {})
     calls.append((method, url, params, json))
+    if url.endswith(":7878/ping"):
+        return Resp(body={"status": "OK"})
     if url.endswith("/importlist/movie"):
         assert params.get("includeRecommendations") == params.get("includeTrending") == params.get("includePopular") == "true"
         return Resp(body=IMPORTLIST)
@@ -307,6 +309,8 @@ def down(self, method, url, **kw):
     if "importlist" in url:
         raise requests.ConnectTimeout("timed out")
     return orig(self, method, url, **kw)
+orig_get = requests.get
+requests.get = lambda url, **kw: (_ for _ in ()).throw(requests.ConnectTimeout("timed out")) if url.endswith("/ping") else orig_get(url, **kw)
 requests.Session.request = down
 s._suggest = None
 try:
@@ -315,6 +319,7 @@ except urllib.error.HTTPError as e:
     err = json.loads(e.read())["error"]
     assert e.code == 502 and err == "watchlist-sync can't reach Radarr at http://localhost:7878", err
 requests.Session.request = orig
+requests.get = orig_get
 print("tv tests OK")
 
 call("/api/plex/logout", {})
