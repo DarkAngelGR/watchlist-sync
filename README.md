@@ -40,6 +40,16 @@ In the **Users** card, click **Exclude…** next to someone. Before anything hap
 
 Anything that was already in your library before watchlist-sync is never deleted. With **Dry run** on, nothing is deleted, the result just shows what would have been. **Include again** brings the user back; their titles are re-added on the next sync.
 
+## TV requests (FlexPlex)
+
+[FlexPlex](https://github.com/DarkAngelGR/samsucks)'s **Lucky Draw** can suggest movies you don't have and add them on the spot. It finds watchlist-sync by itself when it runs on the same machine as Plex (port 8789); otherwise set the address in FlexPlex's Settings.
+
+- `GET /api/tv/suggestions`: Radarr's Discover list (TMDB recommendations based on your library, plus your import lists) without what's already in Radarr, excluded, or already requested. Cached for 30 minutes.
+- `POST /api/tv/request` with `{"tmdbId": 438631}`: adds the movie to Radarr right away, with the same quality profile, root folder and `plex-<owner>` tag as watchlist additions, and starts the search. **Dry run** is respected. The title is recorded like any other, so the watchlist sync won't add it twice.
+- `GET /api/tv`: what's set up (Radarr, Sonarr, dry run), for the TV's status line.
+
+Shows aren't suggested: Sonarr has no Discover list. Your Sonarr/Radarr API keys never leave watchlist-sync. Only these endpoints allow cross-origin calls, and they need `UI_PASSWORD` when it's set (enter it in FlexPlex's Settings).
+
 ## Security
 
 The UI has no login by default and stores your Plex sign-in, so keep it on your LAN / Tailscale and don't route it through the Cloudflare tunnel. To add a password, set `UI_PASSWORD=...` in docker-compose (any username works).

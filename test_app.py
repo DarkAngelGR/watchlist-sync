@@ -25,6 +25,16 @@ META = {"101": ["tvdb://81189", "tmdb://1396"], "102": ["tmdb://27205", "imdb://
         "201": ["tvdb://305288"], "202": ["tvdb://81189"], "203": ["tvdb://999"]}
 sonarr_series, radarr_movies = [{"id": 1, "tvdbId": 999, "tags": []}], []
 tags = {}
+IMG = "https://image.tmdb.org/t/p/original/"
+IMPORTLIST = [
+    {"tmdbId": 438631, "title": "Dune", "year": 2021, "genres": ["Science Fiction", "Adventure"],
+     "ratings": {"tmdb": {"value": 7.8}}, "overview": "Spice.", "isRecommendation": True,
+     "images": [{"coverType": "poster", "remoteUrl": IMG + "dune.jpg"}, {"coverType": "fanart", "remoteUrl": IMG + "dune-bg.jpg"}]},
+    {"tmdbId": 27205, "title": "Inception", "isExisting": True},          # already in Radarr
+    {"tmdbId": 555, "title": "Excluded One", "isExcluded": True},
+    {"tmdbId": 693134, "title": "Dune: Part Two", "year": 2024, "genres": ["Science Fiction"],
+     "ratings": {"imdb": {"value": 8.6}}, "images": []},
+]
 
 
 def fake(self, method, url, params=None, json=None, headers=None, timeout=None):
@@ -40,6 +50,9 @@ def fake(self, method, url, params=None, json=None, headers=None, timeout=None):
             coll[idx] = json
         return Resp(200, {})
     calls.append((method, url, params, json))
+    if url.endswith("/importlist/movie"):
+        assert params.get("includeRecommendations") == "true"
+        return Resp(body=IMPORTLIST)
     if url.endswith("/api/v2/pins") and method == "POST":
         return Resp(body={"id": 4242, "code": "abcd"})
     if "/api/v2/pins/4242" in url:
@@ -127,7 +140,7 @@ os.environ.update({
 s = app.Syncer(d)
 
 # --- web API: sign-in flow + settings
-import threading, urllib.request
+import threading, urllib.request, urllib.error
 from http.server import ThreadingHTTPServer
 srv = ThreadingHTTPServer(("127.0.0.1", 0), app.make_handler(s, ""))
 threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -232,6 +245,64 @@ assert act["deleted"] == ["Inception"], act   # Breaking Bad kept: maria wants i
 assert not [c for c in calls if c[0] in ("DELETE", "PUT")]
 call("/api/users/aggelos/include", {})
 print("exclusion tests OK")
+
+# --- TV clients (FlexPlex): suggestions + on-the-fly requests
+s.settings.update({"dry_run": False})
+info = call("/api/tv")
+assert info["product"] == "watchlist-sync" and info["radarr"] and not info["dry_run"], info
+sug = call("/api/tv/suggestions")
+titles = [m["title"] for m in sug["movies"]]
+assert titles == ["Dune", "Dune: Part Two"], titles          # existing + excluded filtered out
+dune = sug["movies"][0]
+assert dune["poster"] == "https://image.tmdb.org/t/p/w342/dune.jpg", dune
+assert dune["backdrop"] == "https://image.tmdb.org/t/p/w1280/dune-bg.jpg" and dune["rating"] == 7.8
+assert sug["movies"][1]["rating"] == 8.6 and sug["movies"][1]["poster"] == ""
+calls.clear()
+res = call("/api/tv/request", {"tmdbId": 438631, "title": "Dune"})
+assert res["ok"] and res["status"] == "added", res
+post = [c for c in calls if c[0] == "POST" and c[1].endswith("/movie")][0][3]
+assert post["tmdbId"] == 438631 and post["addOptions"]["searchForMovie"] is True
+assert tags["plex-aggelos"] in post["tags"], post
+assert any("/api/system/tasks" in c[1] and c[2]["taskid"] == "update_movies" for c in calls)  # Bazarr nudged
+again = call("/api/tv/request", {"tmdbId": 438631})
+assert again["status"] == "already-requested", again
+assert [m["title"] for m in call("/api/tv/suggestions")["movies"]] == ["Dune: Part Two"]  # requested one gone
+assert s.state.is_handled("radarr", 438631)
+assert not s.run_once()["added_movies"]                      # the watchlist sync won't re-add it
+s.settings.update({"dry_run": True}); calls.clear()
+dry = call("/api/tv/request", {"tmdbId": 693134})
+assert dry["status"] == "dry-run" and not [c for c in calls if c[0] == "POST" and c[1].endswith("/movie")], dry
+assert not s.state.is_handled("radarr", 693134)
+s.settings.update({"dry_run": False})
+try:
+    call("/api/tv/request", {"title": "no id"}); raise AssertionError("expected 400")
+except urllib.error.HTTPError as e:
+    assert e.code == 400
+
+# CORS only on /api/tv, preflight works, and UI_PASSWORD still applies
+def raw(path, method="GET", headers=None, server=base):
+    req = urllib.request.Request(server + path, method=method, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req) as r:
+            return r.status, dict(r.headers)
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers)
+code, h = raw("/api/tv/request", "OPTIONS")
+assert code == 204 and h["Access-Control-Allow-Origin"] == "*" and "Authorization" in h["Access-Control-Allow-Headers"]
+assert raw("/api/tv")[1].get("Access-Control-Allow-Origin") == "*"
+assert "Access-Control-Allow-Origin" not in raw("/api/status")[1]
+srv2 = ThreadingHTTPServer(("127.0.0.1", 0), app.make_handler(s, "pw"))
+threading.Thread(target=srv2.serve_forever, daemon=True).start()
+b2 = f"http://127.0.0.1:{srv2.server_port}"
+code, h = raw("/api/tv", server=b2)
+assert code == 401 and h.get("Access-Control-Allow-Origin") == "*" and "WWW-Authenticate" not in h, (code, h)
+assert raw("/api/status", server=b2)[1].get("WWW-Authenticate")    # the web UI still prompts
+import base64 as b64
+auth = {"Authorization": "Basic " + b64.b64encode(b"tv:pw").decode()}
+assert raw("/api/tv", headers=auth, server=b2)[0] == 200
+assert raw("/api/tv/request", "OPTIONS", server=b2)[0] == 204      # preflight needs no password
+srv2.shutdown()
+print("tv tests OK")
 
 call("/api/plex/logout", {})
 assert call("/api/status")["account"] is None and not s.settings.all()["plex_token"]
