@@ -894,7 +894,7 @@ class Syncer:
                 "dry_run": cfg.dry_run, "signed_in": bool(cfg.plex_token)}
 
     # -- downloads in progress, for FlexPlex (GET /api/tv/queue)
-    QUEUE_TTL = 8           # seconds; the TV asks every ~10 s
+    QUEUE_TTL = 4           # seconds; the TV asks every 5 s
     SEARCHING_DAYS = 3      # titles added this recently, with nothing downloaded yet, show as "Searching"
 
     @staticmethod
