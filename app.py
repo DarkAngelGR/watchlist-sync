@@ -34,6 +34,7 @@ log = logging.getLogger("watchlist-sync")
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLEXTV = "https://plex.tv"
 PRODUCT = "watchlist-sync"
+VERSION = "1.0.0"
 
 
 # --------------------------------------------------------------------------- settings
@@ -910,7 +911,7 @@ class Syncer:
 
     def tv_info(self):
         cfg = Config(self.settings.all())
-        return {"product": PRODUCT, "radarr": cfg.radarr.enabled, "sonarr": cfg.sonarr.enabled,
+        return {"product": PRODUCT, "version": VERSION, "radarr": cfg.radarr.enabled, "sonarr": cfg.sonarr.enabled,
                 "radarr_url": cfg.radarr.url if cfg.radarr.enabled else "",
                 "sonarr_url": cfg.sonarr.url if cfg.sonarr.enabled else "",
                 "radarr_ok": self._reachable(cfg.radarr), "sonarr_ok": self._reachable(cfg.sonarr),
@@ -1234,6 +1235,7 @@ def make_handler(syncer, ui_password):
             if p == "/api/status":
                 cfg = Config(syncer.settings.all())
                 return self._send(200, {
+                    "version": VERSION,
                     "account": json.loads(syncer.state.get("plex_account", "null")),
                     "problem": syncer.setup_problem(cfg),
                     "running": syncer.running,

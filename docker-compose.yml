@@ -1,14 +1,15 @@
-# Run from this folder:  docker compose up -d --build
-# Then open http://<nas-ip>:8789 to sign in with Plex and configure Sonarr/Radarr/Bazarr.
+# watchlist-sync. Start it with:  docker compose up -d
+# Then open http://<server-ip>:8789 to sign in with Plex and connect Sonarr/Radarr/Bazarr.
 services:
   watchlist-sync:
-    build: .
+    image: ghcr.io/darkangelgr/watchlist-sync:latest
+    # build: .                  # or build it from this folder instead
     container_name: watchlist-sync
-    network_mode: host          # reaches Sonarr/Radarr/Bazarr like the rest of the stack
+    network_mode: host          # reaches Sonarr/Radarr/Bazarr on this machine and your LAN
     environment:
-      - TZ=Europe/Athens
-      # - UI_PASSWORD=change-me   # optional: password-protect the web UI
+      - TZ=Europe/London        # your time zone
+      # - UI_PASSWORD=change-me # optional: password-protect the web UI (recommended)
       # - PORT=8789
     volumes:
-      - ./data:/data
+      - ./data:/data            # settings, Plex sign-in and history
     restart: unless-stopped

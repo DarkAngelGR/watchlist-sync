@@ -73,6 +73,7 @@ dialog li{margin:2px 0}
 <div class="wrap">
   <header>
     <h1>Watchlist Sync</h1>
+    <span id="ver" class="mute small"></span>
     <span id="statePill" class="pill">…</span>
     <span class="sp"></span>
     <button id="syncBtn" class="primary">Sync now</button>
@@ -192,6 +193,7 @@ let dismissed = null;
 
 function renderStatus(st){
   lastStatus = st;
+  if (st.version) $("#ver").textContent = "v" + st.version;
   const pill = $("#statePill");
   if (st.running){ pill.textContent = "Syncing…"; pill.className = "pill warn"; }
   else if (st.problem){ pill.textContent = "Setup needed"; pill.className = "pill bad"; }

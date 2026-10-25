@@ -1,0 +1,30 @@
+name: Bug report
+description: Something doesn't sync, or doesn't work as described
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: watchlist-sync version
+      description: Shown next to the title in the web UI.
+      placeholder: e.g. 1.0.0
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+      description: Which title, whose watchlist, and what Sonarr/Radarr did (or didn't do).
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: "Output of `docker logs watchlist-sync --tail 100`. Remove anything private first."
+      render: text
+  - type: textarea
+    id: setup
+    attributes:
+      label: Setup
+      description: Sonarr/Radarr versions, how you run it (NAS model, Docker version), dry run on or off.

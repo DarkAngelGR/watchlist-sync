@@ -1,64 +1,148 @@
 # watchlist-sync
 
-Reads the Plex watchlist of the server owner **and every friend you share the server with**, then:
+**Your household's Plex Watchlists, downloaded automatically.** Add a movie or show to
+your Plex Watchlist, from any Plex app, and watchlist-sync hands it to Radarr or Sonarr.
+It reads your friends' Watchlists too, so everyone you share your server with can
+request things without a separate request app.
 
-- adds **shows → Sonarr** (matched by TVDB id, searched immediately)
-- adds **movies → Radarr** (matched by TMDB id) — optional
-- triggers Bazarr's *Sync with Sonarr/Radarr* task so new titles appear there right away
+[![Latest release](https://img.shields.io/github/v/release/DarkAngelGR/watchlist-sync?label=release)](https://github.com/DarkAngelGR/watchlist-sync/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-Every title is tagged `plex-<username>` so you can see who asked for what.
+<p align="center">
+  <img src="assets/screenshot.png" alt="The watchlist-sync web page: the Plex account, the last sync, users and their Watchlists, and recent requests" width="760">
+</p>
 
-## Install on the NAS
+## What it does
 
-```bash
-cd /volume2/docker/mediastack
-git clone https://github.com/<you>/watchlist-sync.git
+- **Movies go to Radarr, shows go to Sonarr**, matched by TMDB and TVDB ids, and are
+  searched for right away.
+- **Everyone's Watchlist counts:** the server owner's and every friend's you share the
+  server with. Each title is tagged `plex-<username>` in Sonarr/Radarr, so you can see
+  who asked for what.
+- **Bazarr is told** to pick up new titles straight away, so subtitles follow.
+- **Dry run first:** it starts by only showing what it *would* add.
+- **Excluding someone** stops syncing their Watchlist and can remove what only they
+  asked for, files included. A preview shows exactly what goes and what stays.
+- **A web page** for signing in with Plex, settings, users and request history.
+  No config files to edit.
+
+## Getting started
+
+You need Docker, a Plex Media Server you own, and Sonarr and/or Radarr.
+
+1. Save this as `docker-compose.yml` in a new folder (or download the one in this repo):
+
+   ```yaml
+   services:
+     watchlist-sync:
+       image: ghcr.io/darkangelgr/watchlist-sync:latest
+       container_name: watchlist-sync
+       network_mode: host
+       environment:
+         - TZ=Europe/London        # your time zone
+         - UI_PASSWORD=change-me   # optional, recommended
+       volumes:
+         - ./data:/data
+       restart: unless-stopped
+   ```
+
+2. Start it: `docker compose up -d`
+3. Open **http://&lt;server-ip&gt;:8789** and:
+   1. **Sign in with Plex** using the account that owns the server. Plex's own sign-in
+      page opens; there's nothing to copy.
+   2. Under **Settings**, enter the Sonarr address and API key (Sonarr › Settings ›
+      General), press **Test & load options**, and pick a quality profile and root folder.
+      Do the same for Radarr, and for Bazarr if you use it.
+   3. **Save.** The first syncs are a dry run: **Last sync** shows what would be added.
+      When it looks right, untick **Dry run** and save again.
+
+To update: `docker compose pull && docker compose up -d`. Settings, the Plex sign-in
+and the history live in `./data`.
+
+<details>
+<summary><b>Build it yourself instead</b></summary>
+
+```sh
+git clone https://github.com/DarkAngelGR/watchlist-sync.git
 cd watchlist-sync
+# in docker-compose.yml, swap the image: line for build: .
 docker compose up -d --build
 ```
+</details>
 
-To update later: `git pull && docker compose up -d --build`.
+## Friends' Watchlists
 
-Open **http://<nas-ip>:8789** and:
+Only your sign-in is needed. Each friend has to allow it once: in their Plex account,
+**Privacy › Watchlist** set to **Friends** (or wider). The **Users** card shows whose
+Watchlist is readable and who still has theirs private. Managed Plex Home users (no
+plex.tv account of their own) don't have a Watchlist Plex shares, so they aren't covered.
 
-1. **Sign in with Plex** — use the account that owns the server. Plex's own login page opens; nothing to copy.
-2. Under **Settings**, enter the Sonarr URL + API key (Sonarr → Settings → General), press **Test & load options**, pick a quality profile and root folder. Same for Radarr and Bazarr if you want them.
-3. **Save settings.** It starts in **dry run** — the "Last sync" card shows what it *would* add. When it looks right, untick *Dry run* and save.
+## Excluding someone
 
-Settings, login and history live in `watchlist-sync/data/`.
+In **Users**, press **Exclude…** next to a name. Before anything happens, you see:
 
-## Friends' watchlists
+- **What gets deleted:** titles watchlist-sync added *only* because of that person,
+  removed from Sonarr/Radarr **with their files**. Untick this to just stop syncing
+  their Watchlist.
+- **What's kept:** titles someone else also asked for or still has listed. Those stay;
+  only the person's `plex-<name>` tag is removed.
 
-Only your login is needed. Each friend must set their Plex account **Privacy → Watchlist** to **Friends only** (or wider). The **Users** card shows who is readable and who is private. Managed Plex Home users (no own plex.tv account) aren't covered.
+Anything that was in your library before watchlist-sync is never deleted. In dry run
+nothing is deleted at all. **Include again** brings the person back on the next sync.
 
-## Excluding a user
+## How it behaves
 
-In the **Users** card, click **Exclude…** next to someone. Before anything happens you see:
-
-- **What gets deleted:** titles watchlist-sync added *only* because of that user. They're removed from Sonarr/Radarr **together with their downloaded files**. You can untick this to just stop syncing their watchlist.
-- **What's kept:** titles someone else also requested or still has on their watchlist. Those stay; only the user's `plex-<name>` tag is removed.
-
-Anything that was already in your library before watchlist-sync is never deleted. With **Dry run** on, nothing is deleted, the result just shows what would have been. **Include again** brings the user back; their titles are re-added on the next sync.
-
-## Orama (Samsung TV)
-
-[Orama](https://github.com/DarkAngelGR/Orama) can search Plex's catalog for movies and shows you don't have and add them to your Plex Watchlist. It then asks watchlist-sync to sync right away, so the title reaches Sonarr/Radarr in seconds instead of on the next cycle. Orama finds watchlist-sync by itself when it runs on the same machine as Plex (port 8789); otherwise set the address in Orama's Settings › Downloads.
-
-- `POST /api/tv/sync`: start a sync now.
-- `GET /api/tv/queue`: what Sonarr/Radarr are downloading (progress, time left, status), grouped per movie/series, plus titles watchlist-sync added in the last 3 days that are still being searched for. Orama shows these on its home screen.
-- `GET /api/tv/collection?tmdb=ID`: the Radarr collection a movie belongs to, with every part and whether it's in Radarr / downloaded. Orama shows it on the movie's page.
-- `POST /api/tv/delete` `{kind: "movie"|"show", tmdb|tvdb, imdb}`: delete a movie from Radarr or a show from Sonarr, files included (nothing in dry run). It's remembered, so a watchlist it's still on doesn't bring it back; adding it to a watchlist again later does. Orama calls this from its Delete button.
-- `GET /api/tv`: what's set up and whether Sonarr/Radarr answer (`radarr_ok`, `sonarr_ok`), for the TV's status line.
-
-Only these endpoints allow cross-origin calls, and they need `UI_PASSWORD` when it's set (enter it in Orama's Settings). Your Sonarr/Radarr API keys never leave watchlist-sync.
+- Each title is handled once. Delete something from Sonarr/Radarr yourself and it
+  isn't re-added just because it's still on a Watchlist.
+- Removing a title from a Watchlist doesn't delete it from your library.
+- It syncs every 15 minutes by default (Settings), or right away with **Sync now**.
+- The Plex sign-in is refreshed daily so it doesn't expire.
+- Settings can be pre-filled with environment variables (see `.env.example`); values
+  saved on the web page win.
 
 ## Security
 
-The UI has no login by default and stores your Plex sign-in, so keep it on your LAN / Tailscale and don't route it through the Cloudflare tunnel. To add a password, set `UI_PASSWORD=...` in docker-compose (any username works).
+The web page stores your Plex sign-in and Sonarr/Radarr API keys, so:
 
-## Behaviour notes
+- Set `UI_PASSWORD` (any username works in the browser prompt).
+- Keep it on your home network or a VPN such as Tailscale. Don't expose it to the
+  internet through a reverse proxy or tunnel.
 
-- Each title is handled once. If you delete something from Sonarr later, it won't be re-added just because it's still on someone's watchlist.
-- Removing an item from a watchlist doesn't delete it from Sonarr/Radarr.
-- The Plex login is refreshed daily so it doesn't expire.
-- Settings can also be pre-filled with env vars (see `.env.example`); values saved in the UI take priority.
+Your API keys never leave the container: the web page and the TV endpoints below only
+ever see what's been requested, not the keys.
+
+## Orama (Samsung TV)
+
+[Orama](https://github.com/DarkAngelGR/FlexPlex), a Plex player for Samsung TVs, works
+with watchlist-sync. From the TV you can search Plex's whole catalog and add titles to
+your Watchlist, and watchlist-sync syncs right away. Orama also shows download progress,
+lists the parts of a collection you don't have yet, and can delete titles from
+Sonarr/Radarr. It finds watchlist-sync by itself when it runs on the same machine as
+Plex (port 8789).
+
+<details>
+<summary><b>TV endpoints</b></summary>
+
+These are the only endpoints that allow cross-origin calls. They need `UI_PASSWORD`
+(HTTP Basic, any username) when it's set.
+
+| Endpoint | What it does |
+| --- | --- |
+| `GET /api/tv` | Version, what's set up, and whether Sonarr/Radarr answer |
+| `POST /api/tv/sync` | Start a sync now (after a Watchlist add) |
+| `GET /api/tv/queue` | What Sonarr/Radarr are downloading, per movie/series, plus recent adds still being searched for |
+| `GET /api/tv/collection?tmdb=ID` | The Radarr collection a movie belongs to, every part, and which ones you have |
+| `POST /api/tv/delete` | `{kind: "movie"\|"show", tmdb\|tvdb, imdb}`: delete from Radarr/Sonarr with files (nothing in dry run). It isn't re-added while it stays on the same Watchlists; adding it to a Watchlist again later brings it back |
+</details>
+
+## For developers
+
+`app.py` is the whole service (Python standard library plus `requests`); `ui.html` is the
+web page; `python test_app.py` runs the tests against fake Plex/Sonarr/Radarr servers.
+Releases are published when `VERSION` in `app.py` changes on `main`.
+
+## License
+
+[MIT](LICENSE) © 2026 Aggelos (DarkAngelGR).
+
+Not affiliated with or endorsed by Plex, Inc., Sonarr, Radarr or Bazarr.
