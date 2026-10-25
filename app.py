@@ -15,6 +15,7 @@ owner's token; each friend's Plex privacy setting for "Watchlist" must be
 """
 import base64
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -34,7 +35,7 @@ log = logging.getLogger("watchlist-sync")
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLEXTV = "https://plex.tv"
 PRODUCT = "watchlist-sync"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 
 # --------------------------------------------------------------------------- settings
@@ -1165,6 +1166,58 @@ class Syncer:
                 summary["errors"].append(f"bazarr:{task}: {e}")
 
 
+# --------------------------------------------------------------------------- request origin
+# Browsers let any website send requests to addresses on your home network. So
+# commands are only accepted from this page itself, the TV app, or another
+# device on your network; and requests must name this server by an address or
+# a local name (a public domain pointing at it is how "DNS rebinding" works).
+LOCAL_SUFFIXES = (".local", ".lan", ".home", ".home.arpa", ".internal", ".localdomain", ".ts.net")
+
+
+def _extra_hosts():
+    return {h.strip().lower() for h in os.environ.get("ALLOWED_HOSTS", "").split(",") if h.strip()}
+
+
+def _local_name(host):
+    """An IP address, localhost, a bare machine name, or a home-network name."""
+    host = (host or "").strip("[]").lower()
+    if not host:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    return host == "localhost" or "." not in host or host.endswith(LOCAL_SUFFIXES) or host in _extra_hosts()
+
+
+def _private_host(host):
+    host = (host or "").strip("[]").lower()
+    if host == "localhost" or host.endswith(LOCAL_SUFFIXES) or host in _extra_hosts():
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_private or ip.is_loopback or ip.is_link_local
+    except ValueError:
+        return "." not in host and bool(host)
+
+
+def host_allowed(host_header):
+    return _local_name(urlparse("//" + (host_header or "")).hostname)
+
+
+def origin_allowed(origin, host_header):
+    """No Origin (curl, scripts), a non-web origin (the TV app runs from file://),
+    this server's own page, or a page on another home-network device."""
+    if not origin or origin == "null":
+        return True
+    u = urlparse(origin)
+    if u.scheme not in ("http", "https"):
+        return True
+    own = urlparse("//" + (host_header or "")).hostname
+    return (u.hostname or "") == (own or "") or _private_host(u.hostname)
+
+
 # --------------------------------------------------------------------------- web ui / api
 def make_handler(syncer, ui_password):
     with open(os.path.join(HERE, "ui.html"), "rb") as f:
@@ -1176,9 +1229,12 @@ def make_handler(syncer, ui_password):
 
         def _cors(self):
             # Only the TV endpoints are cross-origin: a TV app's page isn't served
-            # from here. They still require UI_PASSWORD when it is set.
-            if self._tv():
-                self.send_header("Access-Control-Allow-Origin", "*")
+            # from here. They still require UI_PASSWORD when it is set, and only
+            # origins on your own network get an answer (see origin_allowed).
+            origin = self.headers.get("Origin")
+            if self._tv() and origin_allowed(origin, self.headers.get("Host")):
+                self.send_header("Access-Control-Allow-Origin", origin or "*")
+                self.send_header("Vary", "Origin")
                 self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
                 self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
                 self.send_header("Access-Control-Max-Age", "600")
@@ -1193,8 +1249,21 @@ def make_handler(syncer, ui_password):
             self.end_headers()
             self.wfile.write(body)
 
+        def _guard(self, command=False):
+            """Refuse requests a foreign website could have made through your browser."""
+            if not host_allowed(self.headers.get("Host")):
+                self._send(403, {"error": "Unknown host name: open this by its IP address, or add the "
+                                          "name to ALLOWED_HOSTS"})
+                return False
+            if command and not origin_allowed(self.headers.get("Origin"), self.headers.get("Host")):
+                self._send(403, {"error": "Request from another website refused"})
+                return False
+            return True
+
         def do_OPTIONS(self):
             # CORS preflight carries no credentials, so it skips _authed.
+            if not self._guard(command=True):
+                return
             self.send_response(204 if self._tv() else 404)
             self._cors()
             self.send_header("Content-Length", "0")
@@ -1225,6 +1294,8 @@ def make_handler(syncer, ui_password):
             return json.loads(self.rfile.read(n) or b"{}") if n else {}
 
         def do_GET(self):
+            if not self.path.startswith("/health") and not self._guard():
+                return
             if not self._authed():
                 return
             p = self.path.split("?")[0]
@@ -1282,6 +1353,8 @@ def make_handler(syncer, ui_password):
             self._send(404, {"error": "not found"})
 
         def do_POST(self):
+            if not self._guard(command=True):
+                return
             if not self._authed():
                 return
             p = self.path.split("?")[0]

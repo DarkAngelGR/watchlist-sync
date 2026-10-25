@@ -108,6 +108,13 @@ The web page stores your Plex sign-in and Sonarr/Radarr API keys, so:
 - Keep it on your home network or a VPN such as Tailscale. Don't expose it to the
   internet through a reverse proxy or tunnel.
 
+It also refuses requests that another website could make through your browser:
+commands are only accepted from its own page, the Orama TV app, or other devices on
+your network, and it only answers to an IP address or a local name (`nas.local`,
+a bare machine name, a Tailscale `*.ts.net` name). If you reach it by another name,
+for example behind a reverse proxy, add that name to `ALLOWED_HOSTS`
+(comma-separated) in the environment.
+
 Your API keys never leave the container: the web page and the TV endpoints below only
 ever see what's been requested, not the keys.
 

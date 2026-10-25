@@ -266,6 +266,21 @@ code, h = raw("/api/tv/sync", "OPTIONS")
 assert code == 204 and h["Access-Control-Allow-Origin"] == "*" and "Authorization" in h["Access-Control-Allow-Headers"]
 assert raw("/api/tv")[1].get("Access-Control-Allow-Origin") == "*"
 assert "Access-Control-Allow-Origin" not in raw("/api/status")[1]
+# other websites can't drive it through your browser; the TV app and LAN pages can
+evil = {"Origin": "https://evil.example", "Content-Type": "text/plain"}
+assert raw("/api/sync", "POST", evil)[0] == 403
+assert raw("/api/tv/delete", "OPTIONS", {"Origin": "https://evil.example"})[0] == 403
+assert "Access-Control-Allow-Origin" not in raw("/api/tv", headers={"Origin": "https://evil.example"})[1]
+assert raw("/api/settings", headers={"Host": "evil.example:8789"})[0] == 403          # DNS rebinding
+assert raw("/health", headers={"Host": "evil.example"})[0] == 200
+assert raw("/api/tv/sync", "POST", {"Origin": "file://"})[0] == 202                   # Orama on the TV
+assert raw("/api/tv/sync", "OPTIONS", {"Origin": "null"})[1].get("Access-Control-Allow-Origin") == "null"
+assert raw("/api/tv", headers={"Origin": "http://192.168.1.20:8800"})[1].get("Access-Control-Allow-Origin") == "http://192.168.1.20:8800"
+assert raw("/api/settings", headers={"Host": "nas.local:8789"})[0] == 200
+assert raw("/api/settings", headers={"Host": "nas.tail1234.ts.net"})[0] == 200
+os.environ["ALLOWED_HOSTS"] = "sync.example.com"
+assert raw("/api/settings", headers={"Host": "sync.example.com"})[0] == 200
+del os.environ["ALLOWED_HOSTS"]
 srv2 = ThreadingHTTPServer(("127.0.0.1", 0), app.make_handler(s, "pw"))
 threading.Thread(target=srv2.serve_forever, daemon=True).start()
 b2 = f"http://127.0.0.1:{srv2.server_port}"
