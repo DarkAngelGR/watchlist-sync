@@ -873,7 +873,7 @@ class Syncer:
         })
         return body
 
-    # -- TV clients (FlexPlex): status line, and "sync now" after a Watchlist add
+    # -- TV clients (Orama): status line, and "sync now" after a Watchlist add
     @staticmethod
     def _reachable(arr_cfg):
         """Can we open a connection to this Sonarr/Radarr? (3 s, no API key needed)"""
@@ -893,7 +893,7 @@ class Syncer:
                 "radarr_ok": self._reachable(cfg.radarr), "sonarr_ok": self._reachable(cfg.sonarr),
                 "dry_run": cfg.dry_run, "signed_in": bool(cfg.plex_token)}
 
-    # -- downloads in progress, for FlexPlex (GET /api/tv/queue)
+    # -- downloads in progress, for Orama (GET /api/tv/queue)
     QUEUE_TTL = 4           # seconds; the TV asks every 5 s
     SEARCHING_DAYS = 3      # titles added this recently, with nothing downloaded yet, show as "Searching"
 
@@ -996,7 +996,7 @@ class Syncer:
                             "status": "searching", "progress": 0, "detail": ""})
         return out
 
-    # -- a movie's collection, for FlexPlex (GET /api/tv/collection?tmdb=ID)
+    # -- a movie's collection, for Orama (GET /api/tv/collection?tmdb=ID)
     COLLECTION_TTL = 600
 
     def tv_collection(self, tmdb):

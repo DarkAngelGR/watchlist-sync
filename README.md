@@ -40,16 +40,16 @@ In the **Users** card, click **Exclude…** next to someone. Before anything hap
 
 Anything that was already in your library before watchlist-sync is never deleted. With **Dry run** on, nothing is deleted, the result just shows what would have been. **Include again** brings the user back; their titles are re-added on the next sync.
 
-## FlexPlex (Samsung TV)
+## Orama (Samsung TV)
 
-[FlexPlex](https://github.com/DarkAngelGR/samsucks) can search Plex's catalog for movies and shows you don't have and add them to your Plex Watchlist. It then asks watchlist-sync to sync right away, so the title reaches Sonarr/Radarr in seconds instead of on the next cycle. FlexPlex finds watchlist-sync by itself when it runs on the same machine as Plex (port 8789); otherwise set the address in FlexPlex's Settings › Downloads.
+[Orama](https://github.com/DarkAngelGR/Orama) can search Plex's catalog for movies and shows you don't have and add them to your Plex Watchlist. It then asks watchlist-sync to sync right away, so the title reaches Sonarr/Radarr in seconds instead of on the next cycle. Orama finds watchlist-sync by itself when it runs on the same machine as Plex (port 8789); otherwise set the address in Orama's Settings › Downloads.
 
 - `POST /api/tv/sync`: start a sync now.
-- `GET /api/tv/queue`: what Sonarr/Radarr are downloading (progress, time left, status), grouped per movie/series, plus titles watchlist-sync added in the last 3 days that are still being searched for. FlexPlex shows these on its home screen.
-- `GET /api/tv/collection?tmdb=ID`: the Radarr collection a movie belongs to, with every part and whether it's in Radarr / downloaded. FlexPlex shows it on the movie's page.
+- `GET /api/tv/queue`: what Sonarr/Radarr are downloading (progress, time left, status), grouped per movie/series, plus titles watchlist-sync added in the last 3 days that are still being searched for. Orama shows these on its home screen.
+- `GET /api/tv/collection?tmdb=ID`: the Radarr collection a movie belongs to, with every part and whether it's in Radarr / downloaded. Orama shows it on the movie's page.
 - `GET /api/tv`: what's set up and whether Sonarr/Radarr answer (`radarr_ok`, `sonarr_ok`), for the TV's status line.
 
-Only these endpoints allow cross-origin calls, and they need `UI_PASSWORD` when it's set (enter it in FlexPlex's Settings). Your Sonarr/Radarr API keys never leave watchlist-sync.
+Only these endpoints allow cross-origin calls, and they need `UI_PASSWORD` when it's set (enter it in Orama's Settings). Your Sonarr/Radarr API keys never leave watchlist-sync.
 
 ## Security
 
