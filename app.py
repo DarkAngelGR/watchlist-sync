@@ -213,6 +213,19 @@ class State:
         return [{"service": s, "id": i, "title": t, "users": {x.lower() for x in (u or "").split(",") if x}}
                 for s, i, t, u in rows]
 
+    def deleted_users(self, service, ext_id):
+        """For a title deleted from a TV: who still had it on their watchlist
+        then (and since). None if it wasn't deleted that way."""
+        with self.lock:
+            row = self.db.execute("SELECT users FROM handled WHERE service=? AND ext_id=? AND result='deleted'",
+                                  (service, ext_id)).fetchone()
+        return None if row is None else {x.lower() for x in (row[0] or "").split(",") if x}
+
+    def set_users(self, service, ext_id, users):
+        with self.lock, self.db:
+            self.db.execute("UPDATE handled SET users=? WHERE service=? AND ext_id=?",
+                            (",".join(sorted(users)), service, ext_id))
+
     def forget(self, service, ext_id):
         with self.lock, self.db:
             self.db.execute("DELETE FROM handled WHERE service=? AND ext_id=?", (service, ext_id))
@@ -472,12 +485,18 @@ class Arr:
             ids.append(self._tags[label])
         return ids
 
-    def find(self, ext_id):
-        """Return the series/movie object in Sonarr/Radarr for a TVDB/TMDB id, or None."""
+    def find(self, ext_id, imdb=None):
+        """Return the series/movie object in Sonarr/Radarr for a TVDB/TMDB id
+        (or, failing that, an IMDb id), or None."""
         key, path = ("tvdbId", "/series") if self.name == "Sonarr" else ("tmdbId", "/movie")
-        for x in self.get(path):
-            if x.get(key) == ext_id:
+        items = self.get(path)
+        for x in items:
+            if ext_id and x.get(key) == ext_id:
                 return x
+        if imdb:
+            for x in items:
+                if (x.get("imdbId") or "").lower() == imdb.lower():
+                    return x
         return None
 
     def delete(self, obj):
@@ -770,6 +789,8 @@ class Syncer:
         for tvdb, it in grouped.items():
             title = it["title"]
             try:
+                if self._skip_deleted("sonarr", tvdb, it["users"]):
+                    continue
                 if self.state.is_handled("sonarr", tvdb):
                     continue
                 if tvdb in existing:
@@ -827,6 +848,8 @@ class Syncer:
         for tmdb, it in grouped.items():
             title = it["title"]
             try:
+                if self._skip_deleted("radarr", tmdb, it["users"]):
+                    continue
                 if self.state.is_handled("radarr", tmdb):
                     continue
                 if tmdb in existing:
@@ -1050,6 +1073,48 @@ class Syncer:
         cache[tmdb] = (time.time(), result)
         return result
 
+    # -- deleting a title from a TV (POST /api/tv/delete)
+    def tv_delete(self, kind, ext_id, imdb, title):
+        """Remove a movie (Radarr) or show (Sonarr) and its files. The title is
+        remembered as deleted, so a watchlist it is still on doesn't bring it
+        back; adding it to a watchlist again later does."""
+        cfg = Config(self.settings.all())
+        service, acfg, name = ("radarr", cfg.radarr, "Radarr") if kind == "movie" else ("sonarr", cfg.sonarr, "Sonarr")
+        if not acfg.enabled:
+            return {"service": service, "configured": False, "found": False, "deleted": False}
+        arr = Arr(name, acfg)
+        obj = arr.find(ext_id, imdb)
+        if not obj:
+            return {"service": service, "configured": True, "found": False, "deleted": False}
+        key = "tmdbId" if kind == "movie" else "tvdbId"
+        real_id = obj.get(key) or ext_id
+        label = obj.get("title") or title or "?"
+        if cfg.dry_run:
+            log.info("[dry-run] TV would delete '%s' and its files from %s", label, name)
+            return {"service": service, "configured": True, "found": True, "deleted": False, "dry_run": True}
+        with self.lock:
+            arr.delete(obj)
+            if real_id:
+                self.state.mark(service, int(real_id), label, self.state.wanters(service, int(real_id)), "deleted")
+        self._queue_cache = None
+        self.__dict__.get("_collection_cache", {}).clear()
+        log.info("Deleted '%s' and its files from %s (from a TV)", label, name)
+        return {"service": service, "configured": True, "found": True, "deleted": True, "title": label}
+
+    def _skip_deleted(self, service, ext_id, users):
+        """True while a TV-deleted title should stay deleted. Users who drop it
+        from their watchlist are forgotten; anyone adding it (again) brings it back."""
+        before = self.state.deleted_users(service, ext_id)
+        if before is None:
+            return False
+        now = {u.lower() for u in users}
+        if now - before:
+            self.state.forget(service, ext_id)
+            return False
+        if now != before:
+            self.state.set_users(service, ext_id, now)
+        return True
+
     def tv_queue(self):
         now = time.time()
         cached = getattr(self, "_queue_cache", None)
@@ -1229,6 +1294,22 @@ def make_handler(syncer, ui_password):
                 # A TV just added something to the Plex Watchlist: sync now.
                 syncer.wake.set()
                 return self._send(202, {"queued": True})
+            if p == "/api/tv/delete":
+                kind = body.get("kind")
+                if kind not in ("movie", "show"):
+                    return self._send(400, {"error": "kind must be movie or show"})
+                try:
+                    ext_id = int(body.get("tmdb" if kind == "movie" else "tvdb") or 0)
+                except (TypeError, ValueError):
+                    ext_id = 0
+                imdb = str(body.get("imdb") or "")
+                if not ext_id and not imdb:
+                    return self._send(400, {"error": "No TMDB/TVDB or IMDb id for this title"})
+                try:
+                    return self._send(200, syncer.tv_delete(kind, ext_id, imdb, str(body.get("title") or "")))
+                except (requests.RequestException, ArrError) as e:
+                    svc = "Radarr" if kind == "movie" else "Sonarr"
+                    return self._send(502, {"error": f"{svc}: {str(e)[:200]}"})
             if p == "/api/plex/pin":
                 try:
                     return self._send(200, plex_create_pin(syncer.client_id))

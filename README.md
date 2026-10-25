@@ -47,6 +47,7 @@ Anything that was already in your library before watchlist-sync is never deleted
 - `POST /api/tv/sync`: start a sync now.
 - `GET /api/tv/queue`: what Sonarr/Radarr are downloading (progress, time left, status), grouped per movie/series, plus titles watchlist-sync added in the last 3 days that are still being searched for. Orama shows these on its home screen.
 - `GET /api/tv/collection?tmdb=ID`: the Radarr collection a movie belongs to, with every part and whether it's in Radarr / downloaded. Orama shows it on the movie's page.
+- `POST /api/tv/delete` `{kind: "movie"|"show", tmdb|tvdb, imdb}`: delete a movie from Radarr or a show from Sonarr, files included (nothing in dry run). It's remembered, so a watchlist it's still on doesn't bring it back; adding it to a watchlist again later does. Orama calls this from its Delete button.
 - `GET /api/tv`: what's set up and whether Sonarr/Radarr answer (`radarr_ok`, `sonarr_ok`), for the TV's status line.
 
 Only these endpoints allow cross-origin calls, and they need `UI_PASSWORD` when it's set (enter it in Orama's Settings). Your Sonarr/Radarr API keys never leave watchlist-sync.

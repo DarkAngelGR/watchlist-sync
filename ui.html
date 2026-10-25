@@ -273,7 +273,7 @@ function renderRequests(){
     ? `<table><tr><th>Title</th><th>Where</th><th>Requested by</th><th>Result</th><th>When</th></tr>${
         rows.map(x => `<tr><td>${esc(x.title)}</td><td class="mute">${x.service === "sonarr" ? "Sonarr" : "Radarr"}</td>
           <td>${esc((x.users||"").split(",").join(", "))}</td>
-          <td><span class="tag ${x.result === "added" ? "added" : ""}">${x.result === "added" ? "added" : "already there"}</span></td>
+          <td><span class="tag ${x.result === "added" ? "added" : ""}">${x.result === "added" ? "added" : x.result === "deleted" ? "deleted on a TV" : "already there"}</span></td>
           <td class="mute small">${ago(x.ts)}</td></tr>`).join("")}</table>`
     : `<span class="mute small">Nothing yet.</span>`;
 }

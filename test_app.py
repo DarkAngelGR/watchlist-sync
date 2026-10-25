@@ -349,6 +349,42 @@ try:
 except urllib.error.HTTPError as e:
     assert e.code == 400
 requests.Session.request = prev2
+# --- deleting from a TV: Radarr/Sonarr delete with files, and it stays deleted
+prev3 = requests.Session.request
+deleted = []
+def del_fake(self, method, url, params=None, json=None, headers=None, timeout=None):
+    if method == "DELETE":
+        deleted.append((url.split("/api/v3")[1], dict(params or {})))
+        return Resp(body={})
+    if url.endswith(":7878/api/v3/movie") and not params:
+        return Resp(body=[{"id": 31, "tmdbId": 27205, "imdbId": "tt1375666", "title": "Inception"}])
+    if url.endswith(":8989/api/v3/series") and not params:
+        return Resp(body=[{"id": 41, "tvdbId": 121361, "imdbId": "tt0944947", "title": "Game of Thrones"}])
+    return prev3(self, method, url, params=params, json=json, headers=headers, timeout=timeout)
+requests.Session.request = del_fake
+assert call("/api/tv/delete", {"kind": "movie", "tmdb": 27205})["dry_run"] and not deleted   # dry run deletes nothing
+was_dry = s.settings.all()["dry_run"]
+s.settings.update({"dry_run": False})
+r = call("/api/tv/delete", {"kind": "movie", "tmdb": 27205, "title": "Inception"})
+assert r["deleted"] and r["service"] == "radarr", r
+assert deleted[-1] == ("/movie/31", {"deleteFiles": "true", "addImportExclusion": "false"}), deleted
+r = call("/api/tv/delete", {"kind": "show", "imdb": "tt0944947"})          # no tvdb: found by IMDb id
+assert r["deleted"] and deleted[-1][0] == "/series/41", (r, deleted)
+assert call("/api/tv/delete", {"kind": "movie", "tmdb": 1})["found"] is False
+for bad in ({"kind": "song", "tmdb": 1}, {"kind": "movie"}):
+    try:
+        call("/api/tv/delete", bad); raise AssertionError("expected 400")
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+# stays deleted while the same people have it listed; someone adding it again brings it back
+s.state.mark("radarr", 27205, "Inception", {"aggelos", "maria"}, "deleted")
+assert s._skip_deleted("radarr", 27205, {"aggelos", "maria"})
+assert s._skip_deleted("radarr", 27205, {"maria"})                       # aggelos removed it from his watchlist
+assert s.state.deleted_users("radarr", 27205) == {"maria"}
+assert not s._skip_deleted("radarr", 27205, {"maria", "aggelos"})        # ...and later added it again
+assert s.state.deleted_users("radarr", 27205) is None and not s.state.is_handled("radarr", 27205)
+s.settings.update({"dry_run": was_dry})
+requests.Session.request = prev3
 print("tv tests OK")
 
 call("/api/plex/logout", {})
