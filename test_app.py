@@ -277,6 +277,46 @@ auth = {"Authorization": "Basic " + b64.b64encode(b"tv:pw").decode()}
 assert raw("/api/tv", headers=auth, server=b2)[0] == 200
 assert raw("/api/tv/sync", "OPTIONS", server=b2)[0] == 204         # preflight needs no password
 srv2.shutdown()
+
+# --- download progress for FlexPlex: Radarr + Sonarr queues, grouped, plus "searching"
+prev = requests.Session.request
+def queue_fake(self, method, url, params=None, json=None, headers=None, timeout=None):
+    if url.endswith(":7878/api/v3/queue"):
+        assert params["includeMovie"] == "true"
+        return Resp(body={"records": [
+            {"movieId": 5, "status": "downloading", "trackedDownloadState": "downloading", "size": 1000, "sizeleft": 250,
+             "timeleft": "00:12:30", "movie": {"title": "Dune: Part Two", "year": 2024, "tmdbId": 693134, "imdbId": "tt15239678",
+             "images": [{"coverType": "poster", "remoteUrl": "https://image.tmdb.org/p.jpg"}]}},
+            {"movieId": 6, "status": "completed", "trackedDownloadState": "importPending", "size": 10, "sizeleft": 0,
+             "movie": {"title": "Arrival", "year": 2016, "tmdbId": 329865}}]})
+    if url.endswith(":8989/api/v3/queue"):
+        return Resp(body={"records": [
+            {"seriesId": 9, "status": "downloading", "size": 400, "sizeleft": 300, "timeleft": "1.02:00:00",
+             "series": {"title": "Severance", "year": 2022, "tvdbId": 371980}, "episode": {"seasonNumber": 2, "episodeNumber": 1}},
+            {"seriesId": 9, "status": "queued", "size": 600, "sizeleft": 600, "timeleft": None,
+             "series": {"title": "Severance", "year": 2022, "tvdbId": 371980}, "episode": {"seasonNumber": 2, "episodeNumber": 2}}]})
+    if url.endswith(":7878/api/v3/movie"):
+        return Resp(body=[{"title": "Searching Movie", "year": 2025, "tmdbId": 4242, "hasFile": False, "monitored": True},
+                          {"title": "Old Movie", "tmdbId": 1, "hasFile": False, "monitored": True}])
+    if url.endswith(":8989/api/v3/series"):
+        return Resp(body=[])
+    return prev(self, method, url, params=params, json=json, headers=headers, timeout=timeout)
+requests.Session.request = queue_fake
+s.state.mark("radarr", 4242, "Searching Movie", {"aggelos"}, "added")
+q = call("/api/tv/queue")
+by = {x["title"]: x for x in q["items"]}
+assert q["errors"] == {}, q
+# downloading first (furthest along first), then importing, then searching
+assert [x["title"] for x in q["items"]] == ["Dune: Part Two", "Severance", "Arrival", "Searching Movie"], [x["title"] for x in q["items"]]
+d = by["Dune: Part Two"]
+assert d["kind"] == "movie" and d["progress"] == 75.0 and d["status"] == "downloading" and d["timeleft"] == 750 and d["tmdb"] == 693134, d
+assert d["poster"] == "https://image.tmdb.org/p.jpg", d
+sv = by["Severance"]
+assert sv["kind"] == "show" and sv["progress"] == 10.0 and sv["detail"] == "2 episodes" and sv["timeleft"] == 93600 and sv["status"] == "downloading", sv
+assert by["Arrival"]["status"] == "importing", by["Arrival"]
+assert by["Searching Movie"]["status"] == "searching" and "Old Movie" not in by, q   # only recent watchlist-sync adds
+assert raw("/api/tv/queue")[1].get("Access-Control-Allow-Origin") == "*"
+requests.Session.request = prev
 print("tv tests OK")
 
 call("/api/plex/logout", {})

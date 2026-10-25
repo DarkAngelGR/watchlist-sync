@@ -893,6 +893,136 @@ class Syncer:
                 "radarr_ok": self._reachable(cfg.radarr), "sonarr_ok": self._reachable(cfg.sonarr),
                 "dry_run": cfg.dry_run, "signed_in": bool(cfg.plex_token)}
 
+    # -- downloads in progress, for FlexPlex (GET /api/tv/queue)
+    QUEUE_TTL = 8           # seconds; the TV asks every ~10 s
+    SEARCHING_DAYS = 3      # titles added this recently, with nothing downloaded yet, show as "Searching"
+
+    @staticmethod
+    def _secs(timeleft):
+        """Sonarr/Radarr's 'D.HH:MM:SS' / 'HH:MM:SS' to seconds (None if unknown)."""
+        m = re.fullmatch(r"(?:(\d+)\.)?(\d+):(\d+):(\d+)(?:\.\d+)?", timeleft or "")
+        if not m:
+            return None
+        d, h, mi, se = (int(x or 0) for x in m.groups())
+        return ((d * 24 + h) * 60 + mi) * 60 + se
+
+    @staticmethod
+    def _status(rec):
+        st = (rec.get("trackedDownloadState") or "").lower()
+        raw = (rec.get("status") or "").lower()
+        if st in ("importpending", "importing", "imported") or raw == "completed":
+            return "importing"
+        if st in ("failed", "failedpending") or raw == "failed":
+            return "failed"
+        if (rec.get("trackedDownloadStatus") or "").lower() == "warning" or raw == "warning":
+            return "stalled"
+        if raw in ("paused",):
+            return "paused"
+        if raw in ("queued", "delay", "downloadclientunavailable"):
+            return "queued"
+        return "downloading"
+
+    @staticmethod
+    def _poster(obj):
+        for img in obj.get("images") or []:
+            if img.get("coverType") == "poster":
+                return img.get("remoteUrl") or ""
+        return ""
+
+    def _queue_of(self, arr, kind):
+        """Group one Sonarr/Radarr queue by movie/series."""
+        rank = {"downloading": 0, "importing": 1, "stalled": 2, "paused": 3, "queued": 4, "failed": 5}
+        params = {"page": 1, "pageSize": 200}
+        params["includeMovie" if kind == "movie" else "includeSeries"] = "true"
+        if kind == "show":
+            params["includeEpisode"] = "true"
+        r = request(arr.s, "GET", arr.base + "/queue", retries=0, params=params, timeout=8)
+        r.raise_for_status()
+        groups = {}
+        for rec in r.json().get("records", []):
+            obj = rec.get("movie" if kind == "movie" else "series") or {}
+            key = rec.get("movieId" if kind == "movie" else "seriesId")
+            if key is None:
+                continue
+            g = groups.setdefault(key, {
+                "kind": kind, "title": obj.get("title") or rec.get("title") or "?", "year": obj.get("year"),
+                "tmdb": obj.get("tmdbId"), "tvdb": obj.get("tvdbId"), "imdb": obj.get("imdbId") or "",
+                "poster": self._poster(obj), "size": 0, "sizeleft": 0, "timeleft": None,
+                "status": "queued", "episodes": [],
+            })
+            g["size"] += rec.get("size") or 0
+            g["sizeleft"] += rec.get("sizeleft") or 0
+            t = self._secs(rec.get("timeleft"))
+            if t is not None:
+                g["timeleft"] = max(g["timeleft"] or 0, t)
+            st = self._status(rec)
+            if rank[st] < rank[g["status"]]:
+                g["status"] = st
+            ep = rec.get("episode") or {}
+            if ep.get("episodeNumber") is not None:
+                g["episodes"].append("S%02dE%02d" % (ep.get("seasonNumber") or 0, ep["episodeNumber"]))
+        out = []
+        for g in groups.values():
+            g["progress"] = round(100 * (1 - g["sizeleft"] / g["size"]), 1) if g["size"] else 0
+            eps = sorted(set(g.pop("episodes")))
+            g["detail"] = eps[0] if len(eps) == 1 else (f"{len(eps)} episodes" if eps else "")
+            out.append(g)
+        return out
+
+    def _searching(self, arr, kind, queued_ids):
+        """Titles watchlist-sync added in the last few days that have nothing
+        downloaded and aren't in the queue: Sonarr/Radarr are still looking."""
+        service = "radarr" if kind == "movie" else "sonarr"
+        since = time.time() - self.SEARCHING_DAYS * 86400
+        recent = {int(r["id"]) for r in self.state.recent(500)
+                  if r["service"] == service and r["result"] == "added" and r["ts"] >= since and str(r["id"]).isdigit()}
+        if not recent:
+            return []
+        r = request(arr.s, "GET", arr.base + ("/movie" if kind == "movie" else "/series"), retries=0, timeout=10)
+        r.raise_for_status()
+        out = []
+        for obj in r.json():
+            ext = obj.get("tmdbId" if kind == "movie" else "tvdbId")
+            if ext not in recent or ext in queued_ids:
+                continue
+            if kind == "movie":
+                empty = not obj.get("hasFile")
+            else:
+                empty = not (obj.get("statistics") or {}).get("episodeFileCount")
+            if empty and obj.get("monitored", True):
+                out.append({"kind": kind, "title": obj.get("title") or "?", "year": obj.get("year"),
+                            "tmdb": obj.get("tmdbId"), "tvdb": obj.get("tvdbId"), "imdb": obj.get("imdbId") or "",
+                            "poster": self._poster(obj), "size": 0, "sizeleft": 0, "timeleft": None,
+                            "status": "searching", "progress": 0, "detail": ""})
+        return out
+
+    def tv_queue(self):
+        now = time.time()
+        cached = getattr(self, "_queue_cache", None)
+        if cached and now - cached[0] < self.QUEUE_TTL:
+            return cached[1]
+        cfg = Config(self.settings.all())
+        items, errors = [], {}
+        for name, acfg, kind in (("radarr", cfg.radarr, "movie"), ("sonarr", cfg.sonarr, "show")):
+            if not acfg.enabled:
+                continue
+            arr = Arr(name.capitalize(), acfg)
+            try:
+                q = self._queue_of(arr, kind)
+                ids = {x["tmdb"] if kind == "movie" else x["tvdb"] for x in q}
+                items += q
+                try:
+                    items += self._searching(arr, kind, ids)
+                except requests.RequestException as e:
+                    log.debug("searching check failed for %s: %s", name, e)
+            except requests.RequestException as e:
+                errors[name] = str(e)[:200]
+        order = {"downloading": 0, "importing": 1, "stalled": 2, "paused": 3, "queued": 4, "searching": 5, "failed": 6}
+        items.sort(key=lambda x: (order.get(x["status"], 9), -(x["progress"] or 0)))
+        result = {"items": items, "errors": errors}
+        self._queue_cache = (now, result)
+        return result
+
     def _nudge_bazarr(self, summary, cfg=None):
         """Make Bazarr pick up the new series/movies now instead of on its next sync."""
         cfg = cfg or self.cfg
@@ -999,6 +1129,8 @@ def make_handler(syncer, ui_password):
                 return self._send(200, syncer.settings.public())
             if p == "/api/tv":
                 return self._send(200, syncer.tv_info())
+            if p == "/api/tv/queue":
+                return self._send(200, syncer.tv_queue())
             m = re.fullmatch(r"/api/users/([^/]+)/plan", p)
             if m:
                 return self._send(200, syncer.deletion_plan(unquote(m.group(1))))
