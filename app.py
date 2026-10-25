@@ -26,7 +26,7 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlencode
+from urllib.parse import unquote, urlencode, urlparse, parse_qs
 
 import requests
 
@@ -996,6 +996,60 @@ class Syncer:
                             "status": "searching", "progress": 0, "detail": ""})
         return out
 
+    # -- a movie's collection, for FlexPlex (GET /api/tv/collection?tmdb=ID)
+    COLLECTION_TTL = 600
+
+    def tv_collection(self, tmdb):
+        """The Radarr collection a movie belongs to, with every part (owned or
+        not). Radarr keeps a collection for any movie it manages; for one it
+        doesn't, there's nothing to list. {'collection': None} when unknown."""
+        cache = self.__dict__.setdefault("_collection_cache", {})
+        hit = cache.get(tmdb)
+        if hit and time.time() - hit[0] < self.COLLECTION_TTL:
+            return hit[1]
+        cfg = Config(self.settings.all())
+        if not cfg.radarr.enabled:
+            return {"collection": None, "reason": "radarr not set up"}
+        arr = Arr("Radarr", cfg.radarr)
+        get = lambda path, **params: request(arr.s, "GET", arr.base + path, retries=0, params=params, timeout=10)
+        r = get("/movie", tmdbId=tmdb)
+        r.raise_for_status()
+        movies = r.json()
+        movie = movies[0] if movies else None
+        coll = (movie or {}).get("collection") or {}
+        if not coll.get("tmdbId"):
+            # Not in Radarr: its lookup still names the collection.
+            r = get("/movie/lookup/tmdb", tmdbId=tmdb)
+            if r.status_code == 200:
+                coll = (r.json() or {}).get("collection") or {}
+        if not coll.get("tmdbId"):
+            result = {"collection": None}
+        else:
+            r = get("/collection", tmdbId=coll["tmdbId"])
+            r.raise_for_status()
+            found = r.json() or []
+            c = found[0] if found else None
+            if not c:
+                result = {"collection": None, "title": coll.get("title")}
+            else:
+                parts = []
+                for m in c.get("movies") or []:
+                    tid = m.get("tmdbId")
+                    have = m.get("isExisting")
+                    entry = {"tmdb": tid, "title": m.get("title") or "?", "year": m.get("year"),
+                             "imdb": m.get("imdbId") or "", "poster": self._poster(m), "inRadarr": False,
+                             "hasFile": False, "monitored": False}
+                    if have is None or have:
+                        rr = get("/movie", tmdbId=tid)
+                        if rr.status_code == 200 and rr.json():
+                            rm = rr.json()[0]
+                            entry.update(inRadarr=True, hasFile=bool(rm.get("hasFile")), monitored=bool(rm.get("monitored")))
+                    parts.append(entry)
+                parts.sort(key=lambda x: (x["year"] or 9999, x["title"]))
+                result = {"collection": {"title": c.get("title") or coll.get("title"), "tmdb": coll["tmdbId"], "movies": parts}}
+        cache[tmdb] = (time.time(), result)
+        return result
+
     def tv_queue(self):
         now = time.time()
         cached = getattr(self, "_queue_cache", None)
@@ -1131,6 +1185,16 @@ def make_handler(syncer, ui_password):
                 return self._send(200, syncer.tv_info())
             if p == "/api/tv/queue":
                 return self._send(200, syncer.tv_queue())
+            if p == "/api/tv/collection":
+                qs = parse_qs(urlparse(self.path).query)
+                try:
+                    tmdb = int((qs.get("tmdb") or [""])[0])
+                except ValueError:
+                    return self._send(400, {"error": "tmdb id needed"})
+                try:
+                    return self._send(200, syncer.tv_collection(tmdb))
+                except requests.RequestException as e:
+                    return self._send(502, {"error": "Radarr: " + str(e)[:200]})
             m = re.fullmatch(r"/api/users/([^/]+)/plan", p)
             if m:
                 return self._send(200, syncer.deletion_plan(unquote(m.group(1))))

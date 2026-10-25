@@ -317,6 +317,38 @@ assert by["Arrival"]["status"] == "importing", by["Arrival"]
 assert by["Searching Movie"]["status"] == "searching" and "Old Movie" not in by, q   # only recent watchlist-sync adds
 assert raw("/api/tv/queue")[1].get("Access-Control-Allow-Origin") == "*"
 requests.Session.request = prev
+# --- a movie's collection for FlexPlex (from Radarr)
+prev2 = requests.Session.request
+def coll_fake(self, method, url, params=None, json=None, headers=None, timeout=None):
+    if url.endswith(":7878/api/v3/movie") and params and "tmdbId" in params:
+        db = {155: {"tmdbId": 155, "title": "The Dark Knight", "hasFile": True, "monitored": True, "collection": {"title": "The Dark Knight Collection", "tmdbId": 263}},
+              272: {"tmdbId": 272, "title": "Batman Begins", "hasFile": True, "monitored": True},
+              49026: {"tmdbId": 49026, "title": "The Dark Knight Rises", "hasFile": False, "monitored": True}}
+        m = db.get(int(params["tmdbId"]))
+        return Resp(body=[m] if m else [])
+    if url.endswith(":7878/api/v3/collection"):
+        assert params["tmdbId"] == 263
+        return Resp(body=[{"title": "The Dark Knight Collection", "tmdbId": 263, "movies": [
+            {"tmdbId": 49026, "title": "The Dark Knight Rises", "year": 2012, "isExisting": True, "images": [{"coverType": "poster", "remoteUrl": "https://img/rises.jpg"}]},
+            {"tmdbId": 155, "title": "The Dark Knight", "year": 2008, "isExisting": True},
+            {"tmdbId": 272, "title": "Batman Begins", "year": 2005, "isExisting": True},
+            {"tmdbId": 999, "title": "Joker Spin-off", "year": 2027, "isExisting": False}]}])
+    if url.endswith(":7878/api/v3/movie/lookup/tmdb"):
+        return Resp(body={"title": "Standalone"})
+    return prev2(self, method, url, params=params, json=json, headers=headers, timeout=timeout)
+requests.Session.request = coll_fake
+c = call("/api/tv/collection?tmdb=155")["collection"]
+assert c["title"] == "The Dark Knight Collection", c
+assert [m["title"] for m in c["movies"]] == ["Batman Begins", "The Dark Knight", "The Dark Knight Rises", "Joker Spin-off"], c
+byt = {m["title"]: m for m in c["movies"]}
+assert byt["Batman Begins"]["hasFile"] and byt["The Dark Knight Rises"]["inRadarr"] and not byt["The Dark Knight Rises"]["hasFile"], c
+assert not byt["Joker Spin-off"]["inRadarr"] and byt["The Dark Knight Rises"]["poster"] == "https://img/rises.jpg", c
+assert call("/api/tv/collection?tmdb=1") == {"collection": None}
+try:
+    call("/api/tv/collection?tmdb=abc"); raise AssertionError("expected 400")
+except urllib.error.HTTPError as e:
+    assert e.code == 400
+requests.Session.request = prev2
 print("tv tests OK")
 
 call("/api/plex/logout", {})

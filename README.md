@@ -46,6 +46,7 @@ Anything that was already in your library before watchlist-sync is never deleted
 
 - `POST /api/tv/sync`: start a sync now.
 - `GET /api/tv/queue`: what Sonarr/Radarr are downloading (progress, time left, status), grouped per movie/series, plus titles watchlist-sync added in the last 3 days that are still being searched for. FlexPlex shows these on its home screen.
+- `GET /api/tv/collection?tmdb=ID`: the Radarr collection a movie belongs to, with every part and whether it's in Radarr / downloaded. FlexPlex shows it on the movie's page.
 - `GET /api/tv`: what's set up and whether Sonarr/Radarr answer (`radarr_ok`, `sonarr_ok`), for the TV's status line.
 
 Only these endpoints allow cross-origin calls, and they need `UI_PASSWORD` when it's set (enter it in FlexPlex's Settings). Your Sonarr/Radarr API keys never leave watchlist-sync.
