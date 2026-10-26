@@ -123,8 +123,8 @@ ever see what's been requested, not the keys.
 [Orama](https://github.com/DarkAngelGR/FlexPlex), a Plex player for Samsung TVs, works
 with watchlist-sync. From the TV you can search Plex's whole catalog and add titles to
 your Watchlist, and watchlist-sync syncs right away. Orama also shows download progress,
-lists the parts of a collection you don't have yet, and can delete titles from
-Sonarr/Radarr. It finds watchlist-sync by itself when it runs on the same machine as
+lists the parts of a collection you don't have yet, shows upcoming episodes, searches
+Bazarr for subtitles, and can delete titles from Sonarr/Radarr. It finds watchlist-sync by itself when it runs on the same machine as
 Plex (port 8789).
 
 <details>
@@ -139,6 +139,9 @@ These are the only endpoints that allow cross-origin calls. They need `UI_PASSWO
 | `POST /api/tv/sync` | Start a sync now (after a Watchlist add) |
 | `GET /api/tv/queue` | What Sonarr/Radarr are downloading, per movie/series, plus recent adds still being searched for |
 | `GET /api/tv/collection?tmdb=ID` | The Radarr collection a movie belongs to, every part, and which ones you have |
+| `GET /api/tv/upcoming?days=7` | Episodes airing in the next days (Sonarr's calendar) that aren't downloaded yet |
+| `GET /api/tv/subtitles?kind=movie\|episode&…` | Search Bazarr for subtitles (`tmdb`/`imdb` for a movie; the show's `tvdb` plus `season` and `episode`; optional `lang`). Returns a token and the results |
+| `POST /api/tv/subtitles/download` | `{token, index}`: download one of those results through Bazarr. Bazarr's own subtitle ids never leave watchlist-sync |
 | `POST /api/tv/delete` | `{kind: "movie"\|"show", tmdb\|tvdb, imdb}`: delete from Radarr/Sonarr with files (nothing in dry run). It isn't re-added while it stays on the same Watchlists; adding it to a Watchlist again later brings it back |
 </details>
 

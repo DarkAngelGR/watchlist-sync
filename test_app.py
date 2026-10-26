@@ -400,6 +400,78 @@ assert not s._skip_deleted("radarr", 27205, {"maria", "aggelos"})        # ...an
 assert s.state.deleted_users("radarr", 27205) is None and not s.state.is_handled("radarr", 27205)
 s.settings.update({"dry_run": was_dry})
 requests.Session.request = prev3
+# --- subtitles through Bazarr, and upcoming episodes (fakes for Radarr/Sonarr/Bazarr)
+prev4 = requests.Session.request
+prev_get, prev_post = requests.get, requests.post
+bz = {"posted": None}
+def tv4_fake(self, method, url, params=None, json=None, headers=None, timeout=None, data=None):
+    if url.endswith(":7878/api/v3/movie"):
+        return Resp(body=[{"id": 31, "tmdbId": 27205, "imdbId": "tt1375666", "title": "Inception"}])
+    if url.endswith(":8989/api/v3/series"):
+        return Resp(body=[{"id": 41, "tvdbId": 121361, "title": "Game of Thrones"}])
+    if url.endswith(":8989/api/v3/episode"):
+        assert params["seriesId"] == 41
+        return Resp(body=[{"id": 900, "seasonNumber": 1, "episodeNumber": 2}, {"id": 901, "seasonNumber": 1, "episodeNumber": 3}])
+    if url.endswith(":8989/api/v3/calendar"):
+        assert params["includeSeries"] == "true"
+        return Resp(body=[
+            {"seasonNumber": 2, "episodeNumber": 5, "title": "Later", "airDateUtc": "2026-10-30T01:00:00Z", "hasFile": False,
+             "series": {"title": "Severance", "year": 2022, "tvdbId": 371980, "images": [{"coverType": "poster", "remoteUrl": "https://img/sev.jpg"}]}},
+            {"seasonNumber": 1, "episodeNumber": 1, "title": "Sooner", "airDateUtc": "2026-10-27T01:00:00Z", "hasFile": False,
+             "series": {"title": "New Show", "year": 2026, "tvdbId": 1}},
+            {"seasonNumber": 4, "episodeNumber": 3, "title": "Got it", "airDateUtc": "2026-10-26T01:00:00Z", "hasFile": True,
+             "series": {"title": "The Bear", "tvdbId": 2}}])
+    return prev4(self, method, url, params=params, json=json, headers=headers, timeout=timeout)
+def bz_get(url, params=None, headers=None, timeout=None):
+    assert headers["X-API-KEY"] == "bzkey"
+    if url.endswith("/api/providers/movies"):
+        assert params == {"radarrid": 31}
+        return Resp(body={"data": [
+            {"provider": "opensubtitles", "language": "el", "hearing_impaired": "False", "forced": "False", "score": 90,
+             "release_info": ["Inception.2010.1080p.BluRay"], "subtitle": "PICKLED-1", "original_format": "False", "uploader": "x"},
+            {"provider": "podnapisi", "language": "en", "hearing_impaired": "True", "forced": "False", "score": 95,
+             "release_info": ["Inception.2010.WEB"], "subtitle": "PICKLED-2", "original_format": "False"},
+            {"provider": "subs4free", "language": "el:hi", "hearing_impaired": "True", "forced": "False", "score": 70,
+             "release_info": [], "subtitle": "PICKLED-3", "original_format": "False"}]})
+    if url.endswith("/api/providers/episodes"):
+        assert params == {"episodeid": 901}
+        return Resp(body={"data": [{"provider": "addic7ed", "language": "el", "score": 80, "subtitle": "PICKLED-E",
+                                    "hearing_impaired": "False", "forced": "False", "original_format": "False"}]})
+    return prev_get(url, params=params, headers=headers, timeout=timeout)
+def bz_post(url, data=None, headers=None, timeout=None, **kw):
+    if "/api/providers/" in url:
+        bz["posted"] = (url.rsplit("/", 1)[1], dict(data))
+        return Resp(204, body=None, content=b"")
+    return prev_post(url, data=data, headers=headers, timeout=timeout, **kw)
+requests.Session.request = tv4_fake
+requests.get, requests.post = bz_get, bz_post
+app.requests.get, app.requests.post = bz_get, bz_post
+s.settings.update({"bazarr_url": "http://localhost:6767", "bazarr_api_key": "bzkey"})
+r = call("/api/tv/subtitles?kind=movie&tmdb=27205&lang=el")
+assert [x["provider"] for x in r["results"]] == ["opensubtitles", "subs4free"], r     # Greek only, best first
+assert all("subtitle" not in x and "_post" not in x for x in r["results"]), r          # Bazarr's pickled ids stay here
+assert r["results"][1]["hi"] is True and r["results"][0]["release"] == "Inception.2010.1080p.BluRay"
+ok = call("/api/tv/subtitles/download", {"token": r["token"], "index": 1})
+assert ok["ok"] and bz["posted"] == ("movies", {"hi": "True", "forced": "False", "original_format": "False",
+                                                "provider": "subs4free", "subtitle": "PICKLED-3", "radarrid": "31"}), bz
+r = call("/api/tv/subtitles?kind=episode&tvdb=121361&season=1&episode=3")
+call("/api/tv/subtitles/download", {"token": r["token"], "index": 0})
+assert bz["posted"][0] == "episodes" and bz["posted"][1]["seriesid"] == "41" and bz["posted"][1]["episodeid"] == "901"
+for bad in ({"token": "nope", "index": 0}, {"token": r["token"], "index": 5}):
+    try:
+        call("/api/tv/subtitles/download", bad); raise AssertionError("expected 409")
+    except urllib.error.HTTPError as e:
+        assert e.code == 409
+try:
+    call("/api/tv/subtitles?kind=movie&tmdb=1"); raise AssertionError("expected 409")
+except urllib.error.HTTPError as e:
+    assert e.code == 409 and b"isn't in Radarr" in e.read()
+up = call("/api/tv/upcoming?days=7")["items"]
+assert [(x["show"], x["season"], x["episode"]) for x in up] == [("New Show", 1, 1), ("Severance", 2, 5)], up   # soonest first, no downloaded ones
+assert up[1]["poster"] == "https://img/sev.jpg"
+requests.Session.request = prev4
+requests.get, requests.post = prev_get, prev_post
+app.requests.get, app.requests.post = prev_get, prev_post
 print("tv tests OK")
 
 call("/api/plex/logout", {})

@@ -35,7 +35,7 @@ log = logging.getLogger("watchlist-sync")
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLEXTV = "https://plex.tv"
 PRODUCT = "watchlist-sync"
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 
 
 # --------------------------------------------------------------------------- settings
@@ -1117,6 +1117,130 @@ class Syncer:
             self.state.set_users(service, ext_id, now)
         return True
 
+    # -- subtitles through Bazarr, for Orama (GET/POST /api/tv/subtitles)
+    # Bazarr's search results carry an opaque, pickled subtitle id that Bazarr
+    # unpickles when downloading, so it never leaves this process: the TV gets
+    # a token and picks a result by number.
+    SUBS_TTL = 900
+
+    def _bazarr(self):
+        cfg = Config(self.settings.all())
+        if not (cfg.bazarr_url and cfg.bazarr_key):
+            raise LookupError("Bazarr isn't set up in watchlist-sync")
+        return cfg, cfg.bazarr_url.rstrip("/"), {"X-API-KEY": cfg.bazarr_key}
+
+    def _subtitle_target(self, cfg, kind, tmdb, tvdb, imdb, season, episode):
+        """Bazarr ids for a movie (Radarr id) or an episode (Sonarr ids)."""
+        if kind == "movie":
+            if not cfg.radarr.enabled:
+                raise LookupError("Radarr isn't set up in watchlist-sync")
+            obj = Arr("Radarr", cfg.radarr).find(tmdb, imdb)
+            if not obj:
+                raise LookupError("This movie isn't in Radarr, so Bazarr doesn't know it")
+            return {"radarrid": obj["id"]}
+        if not cfg.sonarr.enabled:
+            raise LookupError("Sonarr isn't set up in watchlist-sync")
+        arr = Arr("Sonarr", cfg.sonarr)
+        series = arr.find(tvdb, imdb)
+        if not series:
+            raise LookupError("This show isn't in Sonarr, so Bazarr doesn't know it")
+        eps = arr.get("/episode", seriesId=series["id"])
+        ep = next((e for e in eps if e.get("seasonNumber") == season and e.get("episodeNumber") == episode), None)
+        if not ep:
+            raise LookupError(f"Sonarr has no S{season:02d}E{episode:02d} for this show")
+        return {"seriesid": series["id"], "episodeid": ep["id"]}
+
+    def tv_subtitle_search(self, kind, tmdb=0, tvdb=0, imdb="", season=0, episode=0, lang=""):
+        cfg, base, headers = self._bazarr()
+        target = self._subtitle_target(cfg, kind, tmdb, tvdb, imdb, season, episode)
+        path = "/api/providers/movies" if kind == "movie" else "/api/providers/episodes"
+        params = {"radarrid": target["radarrid"]} if kind == "movie" else {"episodeid": target["episodeid"]}
+        r = requests.get(base + path, params=params, headers=headers, timeout=150)
+        if r.status_code in (401, 403):
+            raise LookupError("Bazarr rejected the API key")
+        if r.status_code >= 400:
+            raise LookupError("Bazarr: " + (r.text.strip().strip('"')[:200] or f"HTTP {r.status_code}"))
+        found = (r.json() or {}).get("data") or []
+        want = (lang or "").lower()
+        results = []
+        for x in found:
+            code = str(x.get("language") or "").split(":")[0].lower()
+            if want and code != want:
+                continue
+            results.append({
+                "provider": x.get("provider") or "", "language": code,
+                "hi": str(x.get("hearing_impaired")).lower() == "true",
+                "forced": str(x.get("forced")).lower() == "true",
+                "score": x.get("score") or 0, "release": (x.get("release_info") or [""])[0] or "",
+                "uploader": x.get("uploader") or "",
+                "_post": {"hi": str(x.get("hearing_impaired") or "False"), "forced": str(x.get("forced") or "False"),
+                          "original_format": str(x.get("original_format") or "False"),
+                          "provider": x.get("provider") or "", "subtitle": x.get("subtitle") or ""},
+            })
+        results.sort(key=lambda x: -x["score"])
+        results = results[:40]
+        token = uuid.uuid4().hex
+        cache = self.__dict__.setdefault("_subs_cache", {})
+        now = time.time()
+        for k in [k for k, v in cache.items() if now - v["at"] > self.SUBS_TTL]:
+            del cache[k]
+        cache[token] = {"at": now, "kind": kind, "target": target, "results": results}
+        return {"token": token, "results": [{k: v for k, v in x.items() if k != "_post"} for x in results]}
+
+    def tv_subtitle_download(self, token, index):
+        cfg, base, headers = self._bazarr()
+        entry = self.__dict__.get("_subs_cache", {}).get(token)
+        if not entry or time.time() - entry["at"] > self.SUBS_TTL:
+            raise LookupError("Those search results expired; search again")
+        if not (0 <= index < len(entry["results"])):
+            raise LookupError("No such result")
+        pick = entry["results"][index]
+        path = "/api/providers/movies" if entry["kind"] == "movie" else "/api/providers/episodes"
+        form = dict(pick["_post"], **{k: str(v) for k, v in entry["target"].items()})
+        r = requests.post(base + path, data=form, headers=headers, timeout=150)
+        if r.status_code >= 400:
+            raise LookupError("Bazarr couldn't download it: " + (r.text.strip().strip('"')[:200] or f"HTTP {r.status_code}"))
+        log.info("Downloaded %s subtitles from %s (from a TV)", pick["language"], pick["provider"])
+        return {"ok": True, "language": pick["language"], "provider": pick["provider"]}
+
+    # -- upcoming episodes, for Orama (GET /api/tv/upcoming?days=7)
+    UPCOMING_TTL = 600
+
+    def tv_upcoming(self, days=7):
+        days = max(1, min(30, int(days)))
+        hit = self.__dict__.get("_upcoming_cache")
+        if hit and hit[0] == days and time.time() - hit[1] < self.UPCOMING_TTL:
+            return hit[2]
+        cfg = Config(self.settings.all())
+        if not cfg.sonarr.enabled:
+            return {"items": [], "reason": "sonarr not set up"}
+        arr = Arr("Sonarr", cfg.sonarr)
+        start = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 6 * 3600))
+        end = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + days * 86400))
+        eps = arr.get("/calendar", start=start, end=end, includeSeries="true", unmonitored="false")
+        items = []
+        for e in eps:
+            se = e.get("series") or {}
+            if e.get("hasFile"):
+                continue  # already here: it's in Plex
+            items.append({
+                "show": se.get("title") or "?", "year": se.get("year"), "tvdb": se.get("tvdbId"),
+                "imdb": se.get("imdbId") or "", "season": e.get("seasonNumber"), "episode": e.get("episodeNumber"),
+                "title": e.get("title") or "", "overview": e.get("overview") or "",
+                "air": e.get("airDateUtc") or "", "poster": self._poster(se), "fanart": self._image(se, "fanart"),
+            })
+        items.sort(key=lambda x: x["air"])
+        res = {"items": items[:40]}
+        self._upcoming_cache = (days, time.time(), res)
+        return res
+
+    @staticmethod
+    def _image(obj, kind):
+        for im in obj.get("images") or []:
+            if im.get("coverType") == kind:
+                return im.get("remoteUrl") or ""
+        return ""
+
     def tv_queue(self):
         now = time.time()
         cached = getattr(self, "_queue_cache", None)
@@ -1333,6 +1457,31 @@ def make_handler(syncer, ui_password):
                     return self._send(200, syncer.tv_collection(tmdb))
                 except requests.RequestException as e:
                     return self._send(502, {"error": "Radarr: " + str(e)[:200]})
+            if p == "/api/tv/upcoming":
+                qs = parse_qs(urlparse(self.path).query)
+                try:
+                    return self._send(200, syncer.tv_upcoming(int((qs.get("days") or ["7"])[0])))
+                except ValueError:
+                    return self._send(400, {"error": "bad days"})
+                except requests.RequestException as e:
+                    return self._send(502, {"error": "Sonarr: " + str(e)[:200]})
+            if p == "/api/tv/subtitles":
+                qs = parse_qs(urlparse(self.path).query)
+                q = lambda k, d="": (qs.get(k) or [d])[0]
+                kind = q("kind")
+                if kind not in ("movie", "episode"):
+                    return self._send(400, {"error": "kind must be movie or episode"})
+                try:
+                    num = lambda k: int(q(k, "0") or 0)
+                    res = syncer.tv_subtitle_search(kind, tmdb=num("tmdb"), tvdb=num("tvdb"), imdb=q("imdb"),
+                                                    season=num("season"), episode=num("episode"), lang=q("lang"))
+                except ValueError:
+                    return self._send(400, {"error": "bad number"})
+                except LookupError as e:
+                    return self._send(409, {"error": str(e)})
+                except requests.RequestException as e:
+                    return self._send(502, {"error": "Couldn't reach Bazarr/Sonarr/Radarr: " + str(e)[:150]})
+                return self._send(200, res)
             m = re.fullmatch(r"/api/users/([^/]+)/plan", p)
             if m:
                 return self._send(200, syncer.deletion_plan(unquote(m.group(1))))
@@ -1385,6 +1534,15 @@ def make_handler(syncer, ui_password):
                 except (requests.RequestException, ArrError) as e:
                     svc = "Radarr" if kind == "movie" else "Sonarr"
                     return self._send(502, {"error": f"{svc}: {str(e)[:200]}"})
+            if p == "/api/tv/subtitles/download":
+                try:
+                    return self._send(200, syncer.tv_subtitle_download(str(body.get("token") or ""), int(body.get("index", -1))))
+                except (TypeError, ValueError):
+                    return self._send(400, {"error": "bad index"})
+                except LookupError as e:
+                    return self._send(409, {"error": str(e)})
+                except requests.RequestException as e:
+                    return self._send(502, {"error": "Couldn't reach Bazarr: " + str(e)[:150]})
             if p == "/api/plex/pin":
                 try:
                     return self._send(200, plex_create_pin(syncer.client_id))
