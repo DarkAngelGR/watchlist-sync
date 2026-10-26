@@ -19,6 +19,9 @@ request things without a separate request app.
 - **Everyone's Watchlist counts:** the server owner's and every friend's you share the
   server with. Each title is tagged `plex-<username>` in Sonarr/Radarr, so you can see
   who asked for what.
+- **Anime is handled as anime:** pick an anime root folder (and profile) under Settings,
+  and shows TheTVDB calls anime, or Japanese animation, are added there as series type
+  *Anime* (absolute episode numbers). Leave it empty and anime is added like any show.
 - **Bazarr is told** to pick up new titles straight away, so subtitles follow.
 - **Dry run first:** it starts by only showing what it *would* add.
 - **Excluding someone** stops syncing their Watchlist and can remove what only they

@@ -22,7 +22,12 @@ class Resp:
 
 USERS_XML = b'<MediaContainer><User id="1" title="Maria" username="maria"/><User id="2" title="nikos" username="nikos"/></MediaContainer>'
 META = {"101": ["tvdb://81189", "tmdb://1396"], "102": ["tmdb://27205", "imdb://tt1375666"],
-        "201": ["tvdb://305288"], "202": ["tvdb://81189"], "203": ["tvdb://999"]}
+        "201": ["tvdb://305288"], "202": ["tvdb://81189"], "203": ["tvdb://999"],
+        "104": ["tvdb://424536"], "105": ["tvdb://371028"]}
+owner_watchlist = [{"ratingKey": "101", "title": "Breaking Bad", "type": "show"},
+                   {"ratingKey": "102", "title": "Inception", "type": "movie"}]
+LOOKUP_EXTRA = {424536: {"genres": ["Anime", "Animation", "Fantasy"], "originalLanguage": {"name": "Japanese"}},
+                371028: {"genres": ["Animation", "Action"], "originalLanguage": {"name": "English"}}}
 sonarr_series, radarr_movies = [{"id": 1, "tvdbId": 999, "tags": []}], []
 tags = {}
 
@@ -56,9 +61,7 @@ def fake(self, method, url, params=None, json=None, headers=None, timeout=None):
     if "api/v2/ping" in url:
         return Resp(body={})
     if "watchlist/all" in url:
-        return Resp(body={"MediaContainer": {"totalSize": 2, "Metadata": [
-            {"ratingKey": "101", "title": "Breaking Bad", "type": "show"},
-            {"ratingKey": "102", "title": "Inception", "type": "movie"}]}})
+        return Resp(body={"MediaContainer": {"totalSize": len(owner_watchlist), "Metadata": owner_watchlist}})
     if "community.plex.tv" in url:
         if "allFriendsV2" in json["query"]:
             return Resp(body={"data": {"allFriendsV2": [
@@ -87,9 +90,9 @@ def fake(self, method, url, params=None, json=None, headers=None, timeout=None):
         return Resp(204, {})
     # *arr
     if url.endswith("/qualityprofile"):
-        return Resp(body=[{"id": 1, "name": "Any"}, {"id": 4, "name": "HD-1080p"}])
+        return Resp(body=[{"id": 1, "name": "Any"}, {"id": 4, "name": "HD-1080p"}, {"id": 7, "name": "Anime"}])
     if url.endswith("/rootfolder"):
-        return Resp(body=[{"path": "/tv/"}] if ":8989" in url else [{"path": "/movies"}])
+        return Resp(body=[{"path": "/tv/"}, {"path": "/anime/"}] if ":8989" in url else [{"path": "/movies"}])
     if url.endswith("/languageprofile"):
         return Resp(404, {})
     if url.endswith("/tag"):
@@ -101,7 +104,7 @@ def fake(self, method, url, params=None, json=None, headers=None, timeout=None):
         return Resp(body=sonarr_series)
     if url.endswith("/series/lookup"):
         tid = int(params["term"].split(":")[1])
-        return Resp(body=[{"title": f"show{tid}", "tvdbId": tid, "seasons": []}])
+        return Resp(body=[{"title": f"show{tid}", "tvdbId": tid, "seasons": [], **LOOKUP_EXTRA.get(tid, {})}])
     if url.endswith("/series") and method == "POST":
         sonarr_series.append({"id": len(sonarr_series) + 100, "tvdbId": json["tvdbId"], "tags": json["tags"], "title": json["title"]})
         return Resp(201, json)
@@ -158,7 +161,7 @@ assert "sonarr_api_key" not in json.dumps(pub).replace("sonarr_api_key_set", "")
 call("/api/settings", {"sonarr_api_key": "", "sonarr_quality_profile": "HD-1080p", "plex_token": "evil"})
 assert s.settings.all()["sonarr_api_key"] == "k" and s.settings.all()["plex_token"] == "tok-from-pin"
 t1 = call("/api/test/sonarr", {"url": "", "api_key": ""})
-assert t1["ok"] and t1["version"] == "4.0.15" and t1["roots"] == ["/tv/"], t1
+assert t1["ok"] and t1["version"] == "4.0.15" and t1["roots"] == ["/tv/", "/anime/"], t1
 assert call("/api/test/bazarr", {})["version"] == "1.5.3"
 
 r1 = s.run_once()
@@ -473,6 +476,32 @@ requests.Session.request = prev4
 requests.get, requests.post = prev_get, prev_post
 app.requests.get, app.requests.post = prev_get, prev_post
 print("tv tests OK")
+
+# --- anime: own folder, own profile, series type Anime
+assert app.is_anime({"genres": ["Anime", "Animation"]})
+assert app.is_anime({"genres": ["Animation"], "originalLanguage": {"name": "Japanese"}})
+assert not app.is_anime({"genres": ["Animation"], "originalLanguage": {"name": "English"}})
+assert not app.is_anime({"genres": ["Drama"]}) and not app.is_anime({})
+s.settings.update({"dry_run": False})
+owner_watchlist.append({"ratingKey": "104", "title": "Frieren", "type": "show"})
+calls.clear()
+s.run_once()     # anime folder not set yet: added like any show
+body = next(c[3] for c in calls if c[0] == "POST" and c[1].endswith("/series"))
+assert body["tvdbId"] == 424536 and body["seriesType"] == "standard" and body["rootFolderPath"] == "/tv/", body
+sonarr_series[:] = [x for x in sonarr_series if x["tvdbId"] != 424536]
+s.state.db.execute("DELETE FROM handled WHERE ext_id IN (424536, 371028)")
+call("/api/settings", {"sonarr_anime_root_folder": "/anime/", "sonarr_anime_quality_profile": "Anime"})
+owner_watchlist.append({"ratingKey": "105", "title": "Arcane", "type": "show"})
+calls.clear()
+r5 = s.run_once()
+posted = {c[3]["tvdbId"]: c[3] for c in calls if c[0] == "POST" and c[1].endswith("/series")}
+fr, ar = posted[424536], posted[371028]
+assert fr["seriesType"] == "anime" and fr["rootFolderPath"] == "/anime/" and fr["qualityProfileId"] == 7, fr
+assert ar["seriesType"] == "standard" and ar["rootFolderPath"] == "/tv/" and ar["qualityProfileId"] == 4, ar   # western animation
+assert not r5["errors"], r5
+s.settings.update({"sonarr_anime_quality_profile": ""})     # no anime profile: anime keeps the normal one
+assert call("/api/settings")["sonarr_anime_root_folder"] == "/anime/"
+print("anime tests OK")
 
 call("/api/plex/logout", {})
 assert call("/api/status")["account"] is None and not s.settings.all()["plex_token"]

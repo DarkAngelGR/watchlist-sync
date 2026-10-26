@@ -35,7 +35,7 @@ log = logging.getLogger("watchlist-sync")
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLEXTV = "https://plex.tv"
 PRODUCT = "watchlist-sync"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 
 # --------------------------------------------------------------------------- settings
@@ -60,6 +60,9 @@ FIELDS = {
     "sonarr_root_folder": ("SONARR_ROOT_FOLDER", "", str),
     "sonarr_monitor": ("SONARR_MONITOR", "all", str),
     "sonarr_series_type": ("SONARR_SERIES_TYPE", "standard", str),
+    # Anime gets its own profile/folder and type Anime; off while the folder is empty
+    "sonarr_anime_quality_profile": ("SONARR_ANIME_QUALITY_PROFILE", "", str),
+    "sonarr_anime_root_folder": ("SONARR_ANIME_ROOT_FOLDER", "", str),
     "sonarr_search": ("SONARR_SEARCH_ON_ADD", True, bool),
     "radarr_url": ("RADARR_URL", "", str),
     "radarr_api_key": ("RADARR_API_KEY", "", str),
@@ -138,6 +141,8 @@ class Config:
         self.sonarr = ArrConfig(s, "sonarr")
         self.sonarr_monitor = s["sonarr_monitor"]
         self.sonarr_series_type = s["sonarr_series_type"]
+        self.sonarr_anime_profile = s["sonarr_anime_quality_profile"]
+        self.sonarr_anime_root = s["sonarr_anime_root_folder"]
         self.radarr = ArrConfig(s, "radarr")
         self.radarr_min_availability = s["radarr_min_availability"]
         self.bazarr_url = s["bazarr_url"]
@@ -451,9 +456,9 @@ class Arr:
             raise ArrError(r.status_code, r.text[:500])
         return r.json()
 
-    def quality_profile_id(self):
+    def quality_profile_id(self, want=None):
         profiles = self.get("/qualityprofile")
-        want = self.cfg.quality_profile
+        want = self.cfg.quality_profile if want is None else want
         if not profiles:
             raise RuntimeError(f"{self.name}: no quality profiles found")
         if want:
@@ -464,11 +469,11 @@ class Arr:
                                f"(have: {', '.join(p['name'] for p in profiles)})")
         return profiles[0]["id"]
 
-    def root_folder(self):
+    def root_folder(self, want=None):
         paths = [f["path"] for f in self.get("/rootfolder")]
         if not paths:
             raise RuntimeError(f"{self.name}: no root folders configured")
-        want = self.cfg.root_folder
+        want = self.cfg.root_folder if want is None else want
         if want:
             for p in paths:
                 if p.rstrip("/") == want.rstrip("/"):
@@ -529,6 +534,14 @@ class Arr:
             "profiles": [{"id": p["id"], "name": p["name"]} for p in self.get("/qualityprofile")],
             "roots": [f["path"] for f in self.get("/rootfolder")],
         }
+
+
+def is_anime(series):
+    """A Sonarr lookup result is anime if TheTVDB gives it the Anime genre,
+    or it's Japanese animation."""
+    genres = {g.lower() for g in series.get("genres") or []}
+    lang = ((series.get("originalLanguage") or {}).get("name") or "").lower()
+    return "anime" in genres or ("animation" in genres and lang == "japanese")
 
 
 def bazarr_probe(url, key):
@@ -777,6 +790,9 @@ class Syncer:
         s = self.sonarr
         profile_id = s.quality_profile_id()
         root = s.root_folder()
+        anime_root = s.root_folder(self.cfg.sonarr_anime_root) if self.cfg.sonarr_anime_root else None
+        anime_profile = (s.quality_profile_id(self.cfg.sonarr_anime_profile)
+                         if anime_root and self.cfg.sonarr_anime_profile else profile_id)
         existing = {x.get("tvdbId") for x in s.get("/series")}
         lang_profile = None
         try:  # Sonarr v3 needs a language profile; v4 ignores it
@@ -803,12 +819,13 @@ class Syncer:
                     log.warning("Sonarr lookup found nothing for '%s' (tvdb:%s)", title, tvdb)
                     continue
                 body = dict(found[0])
+                anime = bool(anime_root) and is_anime(body)
                 body.update({
-                    "qualityProfileId": profile_id,
-                    "rootFolderPath": root,
+                    "qualityProfileId": anime_profile if anime else profile_id,
+                    "rootFolderPath": anime_root if anime else root,
                     "monitored": True,
                     "seasonFolder": True,
-                    "seriesType": self.cfg.sonarr_series_type,
+                    "seriesType": "anime" if anime else self.cfg.sonarr_series_type,
                     "tags": s.tag_ids(it["users"]) if self.cfg.tag_by_user else [],
                     "addOptions": {
                         "monitor": self.cfg.sonarr_monitor,
@@ -819,8 +836,9 @@ class Syncer:
                 if lang_profile:
                     body["languageProfileId"] = lang_profile
                 who = ", ".join(sorted(it["users"]))
+                kind = "anime" if anime else "series"
                 if self.cfg.dry_run:
-                    log.info("[dry-run] would add series '%s' (tvdb:%s) for %s", title, tvdb, who)
+                    log.info("[dry-run] would add %s '%s' (tvdb:%s) for %s", kind, title, tvdb, who)
                     summary["added_series"].append(title)
                     continue
                 try:
@@ -833,7 +851,7 @@ class Syncer:
                 self.state.mark("sonarr", tvdb, title, it["users"], "added")
                 existing.add(tvdb)
                 summary["added_series"].append(title)
-                log.info("Added series '%s' (tvdb:%s) requested by %s", title, tvdb, who)
+                log.info("Added %s '%s' (tvdb:%s) requested by %s", kind, title, tvdb, who)
             except Exception as e:
                 log.error("Sonarr: failed on '%s': %s", title, e)
                 summary["errors"].append(f"sonarr:{title}: {e}")

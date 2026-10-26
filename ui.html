@@ -124,6 +124,9 @@ dialog li{margin:2px 0}
           <option value="none">None</option></select></div>
         <div class="row"><label>Series type</label><select name="sonarr_series_type">
           <option value="standard">Standard</option><option value="daily">Daily</option><option value="anime">Anime</option></select></div>
+        <div class="row"><label>Anime root folder</label><select name="sonarr_anime_root_folder"></select></div>
+        <div class="row"><label>Anime profile</label><select name="sonarr_anime_quality_profile"></select></div>
+        <div class="row"><label></label><div class="small mute">Shows TheTVDB calls anime (or Japanese animation) go to the anime folder, with the anime profile and series type Anime.</div></div>
         <div class="row"><label></label><div class="checks"><label><input type="checkbox" name="sonarr_search"> Search as soon as added</label></div></div>
       </fieldset>
 
@@ -362,6 +365,8 @@ async function loadSettings(){
     fillSelect(svc + "_quality_profile", [], settings[svc + "_quality_profile"], "First profile (press Test to choose)");
     fillSelect(svc + "_root_folder", [], settings[svc + "_root_folder"], "First root folder (press Test to choose)");
   }
+  fillSelect("sonarr_anime_root_folder", [], settings.sonarr_anime_root_folder, "Off: anime is added like any show");
+  fillSelect("sonarr_anime_quality_profile", [], settings.sonarr_anime_quality_profile, "Same profile as other shows");
   form.elements.sonarr_monitor.value = settings.sonarr_monitor;
   form.elements.sonarr_series_type.value = settings.sonarr_series_type;
   form.elements.radarr_min_availability.value = settings.radarr_min_availability;
@@ -378,6 +383,12 @@ form.querySelectorAll("[data-test]").forEach(btn => btn.onclick = async () => {
     const curP = form.elements[svc + "_quality_profile"].value, curR = form.elements[svc + "_root_folder"].value;
     fillSelect(svc + "_quality_profile", res.profiles.map(p => ({value:p.name, label:p.name})), curP, "First profile");
     fillSelect(svc + "_root_folder", res.roots.map(p => ({value:p, label:p})), curR, "First root folder");
+    if (svc === "sonarr"){
+      fillSelect("sonarr_anime_root_folder", res.roots.map(p => ({value:p, label:p})),
+                 form.elements.sonarr_anime_root_folder.value, "Off: anime is added like any show");
+      fillSelect("sonarr_anime_quality_profile", res.profiles.map(p => ({value:p.name, label:p.name})),
+                 form.elements.sonarr_anime_quality_profile.value, "Same profile as other shows");
+    }
   }
 });
 
