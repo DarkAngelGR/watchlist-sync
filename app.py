@@ -35,7 +35,7 @@ log = logging.getLogger("watchlist-sync")
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLEXTV = "https://plex.tv"
 PRODUCT = "watchlist-sync"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 
 # --------------------------------------------------------------------------- settings
@@ -786,20 +786,50 @@ class Syncer:
             g["users"] |= it["users"]
         return grouped
 
-    def _sync_sonarr(self, shows, summary):
-        s = self.sonarr
+    @staticmethod
+    def _sonarr_ctx(s, cfg):
+        """Profiles and folders new series go to (normal and anime)."""
         profile_id = s.quality_profile_id()
         root = s.root_folder()
-        anime_root = s.root_folder(self.cfg.sonarr_anime_root) if self.cfg.sonarr_anime_root else None
-        anime_profile = (s.quality_profile_id(self.cfg.sonarr_anime_profile)
-                         if anime_root and self.cfg.sonarr_anime_profile else profile_id)
-        existing = {x.get("tvdbId") for x in s.get("/series")}
+        anime_root = s.root_folder(cfg.sonarr_anime_root) if cfg.sonarr_anime_root else None
+        anime_profile = (s.quality_profile_id(cfg.sonarr_anime_profile)
+                         if anime_root and cfg.sonarr_anime_profile else profile_id)
         lang_profile = None
         try:  # Sonarr v3 needs a language profile; v4 ignores it
             lp = s.get("/languageprofile")
             lang_profile = lp[0]["id"] if lp else None
         except Exception:
             pass
+        return {"profile": profile_id, "root": root, "anime_root": anime_root,
+                "anime_profile": anime_profile, "lang_profile": lang_profile}
+
+    @staticmethod
+    def _sonarr_body(s, cfg, ctx, found, users):
+        """The Sonarr add-series payload, shared by the watchlist sync and TV
+        requests. Returns (body, is_anime)."""
+        body = dict(found)
+        anime = bool(ctx["anime_root"]) and is_anime(body)
+        body.update({
+            "qualityProfileId": ctx["anime_profile"] if anime else ctx["profile"],
+            "rootFolderPath": ctx["anime_root"] if anime else ctx["root"],
+            "monitored": True,
+            "seasonFolder": True,
+            "seriesType": "anime" if anime else cfg.sonarr_series_type,
+            "tags": s.tag_ids(users) if cfg.tag_by_user else [],
+            "addOptions": {
+                "monitor": cfg.sonarr_monitor,
+                "searchForMissingEpisodes": cfg.sonarr.search,
+                "searchForCutoffUnmetEpisodes": False,
+            },
+        })
+        if ctx["lang_profile"]:
+            body["languageProfileId"] = ctx["lang_profile"]
+        return body, anime
+
+    def _sync_sonarr(self, shows, summary):
+        s = self.sonarr
+        ctx = self._sonarr_ctx(s, self.cfg)
+        existing = {x.get("tvdbId") for x in s.get("/series")}
 
         grouped = self._group_by(shows, "tvdb", summary)
         summary["shows"] = len(grouped)
@@ -818,23 +848,7 @@ class Syncer:
                 if not found:
                     log.warning("Sonarr lookup found nothing for '%s' (tvdb:%s)", title, tvdb)
                     continue
-                body = dict(found[0])
-                anime = bool(anime_root) and is_anime(body)
-                body.update({
-                    "qualityProfileId": anime_profile if anime else profile_id,
-                    "rootFolderPath": anime_root if anime else root,
-                    "monitored": True,
-                    "seasonFolder": True,
-                    "seriesType": "anime" if anime else self.cfg.sonarr_series_type,
-                    "tags": s.tag_ids(it["users"]) if self.cfg.tag_by_user else [],
-                    "addOptions": {
-                        "monitor": self.cfg.sonarr_monitor,
-                        "searchForMissingEpisodes": self.cfg.sonarr.search,
-                        "searchForCutoffUnmetEpisodes": False,
-                    },
-                })
-                if lang_profile:
-                    body["languageProfileId"] = lang_profile
+                body, anime = self._sonarr_body(s, self.cfg, ctx, found[0], it["users"])
                 who = ", ".join(sorted(it["users"]))
                 kind = "anime" if anime else "series"
                 if self.cfg.dry_run:
@@ -1092,6 +1106,103 @@ class Syncer:
                 result = {"collection": {"title": c.get("title") or coll.get("title"), "tmdb": coll["tmdbId"], "movies": parts}}
         cache[tmdb] = (time.time(), result)
         return result
+
+    # -- finding and requesting titles from a TV (Jellyfin has no Watchlist)
+    LIBRARY_TTL = 30
+
+    def _library(self, arr, kind):
+        """{tmdb or tvdb id: 'have' | 'requested'} for what Radarr/Sonarr already hold."""
+        cache = self.__dict__.setdefault("_library_cache", {})
+        hit = cache.get(kind)
+        if hit and time.time() - hit[0] < self.LIBRARY_TTL:
+            return hit[1]
+        out = {}
+        if kind == "movie":
+            for m in arr.get("/movie"):
+                out[m.get("tmdbId")] = "have" if m.get("hasFile") else "requested"
+        else:
+            for x in arr.get("/series"):
+                files = ((x.get("statistics") or {}).get("episodeFileCount") or 0)
+                out[x.get("tvdbId")] = "have" if files else "requested"
+        cache[kind] = (time.time(), out)
+        return out
+
+    def _lookup_item(self, kind, x, library):
+        ext = x.get("tmdbId") if kind == "movie" else x.get("tvdbId")
+        ratings = x.get("ratings") or {}
+        rating = ((ratings.get("tmdb") or {}).get("value") or (ratings.get("imdb") or {}).get("value")
+                  or ratings.get("value") or 0)
+        return {
+            "kind": kind, "title": x.get("title") or "?", "year": x.get("year") or None,
+            "overview": x.get("overview") or "", "genres": (x.get("genres") or [])[:4],
+            "runtime": x.get("runtime") or 0, "rating": rating,
+            "network": x.get("network") or x.get("studio") or "",
+            "certification": x.get("certification") or "",
+            "tmdb": x.get("tmdbId") or 0, "tvdb": x.get("tvdbId") or 0, "imdb": x.get("imdbId") or "",
+            "poster": self._poster(x), "fanart": self._image(x, "fanart"),
+            "status": library.get(ext, "none"),
+        }
+
+    def tv_lookup(self, kind, q="", ext_id=0):
+        """Movies (Radarr) or shows (Sonarr) matching `q`, or the one with this
+        TMDB/TVDB id, each with whether it's already there: 'have' (has files),
+        'requested' (added, nothing downloaded yet) or 'none'."""
+        cfg = Config(self.settings.all())
+        arr_cfg = cfg.radarr if kind == "movie" else cfg.sonarr
+        if not arr_cfg.enabled:
+            raise LookupError(("Radarr" if kind == "movie" else "Sonarr") + " isn't set up in watchlist-sync")
+        arr = Arr("Radarr" if kind == "movie" else "Sonarr", arr_cfg)
+        if ext_id:
+            if kind == "movie":
+                found = arr.get("/movie/lookup/tmdb", tmdbId=ext_id)
+                found = found if isinstance(found, list) else [found] if found else []
+            else:
+                found = arr.get("/series/lookup", term=f"tvdb:{ext_id}")
+        else:
+            found = arr.get("/movie/lookup" if kind == "movie" else "/series/lookup", term=q)
+        library = self._library(arr, kind)
+        key = "tmdbId" if kind == "movie" else "tvdbId"
+        return {"items": [self._lookup_item(kind, x, library) for x in (found or [])[:30] if x.get(key)]}
+
+    def tv_request(self, kind, ext_id, user=""):
+        """Add a movie to Radarr or a show to Sonarr, the way a watchlist add
+        would (same profiles, folders, anime handling and search)."""
+        cfg = Config(self.settings.all())
+        arr_cfg = cfg.radarr if kind == "movie" else cfg.sonarr
+        svc = "Radarr" if kind == "movie" else "Sonarr"
+        if not arr_cfg.enabled:
+            raise LookupError(svc + " isn't set up in watchlist-sync")
+        arr = Arr(svc, arr_cfg)
+        service = svc.lower()
+        users = {user} if user else {"tv"}
+        if arr.find(ext_id):
+            return {"ok": True, "status": "already-there", "service": svc}
+        if kind == "movie":
+            movie = arr.get("/movie/lookup/tmdb", tmdbId=ext_id)
+            movie = movie[0] if isinstance(movie, list) and movie else movie
+            if not movie:
+                raise LookupError(f"{svc} couldn't find that movie")
+            body = self._radarr_body(arr, cfg, movie, users, arr.quality_profile_id(), arr.root_folder())
+            title, anime = movie.get("title") or "?", False
+        else:
+            found = arr.get("/series/lookup", term=f"tvdb:{ext_id}")
+            if not found:
+                raise LookupError(f"{svc} couldn't find that show")
+            body, anime = self._sonarr_body(arr, cfg, self._sonarr_ctx(arr, cfg), found[0], users)
+            title = found[0].get("title") or "?"
+        if cfg.dry_run:
+            log.info("[dry-run] would add %s '%s' requested from a TV by %s", kind, title, ", ".join(users))
+            return {"ok": True, "status": "dry-run", "service": svc}
+        try:
+            arr.post("/movie" if kind == "movie" else "/series", body)
+        except ArrError as e:
+            if e.already_exists:
+                return {"ok": True, "status": "already-there", "service": svc}
+            raise
+        self.state.mark(service, ext_id, title, users, "requested")
+        self.__dict__.get("_library_cache", {}).pop(kind, None)
+        log.info("Added %s '%s' requested from a TV by %s", "anime" if anime else kind, title, ", ".join(users))
+        return {"ok": True, "status": "added", "service": svc, "title": title}
 
     # -- deleting a title from a TV (POST /api/tv/delete)
     def tv_delete(self, kind, ext_id, imdb, title):
@@ -1483,6 +1594,25 @@ def make_handler(syncer, ui_password):
                     return self._send(400, {"error": "bad days"})
                 except requests.RequestException as e:
                     return self._send(502, {"error": "Sonarr: " + str(e)[:200]})
+            if p == "/api/tv/lookup":
+                qs = parse_qs(urlparse(self.path).query)
+                q = lambda k, d="": (qs.get(k) or [d])[0]
+                kind = q("kind")
+                if kind not in ("movie", "show"):
+                    return self._send(400, {"error": "kind must be movie or show"})
+                try:
+                    ext_id = int(q("id", "0") or 0)
+                except ValueError:
+                    return self._send(400, {"error": "bad id"})
+                term = q("q").strip()[:200]
+                if not term and not ext_id:
+                    return self._send(400, {"error": "q or id needed"})
+                try:
+                    return self._send(200, syncer.tv_lookup(kind, term, ext_id))
+                except LookupError as e:
+                    return self._send(409, {"error": str(e)})
+                except requests.RequestException as e:
+                    return self._send(502, {"error": ("Radarr: " if kind == "movie" else "Sonarr: ") + str(e)[:200]})
             if p == "/api/tv/subtitles":
                 qs = parse_qs(urlparse(self.path).query)
                 q = lambda k, d="": (qs.get(k) or [d])[0]
@@ -1550,6 +1680,24 @@ def make_handler(syncer, ui_password):
                 try:
                     return self._send(200, syncer.tv_delete(kind, ext_id, imdb, str(body.get("title") or "")))
                 except (requests.RequestException, ArrError) as e:
+                    svc = "Radarr" if kind == "movie" else "Sonarr"
+                    return self._send(502, {"error": f"{svc}: {str(e)[:200]}"})
+            if p == "/api/tv/request":
+                kind = body.get("kind")
+                if kind not in ("movie", "show"):
+                    return self._send(400, {"error": "kind must be movie or show"})
+                try:
+                    ext_id = int(body.get("tmdb" if kind == "movie" else "tvdb") or 0)
+                except (TypeError, ValueError):
+                    ext_id = 0
+                if ext_id <= 0:
+                    return self._send(400, {"error": "TMDB (movie) or TVDB (show) id needed"})
+                user = re.sub(r"[^\w .@-]", "", str(body.get("user") or ""))[:40].strip()
+                try:
+                    return self._send(200, syncer.tv_request(kind, ext_id, user))
+                except LookupError as e:
+                    return self._send(409, {"error": str(e)})
+                except (requests.RequestException, ArrError, RuntimeError) as e:
                     svc = "Radarr" if kind == "movie" else "Sonarr"
                     return self._send(502, {"error": f"{svc}: {str(e)[:200]}"})
             if p == "/api/tv/subtitles/download":

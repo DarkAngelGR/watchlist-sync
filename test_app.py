@@ -503,6 +503,55 @@ s.settings.update({"sonarr_anime_quality_profile": ""})     # no anime profile: 
 assert call("/api/settings")["sonarr_anime_root_folder"] == "/anime/"
 print("anime tests OK")
 
+# --- TV lookups and requests (for Jellyfin, which has no Watchlist)
+prev_fake = requests.Session.request
+def look_fake(self, method, url, params=None, json=None, headers=None, timeout=None):
+    if url.endswith("/movie/lookup") and method == "GET":
+        calls.append((method, url, params, json))
+        return Resp(body=[
+            {"title": "Dune", "year": 2021, "tmdbId": 438631, "imdbId": "tt1160419", "overview": "Paul.", "genres": ["Sci-Fi"],
+             "images": [{"coverType": "poster", "remoteUrl": "https://img/dune.jpg"}], "ratings": {"tmdb": {"value": 7.8}}},
+            {"title": "Inception", "year": 2010, "tmdbId": 27205, "images": []},
+            {"title": "No id", "tmdbId": 0}])
+    if url.endswith("/series/lookup") and not params["term"].startswith("tvdb:"):
+        calls.append((method, url, params, json))
+        return Resp(body=[{"title": "Frieren", "year": 2023, "tvdbId": 424536, "genres": ["Anime"], "network": "NTV"}])
+    return prev_fake(self, method, url, params=params, json=json, headers=headers, timeout=timeout)
+requests.Session.request = look_fake
+radarr_movies[:] = [x for x in radarr_movies if x.get("tmdbId") != 27205] + [{"id": 299, "tmdbId": 27205, "tags": [], "hasFile": True}]
+s._library_cache = {}
+r = call("/api/tv/lookup?kind=movie&q=" + "dune")
+assert [x["title"] for x in r["items"]] == ["Dune", "Inception"], r
+dune, inc = r["items"]
+assert dune["status"] == "none" and dune["poster"] == "https://img/dune.jpg" and dune["rating"] == 7.8 and dune["imdb"] == "tt1160419"
+assert inc["status"] == "have"
+r = call("/api/tv/lookup?kind=show&q=frieren")
+assert r["items"][0]["tvdb"] == 424536 and r["items"][0]["kind"] == "show"
+try:
+    call("/api/tv/lookup?kind=book&q=x"); raise AssertionError("expected 400")
+except urllib.error.HTTPError as e:
+    assert e.code == 400
+calls.clear()
+res = call("/api/tv/request", {"kind": "movie", "tmdb": 438631, "user": "Aggelos <x>"})
+assert res["status"] == "added", res
+posted = next(c[3] for c in calls if c[0] == "POST" and c[1].endswith("/movie"))
+assert posted["tmdbId"] == 438631 and posted["rootFolderPath"] == "/movies" and posted["addOptions"]["monitor"] == "movieOnly"
+assert s.state.is_handled("radarr", 438631)
+assert call("/api/tv/lookup?kind=movie&id=438631")["items"][0]["status"] == "requested"
+assert call("/api/tv/request", {"kind": "movie", "tmdb": 438631})["status"] == "already-there"
+# a show requested from the TV gets the anime folder like a watchlist add would
+sonarr_series[:] = [x for x in sonarr_series if x["tvdbId"] != 424536]
+calls.clear()
+assert call("/api/tv/request", {"kind": "show", "tvdb": 424536, "user": "aggelos"})["status"] == "added"
+body = next(c[3] for c in calls if c[0] == "POST" and c[1].endswith("/series"))
+assert body["seriesType"] == "anime" and body["rootFolderPath"] == "/anime/", body
+try:
+    call("/api/tv/request", {"kind": "show", "tvdb": "x"}); raise AssertionError("expected 400")
+except urllib.error.HTTPError as e:
+    assert e.code == 400
+requests.Session.request = prev_fake
+print("tv lookup/request tests OK")
+
 call("/api/plex/logout", {})
 assert call("/api/status")["account"] is None and not s.settings.all()["plex_token"]
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])
