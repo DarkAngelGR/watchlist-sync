@@ -35,7 +35,7 @@ log = logging.getLogger("watchlist-sync")
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLEXTV = "https://plex.tv"
 PRODUCT = "watchlist-sync"
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 
 # --------------------------------------------------------------------------- settings
@@ -72,8 +72,10 @@ FIELDS = {
     "radarr_search": ("RADARR_SEARCH_ON_ADD", True, bool),
     "bazarr_url": ("BAZARR_URL", "", str),
     "bazarr_api_key": ("BAZARR_API_KEY", "", str),
+    # Optional: trending TV shows for Orama's Discover row (Radarr covers movies)
+    "tmdb_api_key": ("TMDB_API_KEY", "", str),
 }
-SECRETS = ("plex_token", "sonarr_api_key", "radarr_api_key", "bazarr_api_key")
+SECRETS = ("plex_token", "sonarr_api_key", "radarr_api_key", "bazarr_api_key", "tmdb_api_key")
 
 
 def cast(typ, v):
@@ -147,6 +149,7 @@ class Config:
         self.radarr_min_availability = s["radarr_min_availability"]
         self.bazarr_url = s["bazarr_url"]
         self.bazarr_key = s["bazarr_api_key"]
+        self.tmdb_key = s["tmdb_api_key"]
 
 
 # --------------------------------------------------------------------------- state
@@ -1164,6 +1167,88 @@ class Syncer:
         key = "tmdbId" if kind == "movie" else "tvdbId"
         return {"items": [self._lookup_item(kind, x, library) for x in (found or [])[:30] if x.get(key)]}
 
+    # -- what to watch next, for Orama's Discover rows (GET /api/tv/discover)
+    DISCOVER_TTL = 3 * 3600
+    TMDB = "https://api.themoviedb.org/3"
+    TMDB_IMG = "https://image.tmdb.org/t/p/"
+
+    def _tmdb(self, key, path, **params):
+        headers = {"Accept": "application/json"}
+        if key.startswith("eyJ"):            # a v4 read access token
+            headers["Authorization"] = "Bearer " + key
+        else:                                # a v3 API key
+            params["api_key"] = key
+        r = requests.get(self.TMDB + path, params=params, headers=headers, timeout=10)
+        r.raise_for_status()
+        return r.json()
+
+    def _trending_shows(self, key, have):
+        """This week's trending shows from TMDB, with their TVDB ids (Sonarr's)."""
+        out = []
+        for x in (self._tmdb(key, "/trending/tv/week").get("results") or [])[:20]:
+            try:
+                tvdb = (self._tmdb(key, f"/tv/{x['id']}/external_ids") or {}).get("tvdb_id")
+            except requests.RequestException:
+                continue
+            if not tvdb or tvdb in have:
+                continue
+            first = x.get("first_air_date") or ""
+            out.append({
+                "kind": "show", "title": x.get("name") or "?", "year": int(first[:4]) if first[:4].isdigit() else None,
+                "overview": x.get("overview") or "", "genres": [], "runtime": 0,
+                "rating": round(float(x.get("vote_average") or 0), 1), "network": "", "certification": "",
+                "tmdb": x.get("id") or 0, "tvdb": tvdb, "imdb": "",
+                "poster": self.TMDB_IMG + "w342" + x["poster_path"] if x.get("poster_path") else "",
+                "fanart": self.TMDB_IMG + "w1280" + x["backdrop_path"] if x.get("backdrop_path") else "",
+                "status": "none",
+            })
+        return out
+
+    def tv_discover(self):
+        """Titles you don't have yet: trending and popular movies and movies
+        recommended from your library (Radarr's Discover, no key needed), and
+        trending shows when a TMDB key is set. {'sections': [{id, title, items}]}."""
+        hit = self.__dict__.get("_discover_cache")
+        if hit and time.time() - hit[0] < self.DISCOVER_TTL:
+            return hit[1]
+        cfg = Config(self.settings.all())
+        trending_m, popular, recommended, shows, notes = [], [], [], [], []
+        if cfg.radarr.enabled:
+            arr = Arr("Radarr", cfg.radarr)
+            lib = self._library(arr, "movie")
+            raw = arr.get("/importlist/movie", includeRecommendations="true", includeTrending="true", includePopular="true")
+            for x in raw or []:
+                if x.get("isExisting") or x.get("isExcluded") or not x.get("tmdbId") or x.get("tmdbId") in lib:
+                    continue
+                it = self._lookup_item("movie", x, lib)
+                it["poster"] = it["poster"] or x.get("remotePoster") or ""
+                if x.get("isTrending"):
+                    trending_m.append(it)
+                if x.get("isPopular"):
+                    popular.append(it)
+                if x.get("isRecommendation"):
+                    recommended.append(it)
+            recommended.sort(key=lambda m: -(m["rating"] or 0))
+        else:
+            notes.append("Radarr isn't set up")
+        if cfg.tmdb_key and cfg.sonarr.enabled:
+            try:
+                shows = self._trending_shows(cfg.tmdb_key, self._library(Arr("Sonarr", cfg.sonarr), "show"))
+            except requests.RequestException as e:
+                log.warning("TMDB trending shows failed: %s", e)
+                notes.append("TMDB: " + str(e)[:120])
+        trending = []
+        for i in range(max(len(trending_m), len(shows))):     # movies and shows, alternating
+            trending += [x for x in (trending_m[i:i + 1] + shows[i:i + 1])]
+        sections = [
+            {"id": "trending", "title": "Trending this week", "items": trending[:30]},
+            {"id": "recommended", "title": "Recommended for you", "items": recommended[:30]},
+            {"id": "popular", "title": "Popular movies", "items": [m for m in popular if m not in trending_m][:30]},
+        ]
+        res = {"sections": [x for x in sections if x["items"]], "notes": notes}
+        self._discover_cache = (time.time(), res)
+        return res
+
     def tv_request(self, kind, ext_id, user=""):
         """Add a movie to Radarr or a show to Sonarr, the way a watchlist add
         would (same profiles, folders, anime handling and search)."""
@@ -1201,6 +1286,7 @@ class Syncer:
             raise
         self.state.mark(service, ext_id, title, users, "requested")
         self.__dict__.get("_library_cache", {}).pop(kind, None)
+        self.__dict__.pop("_discover_cache", None)
         log.info("Added %s '%s' requested from a TV by %s", "anime" if anime else kind, title, ", ".join(users))
         return {"ok": True, "status": "added", "service": svc, "title": title}
 
@@ -1613,6 +1699,11 @@ def make_handler(syncer, ui_password):
                     return self._send(409, {"error": str(e)})
                 except requests.RequestException as e:
                     return self._send(502, {"error": ("Radarr: " if kind == "movie" else "Sonarr: ") + str(e)[:200]})
+            if p == "/api/tv/discover":
+                try:
+                    return self._send(200, syncer.tv_discover())
+                except requests.RequestException as e:
+                    return self._send(502, {"error": "Radarr: " + str(e)[:200]})
             if p == "/api/tv/subtitles":
                 qs = parse_qs(urlparse(self.path).query)
                 q = lambda k, d="": (qs.get(k) or [d])[0]

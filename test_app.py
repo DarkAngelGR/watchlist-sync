@@ -552,6 +552,59 @@ except urllib.error.HTTPError as e:
 requests.Session.request = prev_fake
 print("tv lookup/request tests OK")
 
+# --- Discover rows: Radarr's discover (no key) + TMDB trending shows (with a key)
+prev_fake = requests.Session.request
+tmdb_calls = []
+def disc_fake(self, method, url, params=None, json=None, headers=None, timeout=None):
+    if url.endswith("/importlist/movie"):
+        assert params == {"includeRecommendations": "true", "includeTrending": "true", "includePopular": "true"}, params
+        return Resp(body=[
+            {"title": "Sinners", "year": 2025, "tmdbId": 1233413, "isTrending": True, "isPopular": True, "remotePoster": "https://img/sinners.jpg", "ratings": {"tmdb": {"value": 7.6}}},
+            {"title": "Inception", "year": 2010, "tmdbId": 27205, "isExisting": True, "isTrending": True},
+            {"title": "Excluded", "year": 2020, "tmdbId": 5, "isExcluded": True, "isPopular": True},
+            {"title": "Arrival", "year": 2016, "tmdbId": 329865, "isRecommendation": True, "ratings": {"tmdb": {"value": 7.6}}},
+            {"title": "Interstellar", "year": 2014, "tmdbId": 157336, "isRecommendation": True, "ratings": {"tmdb": {"value": 8.4}}},
+            {"title": "From a list", "year": 2019, "tmdbId": 9, "lists": [1]}])
+    if "api.themoviedb.org" in url:
+        tmdb_calls.append((url, dict(params or {}), dict(headers or {})))
+        if url.endswith("/trending/tv/week"):
+            return Resp(body={"results": [
+                {"id": 100088, "name": "The Last of Us", "first_air_date": "2023-01-15", "poster_path": "/p.jpg", "backdrop_path": "/b.jpg", "vote_average": 8.55},
+                {"id": 1396, "name": "Breaking Bad", "first_air_date": "2008-01-20"},
+                {"id": 1, "name": "No tvdb"}]})
+        m = re.search(r"/tv/(\d+)/external_ids$", url)
+        if m:
+            return Resp(body={"tvdb_id": {"100088": 392256, "1396": 81189}.get(m.group(1))})
+    return prev_fake(self, method, url, params=params, json=json, headers=headers, timeout=timeout)
+requests.Session.request = disc_fake
+requests.get = lambda url, **kw: disc_fake(None, "GET", url, **kw)
+s._library_cache = {}
+s.__dict__.pop("_discover_cache", None)
+d1 = call("/api/tv/discover")
+secs = {x["id"]: x for x in d1["sections"]}
+assert [m["title"] for m in secs["trending"]["items"]] == ["Sinners"], secs     # no TMDB key: movies only
+assert secs["trending"]["items"][0]["poster"] == "https://img/sinners.jpg" and secs["trending"]["items"][0]["status"] == "none"
+assert [m["title"] for m in secs["recommended"]["items"]] == ["Interstellar", "Arrival"]              # best rated first
+assert "popular" not in secs                                                                         # Sinners is already in trending
+assert not tmdb_calls
+call("/api/settings", {"tmdb_api_key": "v3key"})
+assert call("/api/settings")["tmdb_api_key_set"] and "v3key" not in json.dumps(call("/api/settings"))
+s.__dict__.pop("_discover_cache", None)
+d2 = call("/api/tv/discover")
+tr = [x for x in d2["sections"] if x["id"] == "trending"][0]["items"]
+assert [(m["kind"], m["title"]) for m in tr] == [("movie", "Sinners"), ("show", "The Last of Us")], tr   # Breaking Bad is in Sonarr
+lou = tr[1]
+assert lou["tvdb"] == 392256 and lou["year"] == 2023 and lou["poster"].endswith("/w342/p.jpg") and lou["rating"] == 8.6
+assert tmdb_calls[0][1].get("api_key") == "v3key"
+assert call("/api/tv/discover") == d2          # cached
+s.settings.update({"tmdb_api_key": "eyJabc"})
+s.__dict__.pop("_discover_cache", None); tmdb_calls.clear()
+call("/api/tv/discover")
+assert tmdb_calls[0][2].get("Authorization") == "Bearer eyJabc" and "api_key" not in tmdb_calls[0][1]
+requests.Session.request = prev_fake
+requests.get = lambda url, **kw: fake(None, "GET", url, **kw)
+print("discover tests OK")
+
 call("/api/plex/logout", {})
 assert call("/api/status")["account"] is None and not s.settings.all()["plex_token"]
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])

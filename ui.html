@@ -152,6 +152,12 @@ dialog li{margin:2px 0}
       </fieldset>
 
       <fieldset>
+        <legend>TMDB <span class="mute small">(optional)</span></legend>
+        <div class="row"><label>API key</label><input type="password" name="tmdb_api_key" placeholder="themoviedb.org → Settings → API (free)"></div>
+        <div class="row"><label></label><div class="mute small">Adds trending TV shows to Orama's Discover row. Movies come from Radarr and need no key.</div></div>
+      </fieldset>
+
+      <fieldset>
         <legend>Sync</legend>
         <div class="row"><label>Every (minutes)</label><input type="number" min="1" name="interval_min" style="max-width:120px"></div>
         <div class="row"><label>Options</label><div class="checks">

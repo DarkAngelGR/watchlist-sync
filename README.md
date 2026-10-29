@@ -127,7 +127,9 @@ ever see what's been requested, not the keys.
 works with watchlist-sync. On Plex, you can search Plex's whole catalog from the TV and add
 titles to your Watchlist, and watchlist-sync syncs right away. On Jellyfin, which has no
 Watchlist, Orama searches through Sonarr/Radarr instead and **Request** adds the title
-directly, with the same profiles, folders and anime handling as a Watchlist add. Orama also shows download progress,
+directly, with the same profiles, folders and anime handling as a Watchlist add.
+Orama's **Discover** rows (trending, recommended for you) come from Radarr's Discover; add a free
+[TMDB API key](https://www.themoviedb.org/settings/api) under Settings to include trending TV shows. Orama also shows download progress,
 lists the parts of a collection you don't have yet, shows upcoming episodes, searches
 Bazarr for subtitles, and can delete titles from Sonarr/Radarr. It finds watchlist-sync by itself when it runs on the same machine as
 Plex or Jellyfin (port 8789).
@@ -148,6 +150,7 @@ These are the only endpoints that allow cross-origin calls. They need `UI_PASSWO
 | `GET /api/tv/subtitles?kind=movie\|episode&…` | Search Bazarr for subtitles (`tmdb`/`imdb` for a movie; the show's `tvdb` plus `season` and `episode`; optional `lang`). Returns a token and the results |
 | `POST /api/tv/subtitles/download` | `{token, index}`: download one of those results through Bazarr. Bazarr's own subtitle ids never leave watchlist-sync |
 | `GET /api/tv/lookup?kind=movie\|show&q=TEXT` (or `&id=ID`) | Search Radarr/Sonarr's lookup (or one TMDB/TVDB id). Each result says whether it's already there: `have`, `requested` or `none` |
+| `GET /api/tv/discover` | Titles you don't have yet: trending, popular and recommended movies (Radarr's Discover, no key needed) and trending shows (with a TMDB key) |
 | `POST /api/tv/request` | `{kind: "movie"\|"show", tmdb\|tvdb, user}`: add it to Radarr/Sonarr like a Watchlist add would (nothing in dry run) |
 | `POST /api/tv/delete` | `{kind: "movie"\|"show", tmdb\|tvdb, imdb}`: delete from Radarr/Sonarr with files (nothing in dry run). It isn't re-added while it stays on the same Watchlists; adding it to a Watchlist again later brings it back |
 </details>
