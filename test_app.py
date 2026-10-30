@@ -605,6 +605,24 @@ requests.Session.request = prev_fake
 requests.get = lambda url, **kw: fake(None, "GET", url, **kw)
 print("discover tests OK")
 
+# --- converter endpoints (Orama Server)
+st = call("/api/convert")
+assert st["enabled"] is False and st["jobs"] == [], st
+assert call("/api/hooks/arr", {"eventType": "Download", "movie": {"id": 1, "folderPath": "/m"}, "movieFile": {"relativePath": "a.mkv"}})["queued"] == 0   # off: ignored
+call("/api/settings", {"convert_enabled": True, "convert_path_map": "/m=/nowhere", "convert_hours": "1-7"})
+pub = call("/api/settings")
+assert pub["convert_enabled"] and pub["convert_hours"] == "1-7" and pub["convert_bitrate"] == "1536k" and pub["convert_keep_original"]
+assert call("/api/hooks/arr", {"eventType": "Download", "movie": {"id": 1, "folderPath": "/m"}, "movieFile": {"relativePath": "a.mkv"}})["queued"] == 1
+assert call("/api/convert")["jobs"][0]["path"] == "/nowhere/a.mkv"
+try:
+    call("/api/convert/add", {"path": "/etc/does-not-exist.mkv"}); raise AssertionError("expected 400")
+except urllib.error.HTTPError as e:
+    assert e.code == 400
+assert raw("/api/hooks/arr", "POST", {"Origin": "https://evil.example", "Content-Type": "text/plain"})[0] == 403
+call("/api/settings", {"convert_enabled": False})
+call("/api/convert/clear", {})
+print("converter endpoint tests OK")
+
 call("/api/plex/logout", {})
 assert call("/api/status")["account"] is None and not s.settings.all()["plex_token"]
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])

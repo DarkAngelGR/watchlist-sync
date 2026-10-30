@@ -1,0 +1,637 @@
+<title>Orama Server</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@500;600;700&family=Barlow:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: control-room board — header, a strip of host gauges, then service cards grouped by job; every card is a link to the service. */
+:root {
+  --bg: #eef0f3;
+  --panel: #ffffff;
+  --panel-2: #f5f6f8;
+  --line: #dde1e7;
+  --fg: #1b2230;
+  --muted: #5f6878;
+  --faint: #8a93a3;
+  --accent: #b86e00;
+  --accent-soft: #f6e6cc;
+  --ok: #1f8a4c;
+  --ok-soft: #dcf1e4;
+  --warn: #b97400;
+  --warn-soft: #fbeccc;
+  --bad: #c2362f;
+  --bad-soft: #f8dcda;
+  --idle: #6d7686;
+  --idle-soft: #e7e9ed;
+  --track: #e3e6eb;
+  --spark-a: #2f6fb3;
+  --spark-b: #b86e00;
+  --shadow: 0 1px 2px rgba(20, 30, 50, .06);
+  --f-display: "Barlow Semi Condensed", "Arial Narrow", system-ui, sans-serif;
+  --f-body: "Barlow", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --radius: 10px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f131a; --panel: #161b24; --panel-2: #1b212c; --line: #262e3b;
+    --fg: #e4e8ef; --muted: #9aa3b2; --faint: #6c7586;
+    --accent: #f0a83a; --accent-soft: #3a2c16;
+    --ok: #4cc27b; --ok-soft: #173325; --warn: #f0b13d; --warn-soft: #3a2d12;
+    --bad: #f0665d; --bad-soft: #3d1c1b; --idle: #8a93a3; --idle-soft: #232a35;
+    --track: #252d39; --spark-a: #6aa8ec; --spark-b: #f0a83a;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .3);
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f131a; --panel: #161b24; --panel-2: #1b212c; --line: #262e3b;
+  --fg: #e4e8ef; --muted: #9aa3b2; --faint: #6c7586;
+  --accent: #f0a83a; --accent-soft: #3a2c16;
+  --ok: #4cc27b; --ok-soft: #173325; --warn: #f0b13d; --warn-soft: #3a2d12;
+  --bad: #f0665d; --bad-soft: #3d1c1b; --idle: #8a93a3; --idle-soft: #232a35;
+  --track: #252d39; --spark-a: #6aa8ec; --spark-b: #f0a83a;
+  --shadow: 0 1px 2px rgba(0, 0, 0, .3);
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { background: var(--bg); }
+body {
+  margin: 0; color: var(--fg); font: 15px/1.45 var(--f-body);
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 18px 40px;
+}
+.wrap { max-width: 1480px; margin: 0 auto; display: flex; flex-direction: column; gap: 22px; }
+.num { font-family: var(--f-mono); font-variant-numeric: tabular-nums; }
+
+/* header */
+header { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 10px 24px; }
+.brand { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.brand h1 { margin: 0; font: 700 30px/1 var(--f-display); letter-spacing: .01em; }
+.brand h1 span { color: var(--accent); }
+.brand .host { font: 500 13px var(--f-mono); color: var(--muted); }
+.meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; font-size: 13px; color: var(--muted); }
+.live { display: inline-flex; align-items: center; gap: 6px; }
+.live i { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
+.live.stale i { background: var(--bad); box-shadow: 0 0 0 3px var(--bad-soft); }
+.tally { display: inline-flex; gap: 6px; }
+.chip { display: inline-flex; align-items: center; gap: 5px; padding: 2px 9px; border-radius: 99px; font: 600 12px var(--f-body); letter-spacing: .02em; }
+.chip.ok { background: var(--ok-soft); color: var(--ok); }
+.chip.warn { background: var(--warn-soft); color: var(--warn); }
+.chip.bad { background: var(--bad-soft); color: var(--bad); }
+.banner { padding: 9px 14px; border-radius: 8px; background: var(--accent-soft); color: var(--fg); font-size: 13px; }
+.banner b { color: var(--accent); }
+.onav a { color: var(--muted); } .onav b { color: var(--fg); font-weight: 600; }
+
+/* system strip */
+.sys { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }
+@media (max-width: 1180px) { .sys { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 720px) { .sys { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 440px) { .sys { grid-template-columns: minmax(0, 1fr); } }
+.gauge { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px 10px; display: flex; flex-direction: column; gap: 6px; min-width: 0; box-shadow: var(--shadow); }
+.gauge h3 { margin: 0; font: 600 11px var(--f-body); text-transform: uppercase; letter-spacing: .09em; color: var(--muted); display: flex; justify-content: space-between; gap: 8px; }
+.gauge h3 em { font-style: normal; font-family: var(--f-mono); letter-spacing: 0; text-transform: none; color: var(--faint); font-weight: 400; }
+.big { font: 600 28px/1.05 var(--f-display); font-variant-numeric: tabular-nums; }
+.big small { font: 500 13px var(--f-mono); color: var(--muted); margin-left: 4px; }
+.spark { width: 100%; height: 38px; display: block; }
+.cores { display: flex; gap: 2px; height: 18px; align-items: flex-end; }
+.cores span { flex: 1; background: var(--spark-a); opacity: .75; border-radius: 1px; min-height: 1px; }
+.netrow { display: flex; gap: 14px; flex-wrap: wrap; }
+.netrow div { font: 600 19px/1.1 var(--f-display); font-variant-numeric: tabular-nums; }
+.netrow div b { font: 500 12px var(--f-mono); margin-right: 3px; }
+.dn b { color: var(--spark-a); } .up b { color: var(--spark-b); }
+.disk { display: flex; flex-direction: column; gap: 3px; }
+.disk .lbl { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; }
+.disk .lbl span:last-child { font-family: var(--f-mono); font-size: 12px; color: var(--muted); white-space: nowrap; }
+.bar { height: 6px; border-radius: 3px; background: var(--track); overflow: hidden; }
+.bar i { display: block; height: 100%; border-radius: 3px; background: var(--spark-a); transition: width .6s ease; }
+.bar i.hot { background: var(--warn); } .bar i.crit { background: var(--bad); }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; font-size: 13px; }
+.kv dt { color: var(--muted); } .kv dd { margin: 0; text-align: right; font-family: var(--f-mono); font-size: 12.5px; }
+
+/* services */
+.groups { display: flex; flex-direction: column; gap: 22px; }
+.group h2 { margin: 0 0 10px; font: 600 15px var(--f-display); text-transform: uppercase; letter-spacing: .12em; color: var(--muted); display: flex; align-items: center; gap: 10px; }
+.group h2::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 360px), 1fr)); gap: 12px; align-items: start; }
+
+.card {
+  display: flex; flex-direction: column; gap: 10px; min-width: 0;
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 14px 14px 12px; color: inherit; text-decoration: none; box-shadow: var(--shadow);
+  transition: border-color .15s, transform .15s;
+}
+a.card:hover { border-color: var(--accent); transform: translateY(-1px); }
+a.card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.card.down { background: var(--panel-2); }
+.card.down .head, .card.down .stats { opacity: .7; }
+.head { display: flex; align-items: center; gap: 11px; min-width: 0; }
+.mono { flex: none; width: 36px; height: 36px; border-radius: 8px; display: grid; place-items: center; font: 700 15px var(--f-display); color: #fff; letter-spacing: .02em; }
+.ttl { min-width: 0; flex: 1; }
+.ttl .name { font: 600 17px/1.15 var(--f-display); display: flex; align-items: center; gap: 6px; }
+.ttl .name .go { color: var(--faint); font-size: 13px; transition: color .15s, transform .15s; }
+a.card:hover .go { color: var(--accent); transform: translate(2px, -2px); }
+.ttl .hl { font-size: 13.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pill { flex: none; padding: 2px 8px; border-radius: 99px; font: 600 11px var(--f-body); text-transform: uppercase; letter-spacing: .07em; }
+.pill.ok { background: var(--ok-soft); color: var(--ok); }
+.pill.idle { background: var(--idle-soft); color: var(--idle); }
+.pill.warn { background: var(--warn-soft); color: var(--warn); }
+.pill.error, .pill.down { background: var(--bad-soft); color: var(--bad); }
+
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(88px, 1fr)); gap: 6px; }
+.stat { background: var(--panel-2); border-radius: 6px; padding: 5px 8px; min-width: 0; }
+.stat .v { font: 500 14px var(--f-mono); font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stat .l { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.items { display: flex; flex-direction: column; gap: 9px; }
+.item { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.item .row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; min-width: 0; }
+.item .t { font-weight: 500; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.item .tag { flex: none; font: 500 11px var(--f-mono); color: var(--accent); }
+.item .tag.paused, .item .tag.seeding { color: var(--muted); }
+.item .tag.bad { color: var(--bad); }
+.item .s { font-size: 12.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.item .bar { height: 4px; }
+.item .bar i { background: var(--accent); }
+.more { font-size: 12.5px; color: var(--faint); }
+.note { font-size: 12.5px; padding: 6px 9px; border-radius: 6px; background: var(--warn-soft); color: var(--fg); overflow-wrap: anywhere; }
+.note.bad { background: var(--bad-soft); }
+
+.foot { display: flex; justify-content: space-between; gap: 8px; padding-top: 8px; border-top: 1px dashed var(--line); font: 12px var(--f-mono); color: var(--faint); min-width: 0; }
+.foot span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* updates */
+.upd { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; display: flex; flex-direction: column; gap: 12px; box-shadow: var(--shadow); }
+.upd-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.upd-head h2 { margin: 0; font: 600 15px var(--f-display); text-transform: uppercase; letter-spacing: .12em; color: var(--muted); }
+.upd-sum { font-size: 13.5px; color: var(--muted); flex: 1; min-width: 180px; }
+.upd-sum b { color: var(--accent); font-weight: 600; }
+.upd-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.btn { font: 600 13px var(--f-body); padding: 6px 12px; border-radius: 7px; border: 1px solid var(--line); background: var(--panel-2); color: var(--fg); cursor: pointer; white-space: nowrap; }
+.btn:hover { border-color: var(--accent); }
+.btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--panel); }
+.btn.confirm { background: var(--bad); border-color: var(--bad); color: #fff; }
+.btn[disabled] { opacity: .5; cursor: default; }
+.linkish { font: 500 12.5px var(--f-body); color: var(--muted); background: none; border: 0; padding: 0; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; align-self: flex-start; }
+.upd-pw { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 13px; color: var(--muted); }
+.upd-pw input { font: 14px var(--f-body); padding: 6px 9px; border-radius: 7px; border: 1px solid var(--line); background: var(--panel-2); color: var(--fg); min-width: 0; width: 220px; max-width: 100%; }
+.upd-msg { font-size: 12.5px; padding: 6px 9px; border-radius: 6px; background: var(--warn-soft); }
+.upd-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr)); gap: 6px 18px; }
+.urow { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 4px 10px; padding: 7px 0; border-bottom: 1px dashed var(--line); min-width: 0; }
+.urow .n { font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.urow .i { grid-column: 1 / -1; font: 12px var(--f-mono); color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.urow .m { grid-column: 1 / -1; font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
+.urow .m.bad { color: var(--bad); }
+.ust { font: 600 11px var(--f-body); text-transform: uppercase; letter-spacing: .06em; padding: 2px 8px; border-radius: 99px; white-space: nowrap; }
+.ust.available, .ust.queued, .ust.updating { background: var(--accent-soft); color: var(--accent); }
+.ust.current, .ust.updated { background: var(--ok-soft); color: var(--ok); }
+.ust.local, .ust.unknown { background: var(--idle-soft); color: var(--idle); }
+.ust.error, .ust.failed { background: var(--bad-soft); color: var(--bad); }
+.ubtn-slot { min-width: 70px; text-align: right; }
+.foot .ub { color: var(--accent); font-weight: 500; }
+
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="brand">
+      <h1 id="title">Orama Server</h1>
+      <span class="host" id="host">—</span>
+    </div>
+    <div class="meta">
+      <nav class="onav" id="onav"></nav>
+      <span class="tally" id="tally"></span>
+      <span id="uptime"></span>
+      <span class="live" id="live"><i></i><span id="livetxt">connecting…</span></span>
+    </div>
+  </header>
+
+  <div class="banner" id="banner" hidden></div>
+  <div class="banner" id="conv" hidden></div>
+
+  <section class="sys" aria-label="System utilization">
+    <div class="gauge">
+      <h3>CPU <em id="loadavg"></em></h3>
+      <div class="big" id="cpu">—</div>
+      <svg class="spark" id="cpuSpark" viewBox="0 0 100 38" preserveAspectRatio="none"></svg>
+      <div class="cores" id="cores"></div>
+    </div>
+    <div class="gauge">
+      <h3>Memory <em id="swap"></em></h3>
+      <div class="big" id="mem">—</div>
+      <svg class="spark" id="memSpark" viewBox="0 0 100 38" preserveAspectRatio="none"></svg>
+      <div class="bar"><i id="memBar" style="width:0"></i></div>
+    </div>
+    <div class="gauge">
+      <h3>Network</h3>
+      <div class="netrow"><div class="dn"><b>↓</b><span id="rx">—</span></div><div class="up"><b>↑</b><span id="tx">—</span></div></div>
+      <svg class="spark" id="netSpark" viewBox="0 0 100 38" preserveAspectRatio="none"></svg>
+    </div>
+    <div class="gauge">
+      <h3>Storage</h3>
+      <div id="disks" style="display:flex;flex-direction:column;gap:9px"></div>
+    </div>
+    <div class="gauge">
+      <h3>Host</h3>
+      <dl class="kv" id="hostkv"></dl>
+    </div>
+  </section>
+
+  <section class="upd" id="upd" aria-labelledby="updTitle">
+    <div class="upd-head">
+      <h2 id="updTitle">Updates</h2>
+      <span class="upd-sum" id="updSum">Checking…</span>
+      <div class="upd-actions" id="updActions">
+        <button class="btn" id="updCheck" type="button">Check now</button>
+        <button class="btn primary" id="updAll" type="button" hidden>Update all</button>
+      </div>
+    </div>
+    <form class="upd-pw" id="updPw" hidden>
+      <label for="updPwInput">Password to update containers</label>
+      <input id="updPwInput" type="password" autocomplete="current-password">
+      <button class="btn" type="submit">Unlock</button>
+    </form>
+    <div class="upd-msg" id="updMsg" hidden></div>
+    <div class="upd-list" id="updList"></div>
+    <button class="linkish" id="updToggle" type="button" hidden></button>
+  </section>
+
+  <div class="groups" id="groups"></div>
+</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  const HIST = 60;
+  const hist = { cpu: [], mem: [], rx: [], tx: [] };
+  let demo = false, lastOk = 0, refresh = 5, everOk = false;
+
+  const GROUP_ORDER = ["Streaming", "Requests", "Automation", "Downloads", "Processing", "Infrastructure", "Other"];
+  const HUES = {
+    plex: "#d18b00", jellyfin: "#7b4fc9", sonarr: "#2c8fbf", radarr: "#c79a16", prowlarr: "#c0473a",
+    bazarr: "#3d7fd1", sabnzbd: "#c9a227", qbittorrent: "#3a73c7", tdarr: "#4c9a5e", seerr: "#5b5fd6",
+    overseerr: "#5b5fd6", jellyseerr: "#7b4fc9", gluetun: "#2f8f8a", generic: "#5f6878",
+  };
+
+  function bytes(n, ps) {
+    if (n == null || isNaN(n)) return "—";
+    const u = ["B","KB","MB","GB","TB","PB"]; let i = 0; n = +n;
+    while (Math.abs(n) >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return (i ? n.toFixed(n < 10 ? 2 : 1) : n.toFixed(0)) + " " + u[i] + (ps ? "/s" : "");
+  }
+  function dur(s) {
+    if (!s) return "—";
+    const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+    return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`;
+  }
+  function push(arr, v) { arr.push(v ?? 0); if (arr.length > HIST) arr.shift(); }
+
+  function spark(el, series, max) {
+    const w = 100, h = 38;
+    const top = max ?? Math.max(1, ...series.flatMap(s => s.data));
+    let out = `<line x1="0" y1="${h/2}" x2="${w}" y2="${h/2}" stroke="var(--line)" stroke-width=".6" stroke-dasharray="1.5 1.5" vector-effect="non-scaling-stroke"/>`;
+    for (const s of series) {
+      const d = s.data; if (d.length < 2) continue;
+      const step = w / (HIST - 1), off = w - (d.length - 1) * step;
+      const pts = d.map((v, i) => [off + i * step, h - 2 - (Math.min(v, top) / top) * (h - 4)]);
+      const line = pts.map(p => p.map(n => n.toFixed(2)).join(",")).join(" ");
+      out += `<polygon points="${pts[0][0].toFixed(2)},${h} ${line} ${w},${h}" fill="${s.color}" fill-opacity=".14"/>`;
+      out += `<polyline points="${line}" fill="none" stroke="${s.color}" stroke-width="1.6" vector-effect="non-scaling-stroke" stroke-linejoin="round"/>`;
+    }
+    el.innerHTML = out;
+  }
+
+  function renderSystem(sys) {
+    if (!sys || sys.error) return;
+    push(hist.cpu, sys.cpu); push(hist.mem, sys.mem_percent);
+    push(hist.rx, sys.net_rx); push(hist.tx, sys.net_tx);
+    $("host").textContent = sys.host || "";
+    $("cpu").innerHTML = `${(sys.cpu ?? 0).toFixed(0)}<small>% · ${sys.cpu_count ?? "?"} threads</small>`;
+    $("loadavg").textContent = sys.load ? "load " + sys.load.join(" ") : "";
+    $("cores").innerHTML = (sys.cpu_cores || []).map(c => `<span style="height:${Math.max(4, c)}%" title="${c.toFixed(0)}%"></span>`).join("");
+    spark($("cpuSpark"), [{ data: hist.cpu, color: "var(--spark-a)" }], 100);
+    $("mem").innerHTML = `${(sys.mem_percent ?? 0).toFixed(0)}<small>% · ${bytes(sys.mem_used)} / ${bytes(sys.mem_total)}</small>`;
+    $("swap").textContent = sys.swap_percent != null ? `swap ${sys.swap_percent.toFixed(0)}%` : "";
+    $("memBar").style.width = (sys.mem_percent || 0) + "%";
+    spark($("memSpark"), [{ data: hist.mem, color: "var(--spark-b)" }], 100);
+    $("rx").textContent = bytes(sys.net_rx, true);
+    $("tx").textContent = bytes(sys.net_tx, true);
+    spark($("netSpark"), [{ data: hist.rx, color: "var(--spark-a)" }, { data: hist.tx, color: "var(--spark-b)" }]);
+    $("disks").innerHTML = (sys.disks || []).map(d => d.error
+      ? `<div class="disk"><div class="lbl"><span>${esc(d.name)}</span><span>${esc(d.error)}</span></div></div>`
+      : `<div class="disk"><div class="lbl"><span>${esc(d.name)}</span><span>${bytes(d.used)} / ${bytes(d.total)}</span></div>
+           <div class="bar"><i class="${d.percent > 92 ? "crit" : d.percent > 80 ? "hot" : ""}" style="width:${d.percent}%"></i></div></div>`
+    ).join("") || `<span class="more">No disks configured</span>`;
+    const kv = [
+      ["Uptime", dur(sys.uptime)],
+      ["CPU temp", sys.temp != null ? sys.temp.toFixed(0) + " °C" : "—"],
+      ["Disk read", bytes(sys.disk_r, true)],
+      ["Disk write", bytes(sys.disk_w, true)],
+    ];
+    $("hostkv").innerHTML = kv.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
+    $("uptime").textContent = "up " + dur(sys.uptime);
+  }
+
+  const PILL = { ok: "Active", idle: "Idle", warn: "Attention", error: "Error", down: "Down" };
+
+  function card(s) {
+    const hue = HUES[s.type] || HUES.generic;
+    const initials = s.name.replace(/[^A-Za-z0-9 ]/g, "").split(/\s+/).map(w => w[0]).join("").slice(0, 2).toUpperCase();
+    const items = (s.items || []);
+    const shown = items.slice(0, 3);
+    const tagClass = t => /paus/i.test(t) ? "paused" : /seed/i.test(t) ? "seeding" : /fail|error|block/i.test(t) ? "bad" : "";
+    const c = s.container;
+    const ub = s.update === "available" ? ' · <span class="ub">update available</span>' : (s.update === "updating" || s.update === "queued") ? ' · <span class="ub">updating…</span>' : "";
+    const footL = (c ? `${esc(s.container_name)} · ${esc(c.status || c.state)}` : (s.container_name ? esc(s.container_name) : esc(s.type))) + ub;
+    const footR = c && c.cpu != null ? `${c.cpu.toFixed(1)}% · ${bytes(c.mem)}` : "";
+    const tagName = s.link ? "a" : "div";
+    const attrs = s.link ? ` href="${esc(s.link)}" target="_blank" rel="noopener" aria-label="Open ${esc(s.name)}"` : "";
+    return `<${tagName} class="card ${s.status === "down" ? "down" : ""}"${attrs}>
+      <div class="head">
+        <div class="mono" style="background:${hue}">${esc(initials)}</div>
+        <div class="ttl">
+          <div class="name">${esc(s.name)}${s.link ? '<span class="go" aria-hidden="true">↗</span>' : ""}</div>
+          <div class="hl" title="${esc(s.headline)}">${esc(s.headline)}</div>
+        </div>
+        <span class="pill ${s.status}">${PILL[s.status] || s.status}</span>
+      </div>
+      ${s.stats && s.stats.length ? `<div class="stats">${s.stats.map(x => `<div class="stat"><div class="v">${esc(x.value)}</div><div class="l">${esc(x.label)}</div></div>`).join("")}</div>` : ""}
+      ${s.note ? `<div class="note ${s.status === "error" ? "bad" : ""}">${esc(s.note)}</div>` : ""}
+      ${shown.length ? `<div class="items">${shown.map(it => `
+        <div class="item">
+          <div class="row"><span class="t" title="${esc(it.title)}">${esc(it.title)}</span>${it.tag ? `<span class="tag ${tagClass(it.tag)}">${esc(it.tag)}</span>` : ""}</div>
+          ${it.sub ? `<div class="s" title="${esc(it.sub)}">${esc(it.sub)}</div>` : ""}
+          ${it.progress != null ? `<div class="bar"><i style="width:${Math.min(100, Math.max(0, it.progress))}%"></i></div>` : ""}
+        </div>`).join("")}</div>` : ""}
+      ${items.length > 3 ? `<div class="more">+${items.length - 3} more</div>` : ""}
+      <div class="foot"><span>${footL}</span><span>${footR}</span></div>
+    </${tagName}>`;
+  }
+
+  function renderServices(list) {
+    const groups = {};
+    for (const s of list) (groups[s.group] ||= []).push(s);
+    const names = Object.keys(groups).sort((a, b) => {
+      const ia = GROUP_ORDER.indexOf(a), ib = GROUP_ORDER.indexOf(b);
+      return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib) || a.localeCompare(b);
+    });
+    $("groups").innerHTML = names.map(g => `<section class="group"><h2>${esc(g)}</h2><div class="grid">${groups[g].map(card).join("")}</div></section>`).join("");
+    const n = st => list.filter(s => st.includes(s.status)).length;
+    const ok = n(["ok", "idle"]), warn = n(["warn"]), bad = n(["error", "down"]);
+    $("tally").innerHTML = `<span class="chip ok">${ok} up</span>` +
+      (warn ? `<span class="chip warn">${warn} attention</span>` : "") +
+      (bad ? `<span class="chip bad">${bad} down</span>` : "");
+  }
+
+  // Orama Server: links to its other pages, and what the converter is doing.
+  const H = location.hostname;
+  if ($("onav")) $("onav").innerHTML = `<b>Dashboard</b> · <a href="http://${H}:8789/">Watchlist &amp; converter</a> · <a href="http://${H}:8790/">TV app updates</a>`;
+  const STEP = {audio: "DTS → E-AC3", dv7: "Dolby Vision 7 → 8.1", dv5: "Dolby Vision 5 → HDR10"};
+  function renderOrama(o) {
+    const el = $("conv");
+    if (!o || !$("onav")) { el.hidden = true; if (!o && $("onav")) $("onav").hidden = true; return; }
+    if (!o.enabled && !o.failed) { el.hidden = true; return; }
+    el.hidden = false;
+    el.innerHTML = o.current
+      ? `<b>Converting</b> ${esc(o.current.name)} · ${esc(STEP[o.current.step] || o.current.step || "")} · ${o.current.progress || 0}%` + (o.queued ? ` · ${o.queued} waiting` : "")
+      : `<b>Converter</b> ` + (o.queued ? `${o.queued} waiting` + (o.in_hours ? "" : " for its hours") : "idle") + (o.failed ? ` · <a href="http://${H}:8789/#convCard">${o.failed} failed</a>` : "");
+  }
+
+  function render(data) {
+    refresh = Math.max(2, data.refresh || 5);
+    if (data.title) {
+      const t = data.title, cut = Math.ceil(t.length / 2);
+      $("title").innerHTML = /.home$/i.test(t) ? esc(t.slice(0, -4)) + '<span>' + esc(t.slice(-4)) + '</span>' : esc(t);
+      document.title = t + " Mediastack";
+    }
+    renderSystem(data.system);
+    renderServices(data.services || []);
+    renderOrama(data.orama);
+    lastOk = Date.now();
+  }
+
+  function tickLive() {
+    const age = (Date.now() - lastOk) / 1000;
+    const stale = !lastOk || age > refresh * 3;
+    $("live").classList.toggle("stale", stale);
+    $("livetxt").textContent = demo ? "demo data" : !lastOk ? "connecting…" : stale ? `no data for ${Math.round(age)}s` : "live";
+  }
+
+  async function poll() {
+    if (demo) { render(demoData()); }
+    else {
+      try {
+        const r = await fetch("api/status", { cache: "no-store" });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        render(await r.json());
+        everOk = true;
+        $("banner").hidden = true;
+      } catch (e) {
+        if (!everOk) {
+          demo = true;
+          $("banner").innerHTML = "<b>Preview.</b> No mediadash backend answered here, so this page is showing example data. Run the container on your NAS to see your real stack.";
+          $("banner").hidden = false;
+          render(demoData());
+        }
+      }
+    }
+    pollUpdates();
+    tickLive();
+    setTimeout(poll, (demo ? 3 : refresh) * 1000);
+  }
+  setInterval(tickLive, 1000);
+
+  /* ───── updates ───── */
+  const LS = "mediadash.pw";
+  const store = { get() { try { return localStorage.getItem(LS) || ""; } catch (e) { return ""; } },
+                  set(v) { try { v ? localStorage.setItem(LS, v) : localStorage.removeItem(LS); } catch (e) {} } };
+  let pw = store.get(), upd = null, updKey = "", showAll = false, confirmAll = 0, updMsg = "";
+  const UST = { available: "Update available", current: "Up to date", local: "Built here", unknown: "Not checked", error: "Couldn't check",
+                queued: "Waiting", updating: "Updating…", updated: "Updated", failed: "Failed" };
+  const ago = t => { if (!t) return "never"; const s = (Date.now() / 1000 - t); return s < 90 ? "just now" : s < 5400 ? Math.round(s / 60) + " min ago" : Math.round(s / 3600) + " h ago"; };
+
+  async function act(path, body) {
+    if (demo) { updMsg = "This is the preview: nothing is updated here."; renderUpdates(true); return; }
+    try {
+      const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Password": pw }, body: JSON.stringify(body || {}) });
+      const j = await r.json().catch(() => ({}));
+      if (r.status === 401) { pw = ""; store.set(""); updMsg = "Wrong password. Enter it again."; }
+      else if (!r.ok) updMsg = j.error || ("mediadash answered " + r.status);
+      else updMsg = "";
+    } catch (e) { updMsg = "Couldn't reach mediadash."; }
+    pollUpdates();
+  }
+
+  function renderUpdates(force) {
+    if (!upd) return;
+    const key = JSON.stringify([upd, showAll, confirmAll > Date.now(), pw ? 1 : 0, updMsg]);
+    if (!force && key === updKey) return;
+    updKey = key;
+    const items = upd.items || [];
+    const st = it => it.job === "queued" || it.job === "updating" ? it.job : (it.job === "failed" ? "failed" : it.job === "updated" && it.state !== "available" ? "updated" : it.state);
+    const avail = items.filter(it => it.state === "available" && it.job !== "queued" && it.job !== "updating");
+    const busy = items.filter(it => it.job === "queued" || it.job === "updating");
+    const errs = items.filter(it => it.state === "error");
+    let sum = upd.checking ? "Checking the registries…" : (avail.length ? `<b>${avail.length} update${avail.length > 1 ? "s" : ""} available</b>` : "Everything is up to date");
+    if (busy.length) sum = `Updating ${esc(upd.running || busy[0].name)}` + (busy.length > 1 ? ` · ${busy.length - 1} waiting` : "");
+    if (!upd.checking) sum += ` · checked ${ago(upd.checked)}` + (errs.length ? ` · ${errs.length} couldn't be checked` : "");
+    $("updSum").innerHTML = sum;
+    const locked = upd.enabled && !pw;
+    $("updPw").hidden = !locked;
+    $("updCheck").hidden = !upd.enabled || locked;
+    $("updCheck").disabled = !!upd.checking;
+    $("updAll").hidden = !upd.enabled || locked || avail.length < 2;
+    const confirming = confirmAll > Date.now();
+    $("updAll").textContent = confirming ? `Yes, update ${avail.length}` : `Update all (${avail.length})`;
+    $("updAll").className = "btn " + (confirming ? "confirm" : "primary");
+    const msgs = [];
+    if (!upd.enabled) msgs.push("Updating from here is off. Set MEDIADASH_PASSWORD for the mediadash container to turn it on (see README).");
+    if (upd.check_error) msgs.push(esc(upd.check_error));
+    if (updMsg) msgs.push(esc(updMsg));
+    $("updMsg").innerHTML = msgs.join("<br>");
+    $("updMsg").hidden = !msgs.length;
+    const interesting = it => ["available", "error"].includes(it.state) || it.job;
+    const shown = showAll ? items : items.filter(interesting);
+    $("updList").innerHTML = shown.map(it => {
+      const s = st(it), canRun = it.managed !== false && upd.enabled && !locked && (it.state === "available" || it.job === "failed") && !(it.job === "queued" || it.job === "updating");
+      const unmanaged = it.managed === false && it.state === "available" ? `<div class="m">Not started with docker compose: update it where you created it (e.g. the UGREEN Docker app).</div>` : "";
+      const msg = unmanaged || (s === "updating" || s === "failed" || s === "error" || s === "updated") && it.message ? `<div class="m ${s === "failed" || s === "error" ? "bad" : ""}">${esc(it.message)}</div>` : "";
+      return `<div class="urow"><span class="n" title="${esc(it.name)}">${esc(it.name)}</span><span class="ust ${s}">${UST[s] || s}</span>
+        <span class="ubtn-slot">${canRun ? `<button class="btn" type="button" data-run="${esc(it.name)}">${it.job === "failed" ? "Retry" : "Update"}</button>` : ""}</span>
+        <span class="i" title="${esc(it.image)}">${esc(it.image)}</span>${msg}</div>`;
+    }).join("") || `<span class="more">${items.length ? "No updates right now." : "No containers seen yet."}</span>`;
+    const hidden = items.length - items.filter(interesting).length;
+    $("updToggle").hidden = !items.length || (!showAll && hidden === 0);
+    $("updToggle").textContent = showAll ? "Show only what needs attention" : `Show all ${items.length} containers`;
+  }
+
+  async function pollUpdates() {
+    if (demo) { upd = demoUpdates(); renderUpdates(); return; }
+    try {
+      const r = await fetch("api/updates", { cache: "no-store" });
+      if (r.ok) { upd = await r.json(); renderUpdates(); }
+    } catch (e) {}
+  }
+
+  $("upd").addEventListener("click", e => {
+    const run = e.target.closest("[data-run]");
+    if (run) { act("api/updates/run", { containers: [run.dataset.run] }); run.disabled = true; return; }
+    if (e.target.id === "updCheck") { act("api/updates/check"); return; }
+    if (e.target.id === "updToggle") { showAll = !showAll; renderUpdates(true); return; }
+    if (e.target.id === "updAll") {
+      if (confirmAll > Date.now()) { confirmAll = 0; act("api/updates/run", { containers: "all" }); }
+      else { confirmAll = Date.now() + 5000; renderUpdates(true); setTimeout(() => renderUpdates(true), 5100); }
+    }
+  });
+  $("updPw").addEventListener("submit", e => {
+    e.preventDefault();
+    pw = $("updPwInput").value; store.set(pw); $("updPwInput").value = ""; updMsg = ""; renderUpdates(true);
+  });
+
+  function demoUpdates() {
+    const now = Date.now() / 1000;
+    const mk = (name, image, state, extra) => Object.assign({ name, image, running: true, service: name, state, message: "", job: null }, extra);
+    return { enabled: true, checked: now - 1500, checking: false, check_error: null, running: null, queue: [], log: [],
+      items: [
+        mk("bazarr", "lscr.io/linuxserver/bazarr:latest", "available"),
+        mk("cloudflared", "cloudflare/cloudflared:latest", "current"),
+        mk("gluetun", "qmcgaw/gluetun:latest", "available"),
+        mk("greek-subs", "mediastack-greek-subs", "local"),
+        mk("mediadash", "mediastack-mediadash", "local"),
+        mk("plex", "plexinc/pms-docker:latest", "available"),
+        mk("prowlarr", "lscr.io/linuxserver/prowlarr:latest", "available"),
+        mk("qbittorrent", "lscr.io/linuxserver/qbittorrent:latest", "available"),
+        mk("radarr", "lscr.io/linuxserver/radarr:latest", "current", { job: "updated", message: "Updated 19:42" }),
+        mk("sonarr", "lscr.io/linuxserver/sonarr:latest", "available"),
+        mk("tdarr", "ghcr.io/haveagitgat/tdarr:latest", "current"),
+        mk("watchlist-sync", "mediastack-watchlist-sync", "local"),
+      ] };
+  }
+
+  /* ───── example data, used only when no backend is reachable ───── */
+  let dt = 0;
+  const j = (b, r) => Math.max(0, b + (Math.random() - .5) * r);
+  function demoData() {
+    dt++;
+    const G = 1024 ** 3, M = 1024 ** 2;
+    const p = (start, rate) => Math.min(99.5, start + dt * rate);
+    const cores = Array.from({ length: 4 }, () => j(28, 40));
+    return {
+      title: "myhome", refresh: 3,
+      system: {
+        host: "DXP4800Plus", cpu: j(31, 16), cpu_cores: cores, cpu_count: 4, load: [1.42, 1.18, 0.97],
+        mem_total: 8 * G, mem_used: j(5.1, .2) * G, mem_percent: j(64, 3), swap_percent: 3,
+        temp: j(52, 4), uptime: 1036800 + dt * 3, net_rx: j(38, 20) * M, net_tx: j(6.5, 4) * M,
+        disk_r: j(48, 30) * M, disk_w: j(22, 18) * M,
+        disks: [
+          { name: "Media · /volume1", total: 32 * 1024 * G, used: 23.6 * 1024 * G, percent: 73.8 },
+          { name: "Apps (NVMe) · /volume2", total: 931 * G, used: 214 * G, percent: 23 },
+        ],
+      },
+      services: [
+        { id: "plex", name: "Plex", type: "plex", group: "Streaming", link: "#", status: "ok", headline: "2 streams · 1 transcoding",
+          items: [
+            { title: "Severance · S02E07", sub: "Chikhai Bardo · aggelos · Samsung S95F", progress: p(41, .3), tag: "Direct Play" },
+            { title: "Dune: Part Two", sub: "2024 · friend · LG webOS", progress: p(67, .2), tag: "Transcode (HW)" },
+          ], container_name: "plex", container: { state: "running", status: "Up 12 days", cpu: j(18, 8), mem: 1.1 * G } },
+        { id: "jellyfin", name: "Jellyfin", type: "jellyfin", group: "Streaming", link: "#", status: "idle", headline: "Nobody watching",
+          container_name: "jellyfin", container: { state: "running", status: "Up 12 days", cpu: j(.6, .4), mem: 410 * M } },
+        { id: "sonarr", name: "Sonarr", type: "sonarr", group: "Automation", link: "#", status: "ok", headline: "3 in queue",
+          stats: [{ label: "Queue", value: 3 }, { label: "Missing", value: 27 }, { label: "Series", value: 112 }],
+          items: [
+            { title: "The Bear · S04E03", sub: "SABnzbd · 2.1 GB · ETA 4m", progress: p(62, 1.5), tag: "Downloading" },
+            { title: "Shōgun · S01E09", sub: "qBittorrent · 3.4 GB", progress: 100, tag: "Importing" },
+            { title: "Slow Horses · S05E02", sub: "SABnzbd · 1.8 GB", progress: 0, tag: "Queued" },
+          ], container_name: "sonarr", container: { state: "running", status: "Up 12 days", cpu: j(2, 1.5), mem: 380 * M } },
+        { id: "radarr", name: "Radarr", type: "radarr", group: "Automation", link: "#", status: "ok", headline: "1 in queue",
+          stats: [{ label: "Queue", value: 1 }, { label: "Missing", value: 9 }, { label: "Movies", value: 846 }],
+          items: [{ title: "Conclave (2024)", sub: "qBittorrent · 14.2 GB · ETA 21m", progress: p(38, .8), tag: "Downloading" }],
+          container_name: "radarr", container: { state: "running", status: "Up 12 days", cpu: j(1.4, 1), mem: 420 * M } },
+        { id: "bazarr", name: "Bazarr", type: "bazarr", group: "Automation", link: "#", status: "ok", headline: "34 subtitles wanted",
+          stats: [{ label: "Wanted ep.", value: 29 }, { label: "Wanted movies", value: 5 }, { label: "Throttled", value: 0 }],
+          container_name: "bazarr", container: { state: "running", status: "Up 12 days", cpu: .4, mem: 290 * M } },
+        { id: "prowlarr", name: "Prowlarr", type: "prowlarr", group: "Automation", link: "#", status: "warn", headline: "9 indexers · 1 failing",
+          stats: [{ label: "Enabled", value: 9 }, { label: "Failing", value: 1 }],
+          items: [{ title: "AnimeTosho", sub: "Disabled after failures", tag: "Failing" }],
+          container_name: "prowlarr", container: { state: "running", status: "Up 12 days", cpu: .2, mem: 190 * M } },
+        { id: "watchlist", name: "watchlist-sync", type: "generic", group: "Automation", link: "", status: "ok", headline: "Syncing Plex watchlists to Sonarr/Radarr",
+          container_name: "watchlist-sync", container: { state: "running", status: "Up 3 days", cpu: .1, mem: 48 * M } },
+        { id: "sab", name: "SABnzbd", type: "sabnzbd", group: "Downloads", link: "#", status: "ok", headline: `${bytes(j(42, 10) * M, true)} · 2 in queue · 0:04:12`,
+          stats: [{ label: "Speed", value: bytes(j(42, 10) * M, true) }, { label: "Left", value: "2.9 GB" }, { label: "Free disk", value: "8.2 TB" }],
+          items: [
+            { title: "The.Bear.S04E03.2160p.WEB.h265", sub: "tv · 2.1 GB · ETA 0:04:12", progress: p(62, 1.5), tag: "Downloading" },
+            { title: "Slow.Horses.S05E02.1080p.WEB", sub: "tv · 1.8 GB", progress: 0, tag: "Queued" },
+          ], container_name: "sabnzbd", container: { state: "running", status: "Up 12 days", cpu: j(22, 10), mem: 520 * M } },
+        { id: "qbit", name: "qBittorrent", type: "qbittorrent", group: "Downloads", link: "#", status: "ok", headline: `↓ ${bytes(j(11, 4) * M, true)} · ↑ ${bytes(j(3, 2) * M, true)}`,
+          stats: [{ label: "Down", value: bytes(j(11, 4) * M, true) }, { label: "Up", value: bytes(j(3, 2) * M, true) }, { label: "Downloading", value: 2 }],
+          items: [
+            { title: "Conclave.2024.2160p.UHD.BluRay.REMUX", sub: "radarr · ↓ 9.8 MB/s · ETA 21m", progress: p(38, .8), tag: "Downloading" },
+            { title: "Hollow Knight Silksong", sub: "games · ↓ 1.2 MB/s · ETA 1h 4m", progress: p(71, .2), tag: "Downloading" },
+            { title: "Shogun.S01.2160p.WEB", sub: "tv-sonarr · ↑ 2.1 MB/s · ratio 1.84", progress: 100, tag: "Seeding" },
+          ], container_name: "qbittorrent", container: { state: "running", status: "Up 12 days", cpu: j(6, 3), mem: 640 * M } },
+        { id: "tdarr", name: "Tdarr", type: "tdarr", group: "Processing", link: "#", status: "ok", headline: "1 worker busy · 14 queued",
+          stats: [{ label: "Queued", value: 14 }, { label: "Processed", value: 2311 }, { label: "Errors", value: 0 }, { label: "Saved", value: "182.4 GB" }],
+          items: [{ title: "Gladiator II (2024) Remux-2160p.mkv", sub: "nas-node · transcode gpu · 312 fps", progress: p(54, 2), tag: "DTS → EAC3" }],
+          container_name: "tdarr", container: { state: "running", status: "Up 12 days", cpu: j(41, 12), mem: 760 * M } },
+        { id: "greek-subs", name: "greek-subs", type: "generic", group: "Processing", link: "", status: "ok", headline: "Generating Greek subtitles",
+          container_name: "greek-subs", container: { state: "running", status: "Up 2 days", cpu: j(3, 2), mem: 120 * M } },
+        { id: "gluetun", name: "Gluetun", type: "gluetun", group: "Infrastructure", link: "", status: "ok", headline: "VPN connected · Amsterdam, Netherlands",
+          stats: [{ label: "Public IP", value: "185.107.xx.xx" }, { label: "Location", value: "Amsterdam, NL" }, { label: "Forwarded port", value: 51413 }],
+          container_name: "gluetun", container: { state: "running", status: "Up 12 days (healthy)", cpu: j(2, 1), mem: 34 * M } },
+        { id: "cloudflared", name: "Cloudflared", type: "generic", group: "Infrastructure", link: "", status: "ok", headline: "Tunnel for plex.example.com",
+          container_name: "cloudflared", container: { state: "running", status: "Up 12 days", cpu: .3, mem: 28 * M } },
+        { id: "watchtower", name: "Watchtower", type: "generic", group: "Infrastructure", link: "", status: "down", headline: "Container exited",
+          container_name: "watchtower", container: { state: "exited", status: "Exited (1) 2 hours ago", cpu: null, mem: null } },
+      ],
+    };
+  }
+
+  poll();
+})();
+</script>

@@ -1,1 +1,7 @@
 requests>=2.32.4,<3
+# Orama Server's dashboard
+fastapi==0.115.6
+uvicorn==0.32.1
+httpx==0.28.1
+psutil==6.1.1
+pyyaml==6.0.2

@@ -1,7 +1,11 @@
-# Publishes a release whenever VERSION in app.py changes on main: runs the
-# tests, pushes the Docker image to GitHub's registry
-# (ghcr.io/<owner>/watchlist-sync:<version> and :latest, for amd64 and arm64),
-# and creates a GitHub release with the commit message as notes.
+# Publishes a release whenever VERSION in app.py changes on main:
+#   1. runs the tests (watchlist sync, converter with real files)
+#   2. builds Orama Server, checks every tool in it and runs the converter
+#      tests inside the image
+#   3. pushes both images (amd64 + arm64) to GitHub's registry:
+#        ghcr.io/<owner>/orama-server   everything (sync, converter, dashboard, TV app updates)
+#        ghcr.io/<owner>/watchlist-sync the sync on its own, as before
+#   4. creates a GitHub release with the commit message as notes
 name: Release
 
 on:
@@ -26,20 +30,56 @@ jobs:
           V=$(sed -n 's/^VERSION = "\([^"]*\)"/\1/p' app.py)
           echo "version=$V" >> "$GITHUB_OUTPUT"
           if gh release view "v$V" >/dev/null 2>&1; then echo "exists=true" >> "$GITHUB_OUTPUT"; fi
-          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+          OWNER=${GITHUB_REPOSITORY_OWNER,,}
+          echo "SYNC_IMAGE=ghcr.io/$OWNER/watchlist-sync" >> "$GITHUB_ENV"
+          echo "SERVER_IMAGE=ghcr.io/$OWNER/orama-server" >> "$GITHUB_ENV"
         env:
           GH_TOKEN: ${{ github.token }}
 
       - name: Test
         if: steps.v.outputs.exists != 'true'
         run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg >/dev/null
           pip install -r requirements.txt
           python test_app.py
+          python test_convert.py
 
       - uses: docker/setup-qemu-action@v3
         if: steps.v.outputs.exists != 'true'
       - uses: docker/setup-buildx-action@v3
         if: steps.v.outputs.exists != 'true'
+
+      - name: Build Orama Server for a check
+        if: steps.v.outputs.exists != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: orama-server
+          platforms: linux/amd64
+          load: true
+          tags: orama-server:test
+
+      - name: Check the image
+        if: steps.v.outputs.exists != 'true'
+        run: |
+          docker run --rm orama-server:test sh -c '
+            set -e
+            ffmpeg -hide_banner -version | head -1
+            dovi_tool --version
+            mkvmerge --version
+            /usr/lib/jellyfin-ffmpeg/ffmpeg -hide_banner -filters 2>/dev/null | grep -q libplacebo && echo "jellyfin-ffmpeg with libplacebo"
+            apps2samsung-cli --version
+            docker --version && docker compose version
+            python -c "import fastapi, uvicorn, httpx, psutil, yaml, requests; print(\"python deps ok\")"'
+          docker run --rm -v "$PWD/test_convert.py:/app/test_convert.py:ro" orama-server:test python test_convert.py
+          # all three parts answer
+          mkdir -p /tmp/cfg && printf 'title: ci\nservices: []\ndisks: []\n' > /tmp/cfg/config.yaml
+          docker run -d --name os -p 8789:8789 -p 8765:8765 -p 8790:8790 -v /tmp/cfg:/config:ro orama-server:test
+          for i in $(seq 30); do curl -fs localhost:8789/health && curl -fs localhost:8765/api/status >/dev/null && curl -fs localhost:8790/health && break; sleep 2; done
+          curl -fs localhost:8789/api/convert && curl -fs localhost:8765/api/status | grep -q '"orama"' && echo "all parts up"
+          docker logs os | tail -20
+          docker rm -f os
+
       - uses: docker/login-action@v3
         if: steps.v.outputs.exists != 'true'
         with:
@@ -47,16 +87,33 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Build and push the image
+      - name: Push Orama Server
         if: steps.v.outputs.exists != 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
+          target: orama-server
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ${{ env.IMAGE }}:${{ steps.v.outputs.version }}
-            ${{ env.IMAGE }}:latest
+            ${{ env.SERVER_IMAGE }}:${{ steps.v.outputs.version }}
+            ${{ env.SERVER_IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.v.outputs.version }}
+            org.opencontainers.image.licenses=MIT
+
+      - name: Push watchlist-sync
+        if: steps.v.outputs.exists != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: watchlist-sync
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.SYNC_IMAGE }}:${{ steps.v.outputs.version }}
+            ${{ env.SYNC_IMAGE }}:latest
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ steps.v.outputs.version }}
@@ -66,8 +123,8 @@ jobs:
         if: steps.v.outputs.exists != 'true'
         run: |
           git log -1 --pretty=%B | grep -vE '^(Co-Authored-By|Claude-Session):' > notes.md
-          printf '\n```\ndocker pull %s:%s\n```\n' "$IMAGE" "$V" >> notes.md
-          gh release create "v$V" --title "watchlist-sync $V" --notes-file notes.md --target "$GITHUB_SHA"
+          printf '\n```\ndocker pull %s:%s\n```\n' "$SERVER_IMAGE" "$V" >> notes.md
+          gh release create "v$V" --title "Orama Server $V" --notes-file notes.md --target "$GITHUB_SHA"
         env:
           GH_TOKEN: ${{ github.token }}
           V: ${{ steps.v.outputs.version }}

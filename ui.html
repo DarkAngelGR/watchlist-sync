@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Watchlist Sync</title>
+<title>Orama Server</title>
 <style>
 :root{
   --bg:#f4f4f2; --card:#fff; --ink:#1b1c1e; --mute:#6b6e75; --line:#e3e3df;
@@ -36,6 +36,7 @@ button:disabled{opacity:.55;cursor:default}
 .stats{display:flex;gap:26px;flex-wrap:wrap;margin:4px 0 8px}
 .stats .l{font-size:12px;color:var(--mute)}
 .mute{color:var(--mute)} .small{font-size:13px}
+#nav a{color:var(--mute)} #nav b{color:var(--ink);font-weight:600}
 .err{color:var(--bad);font-size:13px;margin:4px 0 0;word-break:break-word}
 table{width:100%;border-collapse:collapse;font-size:14px}
 th{text-align:left;font-weight:600;color:var(--mute);font-size:12px;padding:6px 8px;border-bottom:1px solid var(--line)}
@@ -72,7 +73,8 @@ dialog li{margin:2px 0}
 <body>
 <div class="wrap">
   <header>
-    <h1>Watchlist Sync</h1>
+    <h1>Orama Server</h1>
+    <nav class="small" id="nav"></nav>
     <span id="ver" class="mute small"></span>
     <span id="statePill" class="pill">…</span>
     <span class="sp"></span>
@@ -104,6 +106,22 @@ dialog li{margin:2px 0}
       <select id="userFilter" style="width:auto;text-transform:none;letter-spacing:0"><option value="">Everyone</option></select>
     </h2>
     <div class="scroll" id="reqBox"><span class="mute small">Nothing yet.</span></div>
+  </section>
+
+  <section class="card" id="convCard">
+    <h2 style="display:flex;align-items:center;gap:10px">Converter
+      <span id="convPill" class="pill">…</span>
+      <span class="sp" style="flex:1"></span>
+      <button id="convScan">Scan library now</button>
+      <button id="convClear">Clear finished</button>
+    </h2>
+    <div id="convNow" class="small mute">Off. Turn it on under Settings › Converter.</div>
+    <div style="display:flex;gap:8px;margin-top:10px">
+      <input type="text" id="convPath" placeholder="Convert one file: its path in this container, e.g. /data/media/movies/…/file.mkv">
+      <button id="convAdd">Add</button>
+    </div>
+    <div class="small mute" id="convAddMsg"></div>
+    <div class="scroll" id="convJobs" style="margin-top:10px"></div>
   </section>
 
   <section class="card">
@@ -155,6 +173,35 @@ dialog li{margin:2px 0}
         <legend>TMDB <span class="mute small">(optional)</span></legend>
         <div class="row"><label>API key</label><input type="password" name="tmdb_api_key" placeholder="themoviedb.org → Settings → API (free)"></div>
         <div class="row"><label></label><div class="mute small">Adds trending TV shows to Orama's Discover row. Movies come from Radarr and need no key.</div></div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Plex server <span class="mute small">(for rescans after converting)</span></legend>
+        <div class="row"><label>URL</label><input type="text" name="plex_server_url" placeholder="http://192.168.x.x:32400"></div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Converter <span class="mute small">(makes files play directly on Samsung TVs)</span></legend>
+        <div class="row"><label></label><div class="checks">
+          <label><input type="checkbox" name="convert_enabled"> On</label>
+        </div></div>
+        <div class="row"><label>Media folders</label><input type="text" name="convert_dirs" placeholder="/media (as mounted in this container, comma-separated)"></div>
+        <div class="row"><label>Audio</label><div class="checks">
+          <label><input type="checkbox" name="convert_audio"> DTS → E-AC3 (when there's no playable track in that language)</label>
+          <label><input type="checkbox" name="convert_keep_original"> Keep the original DTS track too</label>
+        </div></div>
+        <div class="row"><label>E-AC3 bitrate</label><select name="convert_bitrate" style="max-width:160px">
+          <option value="640k">640 kbps</option><option value="1024k">1024 kbps</option><option value="1536k">1536 kbps</option></select></div>
+        <div class="row"><label>Dolby Vision</label><div class="checks">
+          <label><input type="checkbox" name="convert_dv7"> Profile 7 (Blu-ray) → 8.1, no re-encoding</label>
+          <label><input type="checkbox" name="convert_dv5"> Profile 5 → HDR10 (re-encodes with the Intel graphics; experimental)</label>
+          <button type="button" id="gpuBtn" class="link">Check the graphics</button><span id="gpuMsg" class="small mute"></span>
+        </div></div>
+        <div class="row"><label>Only between</label><input type="text" name="convert_hours" placeholder="e.g. 1-7 (blank = any time)" style="max-width:200px"></div>
+        <div class="row"><label>Scan every night at</label><input type="number" min="1" max="23" name="convert_scan_hour" style="max-width:100px"></div>
+        <div class="row"><label>Path mapping</label><input type="text" name="convert_path_map" placeholder="as Sonarr/Radarr see it = as here, e.g. /data/media=/media"></div>
+        <div class="row"><label></label><div class="mute small">Sonarr and Radarr: Settings › Connect › + › Webhook, On Import and On Upgrade,
+          URL <code id="hookUrl"></code>. New files are then fixed right after they arrive.</div></div>
       </fieldset>
 
       <fieldset>
@@ -376,6 +423,7 @@ async function loadSettings(){
   form.elements.sonarr_monitor.value = settings.sonarr_monitor;
   form.elements.sonarr_series_type.value = settings.sonarr_series_type;
   form.elements.radarr_min_availability.value = settings.radarr_min_availability;
+  form.elements.convert_bitrate.value = settings.convert_bitrate || "1536k";
 }
 
 form.querySelectorAll("[data-test]").forEach(btn => btn.onclick = async () => {
@@ -417,7 +465,40 @@ form.onsubmit = async e => {
 $("#syncBtn").onclick = async () => { await api("/api/sync", {method:"POST"}); setTimeout(refresh, 800); };
 $("#userFilter").onchange = renderRequests;
 
-loadSettings(); refresh(); setInterval(refresh, 5000);
+// --- converter
+const STEP = {audio: "DTS → E-AC3", dv7: "Dolby Vision 7 → 8.1", dv5: "Dolby Vision 5 → HDR10"};
+async function refreshConv(){
+  let c; try { c = await api("/api/convert"); } catch(e){ return; }
+  const pill = $("#convPill");
+  pill.className = "pill " + (c.enabled ? (c.in_hours ? "ok" : "warn") : "");
+  pill.textContent = c.enabled ? (c.in_hours ? "On" : "Waiting for " + c.hours) : "Off";
+  const q = (c.counts.queued || 0), cur = c.current;
+  $("#convNow").innerHTML = cur
+    ? `<b>${esc(cur.name)}</b> · ${esc(STEP[cur.step] || cur.step)} · ${cur.progress || 0}%` + (q ? ` · ${q} waiting` : "")
+    : (c.enabled ? (q ? `${q} waiting` : "Nothing to do.") + (c.scanning ? " Scanning the library…" : c.last_scan ? ` Last scan ${ago(c.last_scan.at)}, ${c.last_scan.queued} queued.` : "") + ` ${c.scanned} file${c.scanned === 1 ? "" : "s"} checked so far.`
+                 : "Off. Turn it on under Settings › Converter.");
+  const rows = c.jobs.filter(j => j.status !== "running").slice(0, 30).map(j => `<tr>
+    <td>${esc(j.name)}</td><td><span class="tag ${j.status === "failed" ? "failed" : j.status === "done" ? "added" : ""}">${esc(j.status)}</span></td>
+    <td class="small mute">${esc(j.detail || (j.todo || []).map(t => STEP[t]).join(", ") || j.source)}</td>
+    <td class="small mute">${ago(j.finished || j.added)}${j.status === "failed" ? ` <button class="link" data-retry="${j.id}">Retry</button>` : ""}</td></tr>`).join("");
+  $("#convJobs").innerHTML = rows ? `<table>${rows}</table>` : "";
+  $("#convJobs").querySelectorAll("[data-retry]").forEach(b => b.onclick = async () => { await api("/api/convert/retry", {method:"POST", body: JSON.stringify({id: +b.dataset.retry})}); refreshConv(); });
+}
+$("#convScan").onclick = async () => { await api("/api/convert/scan", {method:"POST"}); setTimeout(refreshConv, 800); };
+$("#convAdd").onclick = async () => {
+  const path = $("#convPath").value.trim(); if (!path) return;
+  try { const r = await api("/api/convert/add", {method:"POST", body: JSON.stringify({path})});
+        $("#convAddMsg").textContent = r.queued ? "Added. It runs when the converter is on (and within its hours)." : (r.error || "Already waiting."); }
+  catch(e){ $("#convAddMsg").textContent = "No such file in the container."; }
+  refreshConv();
+};
+$("#convClear").onclick = async () => { await api("/api/convert/clear", {method:"POST"}); refreshConv(); };
+$("#gpuBtn").onclick = async () => { $("#gpuMsg").textContent = " Checking…"; const r = await api("/api/convert/gpu", {method:"POST"}); $("#gpuMsg").textContent = " " + (r.ok ? "✓ " : "✗ ") + r.detail; };
+$("#hookUrl").textContent = location.origin + "/api/hooks/arr";
+const H = location.hostname;
+$("#nav").innerHTML = `<a href="http://${H}:8765/">Dashboard</a> · <b>Watchlist & converter</b> · <a href="http://${H}:8790/">TV app updates</a>`;
+
+loadSettings(); refresh(); refreshConv(); setInterval(refresh, 5000); setInterval(refreshConv, 3000);
 </script>
 </body>
 </html>

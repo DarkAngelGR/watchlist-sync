@@ -1,15 +1,28 @@
-# watchlist-sync. Start it with:  docker compose up -d
-# Then open http://<server-ip>:8789 to sign in with Plex and connect Sonarr/Radarr/Bazarr.
+# Orama Server: everything around the Orama TV app in one container.
+#   http://<server>:8789  watchlist sync + converter settings (sign in with Plex here)
+#   http://<server>:8765  dashboard (needs a config.yaml, see dash/README in the repo)
+#   http://<server>:8790  TV app updates (installs new Orama releases on the TV)
+# Start it with:  docker compose up -d
 services:
-  watchlist-sync:
-    image: ghcr.io/darkangelgr/watchlist-sync:latest
-    # build: .                  # or build it from this folder instead
-    container_name: watchlist-sync
-    network_mode: host          # reaches Sonarr/Radarr/Bazarr on this machine and your LAN
+  orama-server:
+    image: ghcr.io/darkangelgr/orama-server:latest
+    container_name: orama-server
+    network_mode: host          # reaches Plex/Sonarr/Radarr/Bazarr and the TV on your network
     environment:
       - TZ=Europe/London        # your time zone
-      # - UI_PASSWORD=change-me # optional: password-protect the web UI (recommended)
-      # - PORT=8789
+      - DATA_DIR=/appdata       # so /data can be your media, at the same path Sonarr/Radarr use
+      # - UI_PASSWORD=change-me        # optional: password for the web pages (recommended)
+      # - MEDIADASH_PASSWORD=change-me # lets the dashboard update containers
+      # - TV_IP=192.168.1.50           # the TV, for installing Orama updates
+      # - AUTO_INSTALL=true            # install new Orama releases by themselves
+    # devices:
+    #   - /dev/dri:/dev/dri     # Intel graphics: only for Dolby Vision 5 → HDR10
+    # group_add:
+    #   - "105"                 # the render group's number on your machine (getent group render)
     volumes:
-      - ./data:/data            # settings, Plex sign-in and history
+      - ./orama-server:/appdata                   # settings, Plex sign-in, history, TV certificate
+      - /path/to/data:/data                       # your media, mounted like Sonarr/Radarr mount it (read-write: the converter fixes files in place)
+      - ./mediadash/config.yaml:/config/config.yaml:ro   # dashboard services
+      - /var/run/docker.sock:/var/run/docker.sock # dashboard: container status and updates
+      # - /volume1:/volume1:ro                    # dashboard: free space of these disks
     restart: unless-stopped

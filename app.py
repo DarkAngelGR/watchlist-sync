@@ -31,11 +31,13 @@ from urllib.parse import unquote, urlencode, urlparse, parse_qs
 
 import requests
 
+from convert import Converter, gpu_check
+
 log = logging.getLogger("watchlist-sync")
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLEXTV = "https://plex.tv"
 PRODUCT = "watchlist-sync"
-VERSION = "1.4.0"
+VERSION = "2.0.0"
 
 
 # --------------------------------------------------------------------------- settings
@@ -74,6 +76,19 @@ FIELDS = {
     "bazarr_api_key": ("BAZARR_API_KEY", "", str),
     # Optional: trending TV shows for Orama's Discover row (Radarr covers movies)
     "tmdb_api_key": ("TMDB_API_KEY", "", str),
+    # Plex Media Server on your network (the converter asks it to rescan)
+    "plex_server_url": ("PLEX_SERVER_URL", "", str),
+    # Converter (convert.py): DTS audio and Dolby Vision for Samsung TVs
+    "convert_enabled": ("CONVERT_ENABLED", False, bool),
+    "convert_dirs": ("CONVERT_MEDIA_DIRS", "/media", str),
+    "convert_audio": ("CONVERT_AUDIO", True, bool),
+    "convert_bitrate": ("CONVERT_EAC3_BITRATE", "1536k", str),
+    "convert_keep_original": ("CONVERT_KEEP_ORIGINAL", True, bool),
+    "convert_dv7": ("CONVERT_DV7", False, bool),
+    "convert_dv5": ("CONVERT_DV5", False, bool),
+    "convert_hours": ("CONVERT_HOURS", "", str),
+    "convert_scan_hour": ("CONVERT_SCAN_HOUR", 3, int),
+    "convert_path_map": ("CONVERT_PATH_MAP", "", str),
 }
 SECRETS = ("plex_token", "sonarr_api_key", "radarr_api_key", "bazarr_api_key", "tmdb_api_key")
 
@@ -571,6 +586,19 @@ class Syncer:
         self.cfg = None
         self.lock = threading.Lock()      # one sync or exclusion at a time
         self.action = None                # progress/result of the last exclude, shown in the UI
+        self.converter = Converter(os.path.join(data_dir, "convert"), self.convert_options)
+
+    def convert_options(self):
+        s = self.settings.all()
+        return {
+            "enabled": s["convert_enabled"], "dirs": s["convert_dirs"], "audio": s["convert_audio"],
+            "bitrate": s["convert_bitrate"] or "1536k", "keep_original": s["convert_keep_original"],
+            "dv7": s["convert_dv7"], "dv5": s["convert_dv5"], "hours": s["convert_hours"],
+            "scan_hour": s["convert_scan_hour"], "path_map": s["convert_path_map"],
+            "plex_url": s["plex_server_url"], "plex_token": s["plex_token"],
+            "arr": {"sonarr": {"url": s["sonarr_url"], "api_key": s["sonarr_api_key"]},
+                    "radarr": {"url": s["radarr_url"], "api_key": s["radarr_api_key"]}},
+        }
 
     # -- setup helpers
     def build(self):
@@ -1658,6 +1686,8 @@ def make_handler(syncer, ui_password):
                 })
             if p == "/api/settings":
                 return self._send(200, syncer.settings.public())
+            if p == "/api/convert":
+                return self._send(200, syncer.converter.status())
             if p == "/api/tv":
                 return self._send(200, syncer.tv_info())
             if p == "/api/tv/queue":
@@ -1753,6 +1783,28 @@ def make_handler(syncer, ui_password):
             if p in ("/sync", "/api/sync"):
                 syncer.wake.set()
                 return self._send(202, {"queued": True})
+            # -- converter
+            if p == "/api/hooks/arr":
+                # Sonarr/Radarr > Settings > Connect > Webhook (On Import, On Upgrade)
+                n = syncer.converter.hook(body) if syncer.converter.opts().get("enabled") else 0
+                return self._send(200, {"ok": True, "queued": n})
+            if p == "/api/convert/scan":
+                threading.Thread(target=syncer.converter.scan, daemon=True).start()
+                return self._send(202, {"started": True})
+            if p == "/api/convert/retry":
+                syncer.converter.retry(int(body.get("id") or 0))
+                return self._send(200, {"ok": True})
+            if p == "/api/convert/clear":
+                syncer.converter.clear_finished()
+                return self._send(200, {"ok": True})
+            if p == "/api/convert/add":
+                path = str(body.get("path") or "")
+                if not path.startswith("/") or not os.path.isfile(path):
+                    return self._send(400, {"error": "no such file in the container"})
+                return self._send(200, {"queued": syncer.converter.enqueue(path, "manual")})
+            if p == "/api/convert/gpu":
+                ok, why = gpu_check()
+                return self._send(200, {"ok": ok, "detail": why})
             if p == "/api/tv/sync":
                 # A TV just added something to the Plex Watchlist: sync now.
                 syncer.wake.set()
@@ -1851,6 +1903,9 @@ def make_handler(syncer, ui_password):
 
 
 # --------------------------------------------------------------------------- main
+SYNCER = None      # the running Syncer (Orama Server's dashboard reads the converter's state)
+
+
 def main():
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -1858,7 +1913,9 @@ def main():
     )
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
-    syncer = Syncer(os.environ.get("DATA_DIR", "/data"))
+    global SYNCER
+    syncer = SYNCER = Syncer(os.environ.get("DATA_DIR", "/data"))
+    syncer.converter.start()
     port = int(os.environ.get("PORT", os.environ.get("STATUS_PORT", "8789")))
     srv = ThreadingHTTPServer(("0.0.0.0", port), make_handler(syncer, os.environ.get("UI_PASSWORD", "")))
     threading.Thread(target=srv.serve_forever, daemon=True).start()

@@ -1,12 +1,66 @@
-# watchlist-sync
+# Orama Server
 
-**Your household's Plex Watchlists, downloaded automatically.** Add a movie or show to
-your Plex Watchlist, from any Plex app, and watchlist-sync hands it to Radarr or Sonarr.
-It reads your friends' Watchlists too, so everyone you share your server with can
-request things without a separate request app.
+**Everything around the [Orama](https://github.com/DarkAngelGR/orama) TV app, in one container.**
+Plex stays the media server; Orama Server is its companion:
+
+| Part | Port | What it does |
+|---|---|---|
+| **Watchlist sync** | 8789 | Your household's and friends' Plex Watchlists go to Sonarr/Radarr; Orama's TV endpoints (downloads, requests, subtitles, collections, Discover, delete) |
+| **Converter** | 8789 | Fixes files Samsung TVs can't play directly: DTS audio → E-AC3, Dolby Vision 7 → 8.1, Dolby Vision 5 → HDR10 |
+| **Dashboard** | 8765 | Every service's status, CPU/RAM/disks, and updating containers |
+| **TV app updates** | 8790 | Installs new Orama releases on the TV (Apps2Samsung) |
+
+It replaces four separate containers (watchlist-sync, mediadash, the Orama installer and
+a Tdarr setup for DTS) with one, on the same ports, so Orama, bookmarks and webhooks keep
+working. The watchlist sync alone is still published as `ghcr.io/darkangelgr/watchlist-sync`.
 
 [![Latest release](https://img.shields.io/github/v/release/DarkAngelGR/watchlist-sync?label=release)](https://github.com/DarkAngelGR/watchlist-sync/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
+## Getting started
+
+Download [`docker-compose.yml`](docker-compose.yml), fill in the paths and options, then
+`docker compose up -d`. Open `http://<server>:8789`, sign in with Plex and add Sonarr/Radarr.
+Moving from the separate containers? See [MIGRATING.md](MIGRATING.md).
+
+## The converter
+
+Samsung TVs have no DTS and no Dolby Vision. Orama already works around both while playing
+(it picks another audio track, or has the server convert), but fixing the files once means
+they always play directly, with full quality.
+
+- **DTS → E-AC3.** A DTS track with no playable track in the same language gets an E-AC3
+  (Dolby Digital Plus) copy at 1536 kbps, as the default track. The DTS track is kept
+  unless you turn that off. 7.1 becomes 5.1 (ffmpeg's E-AC3 limit), keeping the LFE.
+- **Dolby Vision profile 7 → 8.1** (UHD Blu-ray remuxes). No re-encoding: only the Dolby
+  Vision layer changes (dovi_tool), so the file always plays as HDR10. Off by default.
+- **Dolby Vision profile 5 → HDR10** (streaming downloads that show purple and green on
+  Samsung). Re-encoded with the Intel graphics (libplacebo + VAAPI); needs `/dev/dri` in the
+  container. **Experimental**, off by default; *Check the graphics* on the settings page
+  tests it first.
+
+New files are fixed right after Sonarr/Radarr import them: add a webhook in each
+(Settings › Connect › + › Webhook, *On Import* and *On Upgrade*, URL
+`http://<server>:8789/api/hooks/arr`). A nightly scan catches everything else. One file at
+a time, at low priority, optionally only during set hours. A file is only replaced after
+the new copy has been checked (same length, every track present), by an atomic rename;
+if anything fails, the original stays untouched. Plex is asked to rescan afterwards.
+
+## The dashboard and TV app updates
+
+The dashboard reads the same `config.yaml` as mediadash did (services, API keys, disks);
+mount it at `/config/config.yaml`. Updating containers needs `MEDIADASH_PASSWORD` and the
+Docker socket. Orama Server updates itself through a short-lived helper container.
+
+TV app updates need `TV_IP` (the TV in Developer Mode) and your Apps2Samsung certificate,
+kept in `<data>/installer/`. Orama finds it on port 8790 as before.
+
+# Watchlist sync
+
+**Your household's Plex Watchlists, downloaded automatically.** Add a movie or show to
+your Plex Watchlist, from any Plex app, and it goes to Radarr or Sonarr.
+It reads your friends' Watchlists too, so everyone you share your server with can
+request things without a separate request app.
 
 <p align="center">
   <img src="assets/screenshot.png" alt="The watchlist-sync web page: the Plex account, the last sync, users and their Watchlists, and recent requests" width="760">
@@ -29,7 +83,7 @@ request things without a separate request app.
 - **A web page** for signing in with Plex, settings, users and request history.
   No config files to edit.
 
-## Getting started
+## Running the sync on its own
 
 You need Docker, a Plex Media Server you own, and Sonarr and/or Radarr.
 
