@@ -18,7 +18,6 @@ CMD ["python", "app.py"]
 # ---------------------------------------------------------------- orama-server
 FROM python:3.12-slim-bookworm AS orama-server
 ARG TARGETARCH
-ARG DOVI_TOOL_VERSION=2.1.2
 # Apps2Samsung release with the command-line tool (signs and installs Orama on the TV)
 ARG A2S_VERSION=latest
 ENV PYTHONUNBUFFERED=1 DATA_DIR=/data SELF_CONTAINER=orama-server
@@ -36,12 +35,16 @@ RUN set -eu; \
     if [ "$TARGETARCH" = amd64 ]; then apt-get install -y --no-install-recommends intel-media-va-driver-non-free; fi; \
     apt-get purge -y gnupg; apt-get autoremove -y; rm -rf /var/lib/apt/lists/*
 
-# dovi_tool
+# dovi_tool: the newest release's Linux build for this CPU (found through GitHub's API,
+# so a renamed download doesn't break the build)
 RUN set -eu; \
-    case "$TARGETARCH" in amd64) T=x86_64-unknown-linux-musl ;; arm64) T=aarch64-unknown-linux-musl ;; *) echo "unsupported" >&2; exit 1 ;; esac; \
-    curl -fsSL "https://github.com/quietvoid/dovi_tool/releases/download/${DOVI_TOOL_VERSION}/dovi_tool-${DOVI_TOOL_VERSION}-${T}.tar.gz" \
-      | tar -xz -C /usr/local/bin dovi_tool; \
-    dovi_tool --version
+    case "$TARGETARCH" in amd64) A=x86_64 ;; arm64) A=aarch64 ;; *) echo "unsupported" >&2; exit 1 ;; esac; \
+    curl -fsSL "https://api.github.com/repos/quietvoid/dovi_tool/releases/latest" -o /tmp/d.json; \
+    URL=$(A=$A python3 -c "import json,os; d=json.load(open('/tmp/d.json')); a=os.environ['A']; u=[x['browser_download_url'] for x in d.get('assets',[]) if a in x['name'] and 'linux' in x['name'] and x['name'].endswith('.tar.gz')]; u.sort(key=lambda n: 'musl' not in n); print(u[0] if u else '')"); \
+    rm /tmp/d.json; [ -n "$URL" ] || { echo "no dovi_tool download for $A" >&2; exit 1; }; \
+    echo "dovi_tool: $URL"; mkdir -p /tmp/dovi; curl -fsSL "$URL" | tar -xz -C /tmp/dovi; \
+    find /tmp/dovi -type f -name dovi_tool -exec install -m 755 {} /usr/local/bin/dovi_tool \; ; \
+    rm -rf /tmp/dovi; dovi_tool --version
 
 # Apps2Samsung command-line tool (as in the Orama installer)
 RUN set -eu; \
