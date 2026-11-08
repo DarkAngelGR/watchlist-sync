@@ -18,6 +18,7 @@ import re
 import sqlite3
 import threading
 import time
+from datetime import datetime, timezone
 import xml.etree.ElementTree as ET
 
 log = logging.getLogger("orama-ai")
@@ -66,6 +67,7 @@ def plex_preferences():
     count = defaultdict(Counter)
     labels = {}
     seen_history = set()
+    last_seen = {}
     for start in range(0, HISTORY_LIMIT, 200):
         page = get_plex("/status/sessions/history/all", {
             "accountID": PLEX_ACCOUNT_ID, "sort": "viewedAt:desc",
@@ -101,8 +103,20 @@ def plex_preferences():
                 title = row.get("grandparentTitle") or ""
             else:
                 continue
+            # Plex playback-history records are plays, not proof of a full watch.
+            # Only discard events when an explicit completion fraction is present.
+            try:
+                position, duration = float(row.get("viewOffset") or 0), float(row.get("duration") or 0)
+                if position > 0 and duration > 0 and position / duration < .9:
+                    continue
+            except (ValueError, TypeError):
+                pass
             count[group_key][episode_key] += 1
             labels[group_key] = (kind, item_key, title)
+            try:
+                last_seen[group_key] = max(last_seen.get(group_key, 0), int(row.get("viewedAt") or 0))
+            except (TypeError, ValueError):
+                pass
         if len(rows) < 200 or not fresh_events:
             break
     favorites = []
@@ -112,6 +126,11 @@ def plex_preferences():
         unique = len(episodes)
         # One full movie viewing is positive; rewatching it is a stronger signal.
         weight = 3 + min(24, repeats * 5) if kind == "movie" else 3 + min(18, unique * .35) + min(24, repeats * 5)
+        # Keep historical favorites strong, but let recent interests influence ranking.
+        when = last_seen.get(key, 0)
+        if when:
+            age_days = max(0, (time.time() - when) / 86400)
+            weight *= .75 + .25 * math.exp(-age_days / 90)
         favorites.append({"kind": "movie" if kind == "movie" else "show",
                           "key": item_key, "title": title, "weight": weight})
     favorites.sort(key=lambda f: -f["weight"])
@@ -142,9 +161,16 @@ def jellyfin_preferences():
         rows = data.get("Items") or []
         for row in rows:
             ud = row.get("UserData") or {}
-            plays = max(int(ud.get("PlayCount") or 0), int(bool(ud.get("Played"))))
-            if not plays:
+            # Jellyfin PlayCount can increase on playback start. Do not infer a
+            # completed watch from PlayCount alone; prefer Played or >=90%.
+            fraction = 0.
+            try:
+                fraction = float(ud.get("PlaybackPositionTicks") or 0) / float(row.get("RunTimeTicks") or 0)
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+            if not (ud.get("Played") or fraction >= .9):
                 continue
+            plays = max(int(ud.get("PlayCount") or 0), 1)
             if row.get("Type") == "Movie":
                 key = "movie:" + str(row.get("Id", ""))
                 title = row.get("Name", "")
@@ -224,6 +250,9 @@ class Recommender:
         self.db = os.path.join(data_dir, "embeddings.sqlite3")
         with sqlite3.connect(self.db) as conn:
             conn.execute("CREATE TABLE IF NOT EXISTS embedding (key TEXT PRIMARY KEY, vector TEXT NOT NULL)")
+            conn.execute("CREATE TABLE IF NOT EXISTS feedback (kind TEXT NOT NULL, item_id TEXT NOT NULL,"
+                         " action TEXT NOT NULL, updated_at INTEGER NOT NULL,"
+                         " PRIMARY KEY(kind, item_id))")
         self.lock = threading.RLock()
         self.embed_lock = threading.Lock()
         self.favorites = []
@@ -283,35 +312,94 @@ class Recommender:
         finally:
             self.embed_lock.release()
 
-    def rank(self, candidates):
+    def feedback(self, kind, item_id, action):
+        """Store only a title ID and explicit preference, never a token or history."""
+        if kind not in ("movie", "show") or not str(item_id).isdigit() or not 0 < int(item_id) < 1000000000:
+            raise ValueError("invalid movie/show identifier")
+        if action not in ("more", "less", "hide", "clear"):
+            raise ValueError("invalid feedback action")
+        with sqlite3.connect(self.db, timeout=5) as conn:
+            if action == "clear":
+                conn.execute("DELETE FROM feedback WHERE kind=? AND item_id=?", (kind, str(int(item_id))))
+            else:
+                conn.execute("INSERT OR REPLACE INTO feedback(kind,item_id,action,updated_at)"
+                             " VALUES(?,?,?,?)", (kind, str(int(item_id)), action, int(time.time())))
+        return {"ok": True, "action": action}
+
+    def _feedback(self):
+        with sqlite3.connect(self.db, timeout=5) as conn:
+            return {(kind, item_id): action for kind, item_id, action in
+                    conn.execute("SELECT kind,item_id,action FROM feedback")}
+
+    def rank(self, candidates, diversity=35):
+        """Rank candidates with taste, feedback and a deterministic diversity penalty.
+
+        The ranking stays responsive on CPU: embeddings are generated and
+        persisted asynchronously, and missing embeddings fall back to metadata.
+        """
         with self.lock:
             favorites = list(self.favorites)
         if not favorites:
             return {"personalized": False, "items": candidates}
+        try:
+            diversity = max(0, min(100, int(diversity)))
+        except (TypeError, ValueError):
+            diversity = 35
         favorites = favorites[:30]
-        candidates = [i for i in candidates if isinstance(i, dict) and i.get("title")][:120]
+        candidates = [x for x in candidates if isinstance(x, dict) and x.get("title")][:120]
+        labels = self._feedback()
         texts = [description(x) for x in favorites + candidates]
         vectors = self.cached_vectors(texts)
         if len(vectors) < len(set(texts)) and self.embed_lock.acquire(blocking=False):
             threading.Thread(target=self._embed_missing, args=(texts,), daemon=True).start()
-        top_weights = sum(math.sqrt(f["weight"]) for f in favorites) or 1.
+        weight_total = sum(math.sqrt(f["weight"]) for f in favorites) or 1.
         scored = []
-        for index, item in enumerate(candidates):
-            metadata = max((metadata_score(item, f) * math.sqrt(f["weight"]) / 6
-                            for f in favorites), default=0.)
-            weighted = sum(metadata_score(item, f) * math.sqrt(f["weight"]) for f in favorites) / top_weights
+        for index, candidate in enumerate(candidates):
+            kind = candidate.get("kind")
+            identifier = candidate.get("tmdb") if kind == "movie" else candidate.get("tvdb")
+            if kind not in ("movie", "show") or not str(identifier or "").isdigit():
+                continue
+            marker = (kind, str(int(identifier)))
+            vote = labels.get(marker, "")
+            if vote == "hide":
+                continue
+            compared = [(metadata_score(candidate, f), f) for f in favorites]
+            highest = max(compared, key=lambda x: x[0] * math.sqrt(x[1]["weight"]))
+            metadata = highest[0] * math.sqrt(highest[1]["weight"]) / 6
+            weighted = sum(sim * math.sqrt(f["weight"]) for sim, f in compared) / weight_total
             score = .6 * metadata + .4 * weighted
-            cv = vectors.get(description(item))
+            cv = vectors.get(description(candidate))
             if cv:
                 semantic = [(cosine(cv, vectors[description(f)]), f["weight"])
                             for f in favorites if description(f) in vectors]
                 if semantic:
-                    best = max(s * min(1.7, math.sqrt(w) / 3) for s, w in semantic)
-                    avg = sum(s * math.sqrt(w) for s, w in semantic) / sum(math.sqrt(w) for _, w in semantic)
-                    score += .65 * best + .35 * avg
-            scored.append((score, -index, item))
-        scored.sort(key=lambda row: (-row[0], -row[1]))
-        return {"personalized": True, "items": [row[2] for row in scored]}
+                    score += .65 * max(v * min(1.7, math.sqrt(w) / 3) for v, w in semantic)
+                    score += .35 * (sum(v * math.sqrt(w) for v, w in semantic) /
+                                    sum(math.sqrt(w) for _, w in semantic))
+            score += .6 if vote == "more" else -.6 if vote == "less" else 0.
+            favorite = highest[1]
+            reason = ("More like titles you've enjoyed" if vote == "more"
+                      else "Similar to " + str(favorite.get("title") or "your watched titles")[:75])
+            ranked = dict(candidate)
+            ranked["ai_reason"] = reason
+            scored.append((score, index, ranked))
+        # Maximal marginal relevance: high exploration spreads genres/topics,
+        # low exploration favors highest match to favorites.
+        picked, remaining = [], list(scored)
+        while remaining:
+            def utility(row):
+                sim = max((metadata_score(row[2], prior[2]) for prior in picked), default=0.)
+                return (row[0] - (diversity / 100) * .42 * sim, -row[1])
+            current = max(remaining, key=utility)
+            remaining.remove(current)
+            picked.append(current)
+        items = [row[2] for row in picked]
+        # A Hidden Gems row is conservative: non-trending, non-popular
+        # candidates with a reasonably positive community score.
+        gems = [row[2] for row in picked if not set(row[2].get("source_rows") or []) &
+                {"trending", "popular"} and float(row[2].get("rating") or 0) >= 6.5]
+        return {"personalized": True, "items": items,
+                "hidden_gems": gems[:12]}
 
 
 def make_handler(engine):
@@ -335,7 +423,7 @@ def make_handler(engine):
                                           "error": engine.last_error})
 
         def do_POST(self):
-            if self.path != "/v1/rank":
+            if self.path not in ("/v1/rank", "/v1/feedback"):
                 return self.respond(404, {"error": "not found"})
             token = self.headers.get("Authorization") or ""
             if not hmac.compare_digest(token, "Bearer " + API_KEY):
@@ -345,10 +433,12 @@ def make_handler(engine):
                 if not 0 < length <= 256000:
                     return self.respond(413, {"error": "invalid body size"})
                 body = json.loads(self.rfile.read(length))
+                if self.path == "/v1/feedback":
+                    return self.respond(200, engine.feedback(body.get("kind"), body.get("id"), body.get("action")))
                 items = body.get("items")
                 if not isinstance(items, list) or len(items) > 120:
                     return self.respond(400, {"error": "items must be a list of up to 120 items"})
-                return self.respond(200, engine.rank(items))
+                return self.respond(200, engine.rank(items, body.get("diversity", 35)))
             except (ValueError, TypeError, AttributeError, json.JSONDecodeError):
                 return self.respond(400, {"error": "invalid JSON"})
 
