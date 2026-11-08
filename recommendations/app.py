@@ -68,6 +68,7 @@ def get_plex(path, params=None):
         for node in root:
             entry = dict(node.attrib)
             entry["Genre"] = [dict(x.attrib) for x in node if x.tag == "Genre"]
+            entry["Guid"] = [dict(x.attrib) for x in node if x.tag == "Guid"]
             items.append(entry)
         return {"MediaContainer": {"Metadata": items, "totalSize": root.get("totalSize")}}
     return json.loads(body)
@@ -154,6 +155,14 @@ def plex_preferences():
                 entry["overview"] = m.get("summary") or ""
                 entry["genres"] = [g.get("tag", "") for g in (m.get("Genre") or [])]
                 entry["year"] = m.get("year") or ""
+                ids = {}
+                for g in (m.get("Guid") or []):
+                    value = g.get("id", "") if isinstance(g, dict) else ""
+                    found = re.match(r"^(tmdb|tvdb)://(\\d+)$", str(value))
+                    if found:
+                        ids[found.group(1)] = found.group(2)
+                if ids:
+                    entry["external_ids"] = ids
         except Exception as exc:
             log.warning("Plex metadata unavailable for %s: %s", entry["key"], type(exc).__name__)
     return favorites[:50]
@@ -166,7 +175,7 @@ def jellyfin_preferences():
     for start in range(0, 5000, page_size):
         url = JELLYFIN_URL + "/Users/" + JELLYFIN_USER_ID + "/Items?" + urlencode({
             "Recursive": "true", "IncludeItemTypes": "Movie,Episode",
-            "Fields": "Genres,Overview", "StartIndex": start, "Limit": page_size,
+            "Fields": "Genres,Overview,ProviderIds", "StartIndex": start, "Limit": page_size,
         })
         data = get_json(url, {"X-Emby-Token": JELLYFIN_API_KEY})
         rows = data.get("Items") or []
@@ -198,6 +207,16 @@ def jellyfin_preferences():
                                            "episodes": Counter(), "genres": row.get("Genres") or [],
                                            "overview": row.get("Overview") or ""})
             item["episodes"][ep_key] = max(item["episodes"][ep_key], plays)
+            if kind == "movie":
+                providers = row.get("ProviderIds") or {}
+                if isinstance(providers, dict):
+                    ids = {}
+                    for key in ("Tmdb", "Tvdb"):
+                        number = str(providers.get(key) or "")
+                        if number.isdigit():
+                            ids[key.lower()] = number
+                    if ids:
+                        item["external_ids"] = ids
         if len(rows) < page_size:
             break
     favorites = []
@@ -218,6 +237,15 @@ def jellyfin_preferences():
             item["genres"] = info.get("Genres") or item["genres"]
             item["overview"] = info.get("Overview") or item["overview"]
             item["year"] = info.get("ProductionYear") or ""
+            providers = info.get("ProviderIds") or {}
+            if isinstance(providers, dict):
+                ids = {}
+                for key in ("Tmdb", "Tvdb"):
+                    value = str(providers.get(key) or "")
+                    if value.isdigit():
+                        ids[key.lower()] = value
+                if ids:
+                    item["external_ids"] = ids
         except Exception as exc:
             log.warning("Jellyfin series metadata unavailable: %s", type(exc).__name__)
     return favorites[:50]
@@ -416,7 +444,18 @@ class Recommender:
         if not isinstance(candidates, list) or len(candidates) > 120:
             raise ValueError("items must be a list of up to 120 items")
         with self.lock:
-            favorites = list(self.favorites[:30])
+            full_history = list(self.favorites)
+        favorites = full_history[:30]
+        # Exact provider IDs are safe to filter. Never guess from titles:
+        # remakes and similarly named films must remain separate.
+        already_watched = set()
+        for watched in full_history:
+            ids = watched.get("external_ids") or {}
+            kind = watched.get("kind")
+            field = "tmdb" if kind == "movie" else "tvdb"
+            known_id = str(ids.get(field) or "")
+            if known_id.isdigit():
+                already_watched.add((kind, known_id))
         query = query.strip()
         # Mood changes the current result set, not the permanent taste profile.
         mood_text = MOODS[mood]
@@ -443,6 +482,8 @@ class Recommender:
             if kind not in ("movie", "show") or not str(identifier or "").isdigit():
                 continue
             marker = (kind, str(int(identifier)))
+            if marker in already_watched:
+                continue
             vote = labels.get(marker, "")
             if vote == "hide":
                 continue
