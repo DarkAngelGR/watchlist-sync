@@ -403,78 +403,129 @@ class Recommender:
         return {"window_days": 30, "by_source": summary,
                 "feedback": dict(feedback), "note": "Served counts are tiles delivered, not guaranteed on-screen views."}
 
-    def rank(self, candidates, diversity=35):
-        """Rank candidates with taste, feedback and a deterministic diversity penalty.
+    def rank(self, candidates, diversity=35, query="", mood="any"):
+        """Re-rank a bounded catalog using local taste + semantic or lexical discovery.
 
-        The ranking stays responsive on CPU: embeddings are generated and
-        persisted asynchronously, and missing embeddings fall back to metadata.
+        Ollama is never called synchronously in this request. A cold embedding
+        cache uses lexical metadata scoring while a worker warms it up.
         """
+        if not isinstance(query, str) or len(query) > 180:
+            raise ValueError("query must be 180 characters or fewer")
+        if mood not in MOODS:
+            raise ValueError("unknown mood")
+        if not isinstance(candidates, list) or len(candidates) > 120:
+            raise ValueError("items must be a list of up to 120 items")
         with self.lock:
-            favorites = list(self.favorites)
-        if not favorites:
+            favorites = list(self.favorites[:30])
+        query = query.strip()
+        # Mood changes the current result set, not the permanent taste profile.
+        mood_text = MOODS[mood]
+        if not favorites and not query and mood == "any":
             return {"personalized": False, "items": candidates}
         try:
             diversity = max(0, min(100, int(diversity)))
         except (TypeError, ValueError):
             diversity = 35
-        favorites = favorites[:30]
-        candidates = [x for x in candidates if isinstance(x, dict) and x.get("title")][:120]
+        candidates = [item for item in candidates if isinstance(item, dict) and item.get("title")]
         labels = self._feedback()
+        query_text = ("Search request: " + query + " " + mood_text).strip() if query or mood_text else ""
         texts = [description(x) for x in favorites + candidates]
+        if query_text:
+            texts.append(query_text)
         vectors = self.cached_vectors(texts)
         if len(vectors) < len(set(texts)) and self.embed_lock.acquire(blocking=False):
             threading.Thread(target=self._embed_missing, args=(texts,), daemon=True).start()
-        weight_total = sum(math.sqrt(f["weight"]) for f in favorites) or 1.
+        total = sum(math.sqrt(f["weight"]) for f in favorites) or 1.
         scored = []
-        for index, candidate in enumerate(candidates):
-            kind = candidate.get("kind")
-            identifier = candidate.get("tmdb") if kind == "movie" else candidate.get("tvdb")
+        for index, item in enumerate(candidates):
+            kind = item.get("kind")
+            identifier = item.get("tmdb") if kind == "movie" else item.get("tvdb")
             if kind not in ("movie", "show") or not str(identifier or "").isdigit():
                 continue
             marker = (kind, str(int(identifier)))
             vote = labels.get(marker, "")
             if vote == "hide":
                 continue
-            compared = [(metadata_score(candidate, f), f) for f in favorites]
-            highest = max(compared, key=lambda x: x[0] * math.sqrt(x[1]["weight"]))
-            metadata = highest[0] * math.sqrt(highest[1]["weight"]) / 6
-            weighted = sum(sim * math.sqrt(f["weight"]) for sim, f in compared) / weight_total
-            score = .6 * metadata + .4 * weighted
-            cv = vectors.get(description(candidate))
-            if cv:
+            compared = [(metadata_score(item, f), f) for f in favorites]
+            if compared:
+                closest_sim, closest = max(compared, key=lambda x: x[0] * math.sqrt(x[1]["weight"]))
+                matching = closest_sim * math.sqrt(closest["weight"]) / 6
+                average = sum(sim * math.sqrt(f["weight"]) for sim, f in compared) / total
+                score = .6 * matching + .4 * average
+                reason = "Similar to " + str(closest.get("title") or "titles you've watched")[:75]
+            else:
+                score = 0.
+                reason = "New discovery"
+            cv = vectors.get(description(item))
+            if cv and favorites:
                 semantic = [(cosine(cv, vectors[description(f)]), f["weight"])
                             for f in favorites if description(f) in vectors]
                 if semantic:
                     score += .65 * max(v * min(1.7, math.sqrt(w) / 3) for v, w in semantic)
                     score += .35 * (sum(v * math.sqrt(w) for v, w in semantic) /
                                     sum(math.sqrt(w) for _, w in semantic))
+            if query:
+                score += 1.4 * query_match(item, query)
+                reason = "Matches your search"
+            if mood_text and mood != "surprise":
+                score += .55 * query_match(item, mood_text)
+                if not query:
+                    reason = "Fits your " + mood.replace("_", "-") + " mood"
+            if query_text and cv and vectors.get(query_text):
+                score += .85 * cosine(cv, vectors[query_text])
+            if mood == "short":
+                runtime = item.get("runtime") or 0
+                try:
+                    mins = float(runtime)
+                except (TypeError, ValueError):
+                    mins = 0.
+                if kind != "movie" or mins > 110:
+                    score -= .75
+                elif mins and mins <= 105:
+                    score += .75
+            if mood == "surprise":
+                # Deliberately emphasize exploration without changing saved likes.
+                score += .12 * math.log1p(max(0, float(item.get("rating") or 0)))
             score += .6 if vote == "more" else -.6 if vote == "less" else 0.
-            favorite = highest[1]
-            reason = ("More like titles you've enjoyed" if vote == "more"
-                      else "Similar to " + str(favorite.get("title") or "your watched titles")[:75])
-            ranked = dict(candidate)
-            ranked["ai_reason"] = reason
+            if vote == "more":
+                reason = "You asked for more titles like this"
+            ranked = dict(item)
+            ranked["ai_reason"] = reason[:120]
             scored.append((score, index, ranked))
-        # Maximal marginal relevance: high exploration spreads genres/topics,
-        # low exploration favors highest match to favorites.
-        picked, remaining = [], list(scored)
-        max_similarity = {row[1]: 0. for row in remaining}
+        # Diversify the top row, including a franchise limit. Collection IDs
+        # win, with conservative title-sequel parsing only as a fallback.
+        remaining, picked = list(scored), []
+        max_sim = {i: 0. for _, i, _ in remaining}
+        sequel_stems = {collection_key(row[2])[7:] for row in remaining
+                        if collection_key(row[2]).startswith("sequel:")}
+        chosen_family = Counter()
         while remaining:
-            current = max(remaining, key=lambda row: (
-                row[0] - (diversity / 100) * .42 * max_similarity[row[1]], -row[1]))
-            remaining.remove(current)
-            picked.append(current)
+            def family(row):
+                own = collection_key(row[2])
+                if own:
+                    return own
+                plain = str(row[2].get("title") or "").casefold().strip(" :")
+                return "sequel:" + plain if plain in sequel_stems else ""
+            def utility(row):
+                group = family(row)
+                # Discourage repeats within the first 12, not an absolute ban.
+                franchise_penalty = .9 if group and chosen_family[group] and len(picked) < 12 else .25 if group and chosen_family[group] else 0.
+                return (row[0] - (diversity / 100.) * .42 * max_sim[row[1]] - franchise_penalty, -row[1])
+            best = max(remaining, key=utility)
+            remaining.remove(best)
+            picked.append(best)
+            group = family(best)
+            if group:
+                chosen_family[group] += 1
             if diversity:
-                for row in remaining:
-                    max_similarity[row[1]] = max(max_similarity[row[1]],
-                                                  metadata_score(row[2], current[2]))
-        items = [row[2] for row in picked]
-        # A Hidden Gems row is conservative: non-trending, non-popular
-        # candidates with a reasonably positive community score.
-        gems = [row[2] for row in picked if not set(row[2].get("source_rows") or []) &
-                {"trending", "popular"} and float(row[2].get("rating") or 0) >= 6.5]
-        return {"personalized": True, "items": items,
-                "hidden_gems": gems[:12]}
+                for other in remaining:
+                    max_sim[other[1]] = max(max_sim[other[1]],
+                                            metadata_score(other[2], best[2]))
+        items = [x[2] for x in picked]
+        gems = [row[2] for row in picked
+                if not set(row[2].get("source_rows") or []) & {"trending", "popular"}
+                and float(row[2].get("rating") or 0) >= 6.5]
+        return {"personalized": True, "items": items, "hidden_gems": gems[:12]}
 
 
 def make_handler(engine):
@@ -488,7 +539,12 @@ def make_handler(engine):
             self.end_headers()
             self.wfile.write(body)
 
+        def _authorized(self):
+            return hmac.compare_digest(self.headers.get("Authorization") or "", "Bearer " + API_KEY)
+
         def do_GET(self):
+            if self.path == "/v1/stats":
+                return self.respond(200, engine.stats()) if self._authorized() else self.respond(401, {"error": "unauthorized"})
             if self.path != "/health":
                 return self.respond(404, {"error": "not found"})
             with engine.lock:
@@ -498,22 +554,24 @@ def make_handler(engine):
                                           "error": engine.last_error})
 
         def do_POST(self):
-            if self.path not in ("/v1/rank", "/v1/feedback"):
+            if self.path not in ("/v1/rank", "/v1/feedback", "/v1/event"):
                 return self.respond(404, {"error": "not found"})
-            token = self.headers.get("Authorization") or ""
-            if not hmac.compare_digest(token, "Bearer " + API_KEY):
+            if not self._authorized():
                 return self.respond(401, {"error": "unauthorized"})
             try:
                 length = int(self.headers.get("Content-Length") or "0")
                 if not 0 < length <= 256000:
                     return self.respond(413, {"error": "invalid body size"})
                 body = json.loads(self.rfile.read(length))
+                if not isinstance(body, dict):
+                    raise ValueError("invalid payload")
                 if self.path == "/v1/feedback":
                     return self.respond(200, engine.feedback(body.get("kind"), body.get("id"), body.get("action")))
+                if self.path == "/v1/event":
+                    return self.respond(200, engine.metric(body.get("event"), body.get("source"), body.get("count", 1)))
                 items = body.get("items")
-                if not isinstance(items, list) or len(items) > 120:
-                    return self.respond(400, {"error": "items must be a list of up to 120 items"})
-                return self.respond(200, engine.rank(items, body.get("diversity", 35)))
+                return self.respond(200, engine.rank(items, body.get("diversity", 35),
+                                                     body.get("query", ""), body.get("mood", "any")))
             except (ValueError, TypeError, AttributeError, json.JSONDecodeError):
                 return self.respond(400, {"error": "invalid JSON"})
 
