@@ -1,0 +1,28 @@
+# Run from the recommendations/ directory on the Minisforum UN1250.
+services:
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama-models:/root/.ollama
+    # Deliberately no published Ollama port; only the recommender can access it.
+
+  recommender:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - ollama
+    env_file: .env
+    environment:
+      OLLAMA_URL: http://ollama:11434
+      DATA_DIR: /data
+      PORT: "8788"
+    ports:
+      # Set AI_BIND_IP in .env to the Minisforum's LAN address (not 0.0.0.0).
+      - "${AI_BIND_IP:-127.0.0.1}:8788:8788"
+    volumes:
+      - recommender-data:/data
+
+volumes:
+  ollama-models:
+  recommender-data:

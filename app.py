@@ -15,6 +15,7 @@ owner's token; each friend's Plex privacy setting for "Watchlist" must be
 """
 import base64
 import hmac
+import hashlib
 import ipaddress
 import json
 import logging
@@ -1135,7 +1136,7 @@ class Syncer:
         ratings = x.get("ratings") or {}
         rating = ((ratings.get("tmdb") or {}).get("value") or (ratings.get("imdb") or {}).get("value")
                   or ratings.get("value") or 0)
-        return {
+        item = {
             "kind": kind, "title": x.get("title") or "?", "year": x.get("year") or None,
             "overview": x.get("overview") or "", "genres": (x.get("genres") or [])[:4],
             "runtime": x.get("runtime") or 0, "rating": rating,
@@ -1145,6 +1146,14 @@ class Syncer:
             "poster": self._poster(x), "fanart": self._image(x, "fanart"),
             "status": library.get(ext, "none"),
         }
+        # Sonarr/Radarr sometimes supply collection membership directly.
+        # Preserve it for the local franchise diversity filter when available.
+        collection = x.get("collection")
+        if isinstance(collection, dict):
+            collection_id = collection.get("tmdbId") or collection.get("id")
+            if str(collection_id or "").isdigit():
+                item["collection_id"] = int(collection_id)
+        return item
 
     def tv_lookup(self, kind, q="", ext_id=0):
         """Movies (Radarr) or shows (Sonarr) matching `q`, or the one with this
@@ -1204,13 +1213,46 @@ class Syncer:
             })
         return out
 
-    def tv_discover(self):
+    def _more_movie_candidates(self, tmdb_key, known, genre_id=None):
+        """Optional wider TMDB catalog for personalized movie recommendations."""
+        try:
+            data = self._tmdb(tmdb_key, "/discover/movie",
+                              sort_by="vote_average.desc", **({"vote_count.gte": 150, "page": 1, "with_genres": genre_id}
+                                                             if genre_id else {"vote_count.gte": 150, "page": 1}))
+            codes = self._tmdb(tmdb_key, "/genre/movie/list").get("genres") or []
+            labels = {g["id"]: g["name"] for g in codes if g.get("id") and g.get("name")}
+        except requests.RequestException as exc:
+            log.warning("TMDB movie discovery unavailable: %s", type(exc).__name__)
+            return []
+        items = []
+        for entry in (data.get("results") or [])[:30]:
+            tid = entry.get("id")
+            if not isinstance(tid, int) or tid in known or entry.get("adult"):
+                continue
+            date = entry.get("release_date") or ""
+            items.append({
+                "kind": "movie", "tmdb": tid, "tvdb": 0, "imdb": "",
+                "title": entry.get("title") or "?",
+                "year": int(date[:4]) if date[:4].isdigit() else None,
+                "overview": entry.get("overview") or "",
+                "genres": [labels[x] for x in (entry.get("genre_ids") or []) if x in labels],
+                "runtime": 0, "rating": round(float(entry.get("vote_average") or 0), 1),
+                "poster": self.TMDB_IMG + "w342" + entry["poster_path"] if entry.get("poster_path") else "",
+                "fanart": self.TMDB_IMG + "w1280" + entry["backdrop_path"] if entry.get("backdrop_path") else "",
+                "status": "none", "popularity": entry.get("popularity") or 0,
+                "source_rows": ["discovery"],
+            })
+            if len(items) >= 24:
+                break
+        return items
+
+    def tv_discover(self, viewer="", diversity=35, mood="any"):
         """Titles you don't have yet: trending and popular movies and movies
         recommended from your library (Radarr's Discover, no key needed), and
         trending shows when a TMDB key is set. {'sections': [{id, title, items}]}."""
         hit = self.__dict__.get("_discover_cache")
         if hit and time.time() - hit[0] < self.DISCOVER_TTL:
-            return hit[1]
+            return self._rank_discover(hit[1], viewer, diversity, mood=mood)
         cfg = Config(self.settings.all())
         trending_m, popular, recommended, shows, notes = [], [], [], [], []
         if cfg.radarr.enabled:
@@ -1246,8 +1288,278 @@ class Syncer:
             {"id": "popular", "title": "Popular movies", "items": [m for m in popular if m not in trending_m][:30]},
         ]
         res = {"sections": [x for x in sections if x["items"]], "notes": notes}
+        self._ai_candidate_pool = []
+        # Only fetch extended catalog candidates when personalization is enabled.
+        if cfg.tmdb_key and (os.getenv("RECOMMENDER_URL") or os.getenv("RECOMMENDER_PROFILES_FILE")):
+            try:
+                known = self._library(Arr("Radarr", cfg.radarr), "movie") if cfg.radarr.enabled else {}
+                self._ai_candidate_pool = self._more_movie_candidates(cfg.tmdb_key, known)
+            except (requests.RequestException, LookupError) as exc:
+                log.warning("Extended discovery unavailable: %s", type(exc).__name__)
         self._discover_cache = (time.time(), res)
-        return res
+        return self._rank_discover(res, viewer, diversity, mood=mood)
+
+    def _ai_search_candidates(self, query, mood):
+        """Query-guided TMDB catalog expansion; never run an LLM or scrape media."""
+        cfg = Config(self.settings.all())
+        if not cfg.tmdb_key:
+            return []
+        lower = (query + " " + (mood or "")).lower()
+        categories = [
+            (("sci-fi", "science fiction", "space", "time travel", "mind_bending"), 878),
+            (("mystery", "detective", "puzzle"), 9648),
+            (("thriller", "suspense", "intense"), 53),
+            (("comedy", "funny", "relaxing"), 35),
+            (("horror", "scary"), 27),
+            (("fantasy", "magic"), 14),
+            (("romance", "romantic"), 10749),
+            (("animation", "animated", "anime"), 16),
+            (("documentary", "true story"), 99),
+        ]
+        genre = next((id for words, id in categories if any(w in lower for w in words)), None)
+        if not genre:
+            return []
+        known = set()
+        if cfg.radarr.enabled:
+            try:
+                known = self._library(Arr("Radarr", cfg.radarr), "movie")
+            except requests.RequestException:
+                pass
+        return self._more_movie_candidates(cfg.tmdb_key, known, genre_id=genre)
+
+    def tv_ai_search(self, viewer, query, mood="any", diversity=35):
+        if not isinstance(query, str) or not 3 <= len(query.strip()) <= 180:
+            raise ValueError("enter a search description of 3-180 characters")
+        if mood not in ("any", "relaxing", "mind_bending", "intense", "short", "surprise"):
+            raise ValueError("unknown mood")
+        if not self._ai_target(viewer):
+            return {"available": False, "items": []}
+        # Reuse the cached baseline pool, then optionally expand by requested genre.
+        hit = self.__dict__.get("_discover_cache")
+        if not hit or time.time() - hit[0] >= self.DISCOVER_TTL:
+            self.tv_discover("", diversity)
+            hit = self.__dict__.get("_discover_cache")
+        base = hit[1] if hit else {"sections": []}
+        expanded = self._ai_search_candidates(query, mood)
+        result = self._rank_discover(base, viewer, diversity, query=query,
+                                     mood=mood, extra_candidates=expanded)
+        sections = result.get("sections") or []
+        for section in sections:
+            if section.get("id") == "recommended" and section.get("title", "").startswith("For you"):
+                return {"available": True, "items": section.get("items", [])[:24]}
+        return {"available": False, "items": []}
+
+    def tv_ai_stats(self, viewer):
+        target = self._ai_target(viewer)
+        if not target:
+            raise ValueError("recommendations are not configured for this profile")
+        base, secret = target
+        response = requests.get(base + "/v1/stats",
+                                headers={"Authorization": "Bearer " + secret},
+                                timeout=(2, 5))
+        response.raise_for_status()
+        return response.json()
+
+    def tv_ai_event(self, viewer, event, source, count):
+        if event not in ("served", "open", "request"):
+            raise ValueError("invalid metric event")
+        if source not in ("recommended", "hidden-gems", "trending", "popular", "ai-search"):
+            raise ValueError("invalid metric source")
+        if type(count) is not int or not 1 <= count <= 120:
+            raise ValueError("invalid metric count")
+        target = self._ai_target(viewer)
+        if not target:
+            raise ValueError("recommendations are not configured for this profile")
+        base, secret = target
+        response = requests.post(base + "/v1/event",
+                                 json={"event": event, "source": source, "count": count},
+                                 headers={"Authorization": "Bearer " + secret},
+                                 timeout=(2, 5))
+        response.raise_for_status()
+        return {"ok": True}
+
+    def _ai_verified(self, viewer, token):
+        """Validate the active Plex/Jellyfin user token, never a caller-supplied UUID.
+
+        This is optional only in the sense that unconfigured services revert to
+        generic discovery. No raw tokens are cached, persisted or logged.
+        """
+        if not isinstance(viewer, str) or not 4 <= len(viewer) <= 128:
+            return False
+        if not isinstance(token, str) or not 8 <= len(token) <= 512:
+            return False
+        source = os.getenv("RECOMMENDER_AUTH_PROVIDER", "").lower().strip()
+        if source not in ("plex", "jellyfin"):
+            return False
+        signature = hashlib.sha256((source + "\0" + viewer + "\0" + token).encode()).hexdigest()
+        cache = self.__dict__.setdefault("_ai_verification_cache", {})
+        now = time.monotonic()
+        if cache.get(signature, 0) > now:
+            return True
+        try:
+            if source == "plex":
+                response = requests.get(
+                    "https://plex.tv/api/v2/user",
+                    headers={"X-Plex-Token": token, "Accept": "application/json",
+                             "X-Plex-Product": "Orama", "X-Plex-Client-Identifier": self.client_id},
+                    timeout=(2, 4))
+                response.raise_for_status()
+                data = response.json()
+                observed = data.get("uuid") or (data.get("user") or {}).get("uuid")
+            else:
+                base = os.getenv("RECOMMENDER_JELLYFIN_URL", "").rstrip("/")
+                if not base.startswith(("http://", "https://")):
+                    return False
+                response = requests.get(base + "/Users/Me",
+                                        headers={"X-Emby-Token": token}, timeout=(2, 4))
+                response.raise_for_status()
+                observed = response.json().get("Id")
+            if not isinstance(observed, str) or not hmac.compare_digest(observed.lower(), viewer.lower()):
+                return False
+            if len(cache) > 256:
+                cache.clear()
+            cache[signature] = now + 60
+            return True
+        except (requests.RequestException, TypeError, ValueError, KeyError):
+            return False
+
+    def _ai_target(self, viewer):
+        """Choose only explicitly configured TV profiles and AI endpoints.
+
+        Viewer IDs sent by TV clients are not independently authenticated.
+        Use a UI password and private LAN for the watchlist-sync endpoint.
+        """
+        if not viewer or len(viewer) > 128:
+            return None
+        mapping = os.getenv("RECOMMENDER_PROFILES_FILE", "").strip()
+        if mapping:
+            try:
+                with open(mapping, encoding="utf-8") as f:
+                    entry = json.load(f).get(viewer)
+                if isinstance(entry, dict):
+                    base = str(entry.get("url") or "").strip().rstrip("/")
+                    key = str(entry.get("api_key") or "").strip()
+                    if base.startswith(("http://", "https://")) and len(key) >= 24:
+                        return base, key
+            except (OSError, ValueError, TypeError) as exc:
+                log.warning("AI profile map unavailable: %s", type(exc).__name__)
+            return None
+        if viewer != os.getenv("RECOMMENDER_PROFILE_UUID", "").strip():
+            return None
+        base = os.getenv("RECOMMENDER_URL", "").strip().rstrip("/")
+        secret = os.getenv("RECOMMENDER_API_KEY", "").strip()
+        return (base, secret) if base and len(secret) >= 24 else None
+
+    def _rank_discover(self, original, viewer="", diversity=35, query="", mood="any", extra_candidates=None):
+        """Optional per-profile personalization, with upstream-safe fallback."""
+        target = self._ai_target(viewer)
+        if not target:
+            return original
+        base, secret = target
+        sections = original.get("sections") or []
+        choices = {}
+        # The candidate pool is cached with the regular Discover data; the TV
+        # receives only the final rows, never the full auxiliary pool.
+        candidates = []
+        for section in sections:
+            for item in section.get("items") or []:
+                candidates.append({**item, "source_rows": [section.get("id", "")]})
+        candidates.extend(self.__dict__.get("_ai_candidate_pool") or [])
+        if extra_candidates:
+            candidates = list(extra_candidates) + candidates
+        for item in candidates:
+            kind = item.get("kind")
+            identifier = item.get("tmdb") if kind == "movie" else item.get("tvdb")
+            if kind not in ("movie", "show") or not identifier:
+                continue
+            key = (kind, str(identifier))
+            if key not in choices:
+                choices[key] = dict(item)
+                choices[key]["source_rows"] = list(item.get("source_rows") or [])
+            else:
+                for source in item.get("source_rows") or []:
+                    if source not in choices[key]["source_rows"]:
+                        choices[key]["source_rows"].append(source)
+            if len(choices) >= 120:
+                break
+        if not choices:
+            return original
+        try:
+            response = requests.post(base + "/v1/rank",
+                                     json={"items": list(choices.values()), "diversity": diversity,
+                                           "query": query, "mood": mood},
+                                     headers={"Authorization": "Bearer " + secret},
+                                     timeout=(2, 5))
+            response.raise_for_status()
+            result = response.json()
+            if result.get("personalized") is not True or not isinstance(result.get("items"), list):
+                return original
+
+            def trusted_match(untrusted):
+                if not isinstance(untrusted, dict):
+                    return None
+                kind = untrusted.get("kind")
+                identifier = untrusted.get("tmdb") if kind == "movie" else untrusted.get("tvdb")
+                original_item = choices.get((kind, str(identifier)))
+                if not original_item:
+                    return None
+                trusted = {k: v for k, v in original_item.items() if k != "source_rows"}
+                why = untrusted.get("ai_reason")
+                if isinstance(why, str) and len(why) <= 120:
+                    trusted["ai_reason"] = why
+                return trusted
+
+            selected, used = [], set()
+            for item in result["items"]:
+                matched = trusted_match(item)
+                if matched is None:
+                    continue
+                key = (matched["kind"], str(matched.get("tmdb") if matched["kind"] == "movie" else matched.get("tvdb")))
+                if key not in used:
+                    selected.append(matched)
+                    used.add(key)
+            if not selected:
+                return original
+            rows = [{"id": "recommended", "title": "For you · Based on your viewing",
+                     "items": selected[:30]}]
+            gems, seen = [], set()
+            for item in (result.get("hidden_gems") or [])[:30]:
+                matched = trusted_match(item)
+                if matched is None:
+                    continue
+                kind = matched["kind"]
+                key = (kind, str(matched.get("tmdb") if kind == "movie" else matched.get("tvdb")))
+                if key in seen or set(choices[key].get("source_rows") or []) & {"popular", "trending"}:
+                    continue
+                seen.add(key)
+                gems.append(matched)
+            if gems:
+                rows.append({"id": "hidden-gems", "title": "Hidden gems for you", "items": gems[:12]})
+            return {**original, "sections": rows +
+                    [section for section in sections if section.get("id") != "recommended"]}
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            log.warning("Optional local recommender unavailable (%s); using original Discover",
+                        type(exc).__name__)
+            return original
+
+    def tv_feedback(self, viewer, kind, identifier, action):
+        target = self._ai_target(viewer)
+        if not target:
+            raise ValueError("recommendations not configured for this profile")
+        if kind not in ("movie", "show") or action not in ("more", "less", "hide", "clear"):
+            raise ValueError("invalid feedback")
+        try:
+            number = int(identifier)
+        except (ValueError, TypeError):
+            raise ValueError("invalid title identifier")
+        if not 0 < number < 1000000000:
+            raise ValueError("invalid title identifier")
+        base, secret = target
+        response = requests.post(base + "/v1/feedback",
+                                 json={"kind": kind, "id": number, "action": action},
+                                 headers={"Authorization": "Bearer " + secret}, timeout=(2, 5))
+        response.raise_for_status()
+        return {"ok": True}
 
     def tv_request(self, kind, ext_id, user=""):
         """Add a movie to Radarr or a show to Sonarr, the way a watchlist add
@@ -1574,7 +1886,7 @@ def make_handler(syncer, ui_password):
             if self._tv() and origin_allowed(origin, self.headers.get("Host")):
                 self.send_header("Access-Control-Allow-Origin", origin or "*")
                 self.send_header("Vary", "Origin")
-                self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Orama-Profile-Token")
                 self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
                 self.send_header("Access-Control-Max-Age", "600")
 
@@ -1627,6 +1939,14 @@ def make_handler(syncer, ui_password):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return False
+
+        def _ai_viewer(self, supplied):
+            # Basic UI auth is necessary but does not identify a specific user.
+            # A second independently verified media-user token is required.
+            token = self.headers.get("X-Orama-Profile-Token") or ""
+            if ui_password and syncer._ai_verified(supplied, token):
+                return supplied
+            return ""
 
         def _body(self):
             n = int(self.headers.get("Content-Length") or 0)
@@ -1699,9 +2019,46 @@ def make_handler(syncer, ui_password):
                     return self._send(409, {"error": str(e)})
                 except requests.RequestException as e:
                     return self._send(502, {"error": ("Radarr: " if kind == "movie" else "Sonarr: ") + str(e)[:200]})
-            if p == "/api/tv/discover":
+            if p == "/api/tv/ai/search":
+                qs = parse_qs(urlparse(self.path).query)
+                supplied = (qs.get("viewer") or [""])[0][:128]
+                verified = self._ai_viewer(supplied)
+                if not verified:
+                    return self._send(403, {"error": "verified profile required"})
+                query = (qs.get("q") or [""])[0]
+                mood = (qs.get("mood") or ["any"])[0]
                 try:
-                    return self._send(200, syncer.tv_discover())
+                    diversity = max(0, min(100, int((qs.get("diversity") or ["35"])[0])))
+                    return self._send(200, syncer.tv_ai_search(verified, query, mood, diversity))
+                except (ValueError, TypeError) as exc:
+                    return self._send(400, {"error": str(exc)[:120]})
+                except requests.RequestException:
+                    return self._send(502, {"error": "AI search unavailable"})
+            if p == "/api/tv/ai/stats":
+                qs = parse_qs(urlparse(self.path).query)
+                supplied = (qs.get("viewer") or [""])[0][:128]
+                verified = self._ai_viewer(supplied)
+                if not verified:
+                    return self._send(403, {"error": "verified profile required"})
+                try:
+                    return self._send(200, syncer.tv_ai_stats(verified))
+                except ValueError as exc:
+                    return self._send(400, {"error": str(exc)[:120]})
+                except requests.RequestException:
+                    return self._send(502, {"error": "AI metrics unavailable"})
+            if p == "/api/tv/discover":
+                qs = parse_qs(urlparse(self.path).query)
+                viewer = (qs.get("viewer") or [""])[0][:128]
+                try:
+                    diversity = max(0, min(100, int((qs.get("diversity") or ["35"])[0])))
+                except (TypeError, ValueError):
+                    diversity = 35
+                try:
+                    # No per-user preference data without API authentication.
+                    mood = (qs.get("mood") or ["any"])[0]
+                    if mood not in ("any", "relaxing", "mind_bending", "intense", "short", "surprise"):
+                        mood = "any"
+                    return self._send(200, syncer.tv_discover(self._ai_viewer(viewer), diversity, mood))
                 except requests.RequestException as e:
                     return self._send(502, {"error": "Radarr: " + str(e)[:200]})
             if p == "/api/tv/subtitles":
@@ -1753,6 +2110,36 @@ def make_handler(syncer, ui_password):
             if p in ("/sync", "/api/sync"):
                 syncer.wake.set()
                 return self._send(202, {"queued": True})
+            if p == "/api/tv/ai/event":
+                if not ui_password:
+                    return self._send(403, {"error": "UI_PASSWORD required"})
+                supplied = str(body.get("viewer") or "")[:128]
+                verified = self._ai_viewer(supplied)
+                if not verified:
+                    return self._send(403, {"error": "verified profile required"})
+                try:
+                    return self._send(200, syncer.tv_ai_event(
+                        verified, body.get("event"), body.get("source"), body.get("count", 1)))
+                except (ValueError, TypeError) as exc:
+                    return self._send(400, {"error": str(exc)[:120]})
+                except requests.RequestException:
+                    return self._send(502, {"error": "local AI metrics unavailable"})
+            if p == "/api/tv/feedback":
+                # Personal feedback requires an authenticated LAN-only TV API.
+                if not ui_password:
+                    return self._send(403, {"error": "UI_PASSWORD is required for AI feedback"})
+                try:
+                    supplied = str(body.get("viewer") or "")[:128]
+                    verified = self._ai_viewer(supplied)
+                    if not verified:
+                        return self._send(403, {"error": "verified profile required"})
+                    return self._send(200, syncer.tv_feedback(
+                        verified, body.get("kind"),
+                        body.get("id"), body.get("action")))
+                except ValueError as e:
+                    return self._send(400, {"error": str(e)})
+                except requests.RequestException:
+                    return self._send(502, {"error": "local AI unavailable"})
             if p == "/api/tv/sync":
                 # A TV just added something to the Plex Watchlist: sync now.
                 syncer.wake.set()
