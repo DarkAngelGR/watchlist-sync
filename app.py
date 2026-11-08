@@ -1277,27 +1277,32 @@ class Syncer:
         return (base, secret) if base and len(secret) >= 24 else None
 
     def _rank_discover(self, original, viewer="", diversity=35):
-        """Optionally replace the recommendation row with local personalized ranking.
-
-        The original Radarr/TMDB results remain the source of candidates and are
-        returned unchanged when the AI service is not configured or unhealthy.
-        No Plex/Sonarr/Radarr credentials are sent to the recommender.
-        """
+        """Optional per-profile personalization, with upstream-safe fallback."""
         target = self._ai_target(viewer)
         if not target:
             return original
         base, secret = target
         sections = original.get("sections") or []
         choices = {}
+        # The candidate pool is cached with the regular Discover data; the TV
+        # receives only the final rows, never the full auxiliary pool.
+        candidates = list(self.__dict__.get("_ai_candidate_pool") or [])
         for section in sections:
             for item in section.get("items") or []:
-                kind = item.get("kind")
-                identifier = item.get("tmdb") if kind == "movie" else item.get("tvdb")
-                if kind not in ("movie", "show") or not identifier:
-                    continue
-                choices.setdefault((kind, str(identifier)), item)
-                if len(choices) >= 120:
-                    break
+                candidates.append({**item, "source_rows": [section.get("id", "")]})
+        for item in candidates:
+            kind = item.get("kind")
+            identifier = item.get("tmdb") if kind == "movie" else item.get("tvdb")
+            if kind not in ("movie", "show") or not identifier:
+                continue
+            key = (kind, str(identifier))
+            if key not in choices:
+                choices[key] = dict(item)
+                choices[key]["source_rows"] = list(item.get("source_rows") or [])
+            else:
+                for source in item.get("source_rows") or []:
+                    if source not in choices[key]["source_rows"]:
+                        choices[key]["source_rows"].append(source)
             if len(choices) >= 120:
                 break
         if not choices:
@@ -1311,26 +1316,72 @@ class Syncer:
             result = response.json()
             if result.get("personalized") is not True or not isinstance(result.get("items"), list):
                 return original
+
+            def trusted_match(untrusted):
+                if not isinstance(untrusted, dict):
+                    return None
+                kind = untrusted.get("kind")
+                identifier = untrusted.get("tmdb") if kind == "movie" else untrusted.get("tvdb")
+                original_item = choices.get((kind, str(identifier)))
+                if not original_item:
+                    return None
+                trusted = {k: v for k, v in original_item.items() if k != "source_rows"}
+                why = untrusted.get("ai_reason")
+                if isinstance(why, str) and len(why) <= 120:
+                    trusted["ai_reason"] = why
+                return trusted
+
             selected, used = [], set()
             for item in result["items"]:
-                if not isinstance(item, dict):
+                matched = trusted_match(item)
+                if matched is None:
                     continue
-                kind = item.get("kind")
-                identifier = item.get("tmdb") if kind == "movie" else item.get("tvdb")
-                key = (kind, str(identifier))
-                if key in choices and key not in used:
-                    selected.append(choices[key])  # use trusted upstream metadata, not remote mutations
+                key = (matched["kind"], str(matched.get("tmdb") if matched["kind"] == "movie" else matched.get("tvdb")))
+                if key not in used:
+                    selected.append(matched)
                     used.add(key)
             if not selected:
                 return original
-            row = {"id": "recommended", "title": "For you · Based on your viewing",
-                   "items": selected[:30]}
-            return {**original, "sections": [row] +
-                    [s for s in sections if s.get("id") != "recommended"]}
+            rows = [{"id": "recommended", "title": "For you · Based on your viewing",
+                     "items": selected[:30]}]
+            gems, seen = [], set()
+            for item in (result.get("hidden_gems") or [])[:30]:
+                matched = trusted_match(item)
+                if matched is None:
+                    continue
+                kind = matched["kind"]
+                key = (kind, str(matched.get("tmdb") if kind == "movie" else matched.get("tvdb")))
+                if key in seen or set(choices[key].get("source_rows") or []) & {"popular", "trending"}:
+                    continue
+                seen.add(key)
+                gems.append(matched)
+            if gems:
+                rows.append({"id": "hidden-gems", "title": "Hidden gems for you", "items": gems[:12]})
+            return {**original, "sections": rows +
+                    [section for section in sections if section.get("id") != "recommended"]}
         except (requests.RequestException, ValueError, TypeError) as exc:
             log.warning("Optional local recommender unavailable (%s); using original Discover",
                         type(exc).__name__)
             return original
+
+    def tv_feedback(self, viewer, kind, identifier, action):
+        target = self._ai_target(viewer)
+        if not target:
+            raise ValueError("recommendations not configured for this profile")
+        if kind not in ("movie", "show") or action not in ("more", "less", "hide", "clear"):
+            raise ValueError("invalid feedback")
+        try:
+            number = int(identifier)
+        except (ValueError, TypeError):
+            raise ValueError("invalid title identifier")
+        if not 0 < number < 1000000000:
+            raise ValueError("invalid title identifier")
+        base, secret = target
+        response = requests.post(base + "/v1/feedback",
+                                 json={"kind": kind, "id": number, "action": action},
+                                 headers={"Authorization": "Bearer " + secret}, timeout=(2, 5))
+        response.raise_for_status()
+        return {"ok": True}
 
     def tv_request(self, kind, ext_id, user=""):
         """Add a movie to Radarr or a show to Sonarr, the way a watchlist add
