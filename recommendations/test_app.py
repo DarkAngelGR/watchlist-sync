@@ -107,6 +107,85 @@ class RecommenderTests(unittest.TestCase):
             results = ai.jellyfin_preferences()
         self.assertEqual([x["title"] for x in results], ["Actually Finished"])
 
+    def test_natural_language_ranks_relevant_title_without_history(self):
+        with tempfile.TemporaryDirectory() as temp:
+            engine = ai.Recommender(temp, start_worker=False)
+            options = [
+                {"kind": "movie", "tmdb": 1, "title": "Summer Garden",
+                 "overview": "A documentary about flowers", "genres": ["Documentary"]},
+                {"kind": "movie", "tmdb": 2, "title": "Time Loops",
+                 "overview": "A psychological mystery about science fiction time travel",
+                 "genres": ["Science Fiction", "Mystery"]},
+            ]
+            engine.embed_lock.acquire()
+            try:
+                result = engine.rank(options, query="psychological science fiction mystery", mood="mind_bending")
+            finally:
+                engine.embed_lock.release()
+            self.assertTrue(result["personalized"])
+            self.assertEqual(result["items"][0]["tmdb"], 2)
+            self.assertEqual(result["items"][0]["ai_reason"], "Matches your search")
+
+    def test_mood_short_movie_favors_known_short_runtime(self):
+        with tempfile.TemporaryDirectory() as temp:
+            engine = ai.Recommender(temp, start_worker=False)
+            options = [
+                {"kind": "movie", "tmdb": 1, "title": "Epic", "runtime": 190},
+                {"kind": "movie", "tmdb": 2, "title": "Short", "runtime": 90},
+                {"kind": "show", "tvdb": 3, "title": "Series"},
+            ]
+            engine.embed_lock.acquire()
+            try:
+                result = engine.rank(options, mood="short")
+            finally:
+                engine.embed_lock.release()
+            self.assertEqual(result["items"][0]["tmdb"], 2)
+
+    def test_franchise_diversity_does_not_group_unrelated_titles(self):
+        self.assertEqual(ai.collection_key({"title": "John Wick: Chapter 2"}), "sequel:john wick")
+        self.assertEqual(ai.collection_key({"title": "A Different Movie"}), "")
+        self.assertEqual(ai.collection_key({"collection_id": 1234, "title": "Movie 5"}), "collection:1234")
+        with tempfile.TemporaryDirectory() as temp:
+            engine = ai.Recommender(temp, start_worker=False)
+            options = [
+                {"kind": "movie", "tmdb": 1, "title": "Galaxy Quest: Chapter 2",
+                 "collection_id": 1234, "genres": ["Adventure"]},
+                {"kind": "movie", "tmdb": 2, "title": "Galaxy Quest: Chapter 3",
+                 "collection_id": 1234, "genres": ["Adventure"]},
+                {"kind": "movie", "tmdb": 3, "title": "Another Adventure", "genres": ["Adventure"]},
+            ]
+            engine.embed_lock.acquire()
+            try:
+                output = engine.rank(options, mood="surprise", diversity=100)
+            finally:
+                engine.embed_lock.release()
+            self.assertIn(3, [x["tmdb"] for x in output["items"][:2]])
+
+    def test_quality_counters_use_aggregates_and_validate_input(self):
+        with tempfile.TemporaryDirectory() as temp:
+            engine = ai.Recommender(temp, start_worker=False)
+            engine.metric("served", "recommended", 20)
+            engine.metric("open", "recommended", 2)
+            engine.metric("request", "recommended", 1)
+            report = ai.Recommender(temp, start_worker=False).stats()
+            self.assertEqual(report["by_source"]["recommended"]["served"], 20)
+            self.assertEqual(report["by_source"]["recommended"]["open_per_100_served"], 10.0)
+            self.assertEqual(report["by_source"]["recommended"]["request"], 1)
+            with self.assertRaises(ValueError):
+                engine.metric("served", "recommended", 1000)
+            with self.assertRaises(ValueError):
+                engine.metric("served", "unknown", 1)
+
+    def test_query_mood_and_event_validation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            engine = ai.Recommender(temp, start_worker=False)
+            with self.assertRaises(ValueError):
+                engine.rank([], query="x" * 181)
+            with self.assertRaises(ValueError):
+                engine.rank([], mood="secret")
+            with self.assertRaises(ValueError):
+                engine.rank([{}] * 121)
+
     def test_empty_history_preserves_original_order(self):
         with tempfile.TemporaryDirectory() as temp:
             engine = ai.Recommender(temp, start_worker=False)
