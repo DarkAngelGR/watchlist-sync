@@ -1,11 +1,16 @@
 """Check that the NAS-side integration is opt-in and keeps trusted metadata."""
+import importlib.util
 import os
+from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch, Mock
 
 import requests
-import app
+
+spec = importlib.util.spec_from_file_location("watchlist_sync_app", Path(__file__).resolve().parents[1] / "app.py")
+app = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(app)
 
 
 class HookTests(unittest.TestCase):
@@ -28,7 +33,7 @@ class HookTests(unittest.TestCase):
             self.assertIs(self.syncer._rank_discover(self.base), self.base)
         with patch.dict(os.environ, {"RECOMMENDER_URL": "http://localhost:8788",
                                      "RECOMMENDER_API_KEY": "secret"}), \
-             patch("app.requests.post", side_effect=requests.Timeout):
+             patch.object(app.requests, "post", side_effect=requests.Timeout):
             self.assertIs(self.syncer._rank_discover(self.base), self.base)
 
     def test_rank_order_uses_upstream_candidate_records(self):
