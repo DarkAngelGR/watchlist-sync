@@ -292,7 +292,8 @@ class Recommender:
 
     def _embed_missing(self, texts):
         try:
-            missing = [t for t in dict.fromkeys(texts) if t not in self.cached_vectors(texts)]
+            known = self.cached_vectors(texts)
+            missing = [t for t in dict.fromkeys(texts) if t not in known]
             for start in range(0, len(missing), 8):
                 batch = missing[start:start + 8]
                 payload = json.dumps({"model": EMBED_MODEL, "input": batch}).encode()
@@ -386,13 +387,16 @@ class Recommender:
         # Maximal marginal relevance: high exploration spreads genres/topics,
         # low exploration favors highest match to favorites.
         picked, remaining = [], list(scored)
+        max_similarity = {row[1]: 0. for row in remaining}
         while remaining:
-            def utility(row):
-                sim = max((metadata_score(row[2], prior[2]) for prior in picked), default=0.)
-                return (row[0] - (diversity / 100) * .42 * sim, -row[1])
-            current = max(remaining, key=utility)
+            current = max(remaining, key=lambda row: (
+                row[0] - (diversity / 100) * .42 * max_similarity[row[1]], -row[1]))
             remaining.remove(current)
             picked.append(current)
+            if diversity:
+                for row in remaining:
+                    max_similarity[row[1]] = max(max_similarity[row[1]],
+                                                  metadata_score(row[2], current[2]))
         items = [row[2] for row in picked]
         # A Hidden Gems row is conservative: non-trending, non-popular
         # candidates with a reasonably positive community score.
