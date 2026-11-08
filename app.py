@@ -1204,6 +1204,38 @@ class Syncer:
             })
         return out
 
+    def _more_movie_candidates(self, tmdb_key, known):
+        """Optional wider TMDB catalog for personalized movie recommendations."""
+        try:
+            data = self._tmdb(tmdb_key, "/discover/movie",
+                              sort_by="vote_average.desc", **{"vote_count.gte": 150, "page": 1})
+            codes = self._tmdb(tmdb_key, "/genre/movie/list").get("genres") or []
+            labels = {g["id"]: g["name"] for g in codes if g.get("id") and g.get("name")}
+        except requests.RequestException as exc:
+            log.warning("TMDB movie discovery unavailable: %s", type(exc).__name__)
+            return []
+        items = []
+        for entry in (data.get("results") or [])[:30]:
+            tid = entry.get("id")
+            if not isinstance(tid, int) or tid in known or entry.get("adult"):
+                continue
+            date = entry.get("release_date") or ""
+            items.append({
+                "kind": "movie", "tmdb": tid, "tvdb": 0, "imdb": "",
+                "title": entry.get("title") or "?",
+                "year": int(date[:4]) if date[:4].isdigit() else None,
+                "overview": entry.get("overview") or "",
+                "genres": [labels[x] for x in (entry.get("genre_ids") or []) if x in labels],
+                "runtime": 0, "rating": round(float(entry.get("vote_average") or 0), 1),
+                "poster": self.TMDB_IMG + "w342" + entry["poster_path"] if entry.get("poster_path") else "",
+                "fanart": self.TMDB_IMG + "w1280" + entry["backdrop_path"] if entry.get("backdrop_path") else "",
+                "status": "none", "popularity": entry.get("popularity") or 0,
+                "source_rows": ["discovery"],
+            })
+            if len(items) >= 24:
+                break
+        return items
+
     def tv_discover(self, viewer="", diversity=35):
         """Titles you don't have yet: trending and popular movies and movies
         recommended from your library (Radarr's Discover, no key needed), and
@@ -1246,6 +1278,14 @@ class Syncer:
             {"id": "popular", "title": "Popular movies", "items": [m for m in popular if m not in trending_m][:30]},
         ]
         res = {"sections": [x for x in sections if x["items"]], "notes": notes}
+        self._ai_candidate_pool = []
+        # Only fetch extended catalog candidates when personalization is enabled.
+        if cfg.tmdb_key and (os.getenv("RECOMMENDER_URL") or os.getenv("RECOMMENDER_PROFILES_FILE")):
+            try:
+                known = self._library(Arr("Radarr", cfg.radarr), "movie") if cfg.radarr.enabled else {}
+                self._ai_candidate_pool = self._more_movie_candidates(cfg.tmdb_key, known)
+            except (requests.RequestException, LookupError) as exc:
+                log.warning("Extended discovery unavailable: %s", type(exc).__name__)
         self._discover_cache = (time.time(), res)
         return self._rank_discover(res, viewer, diversity)
 
@@ -1286,10 +1326,11 @@ class Syncer:
         choices = {}
         # The candidate pool is cached with the regular Discover data; the TV
         # receives only the final rows, never the full auxiliary pool.
-        candidates = list(self.__dict__.get("_ai_candidate_pool") or [])
+        candidates = []
         for section in sections:
             for item in section.get("items") or []:
                 candidates.append({**item, "source_rows": [section.get("id", "")]})
+        candidates.extend(self.__dict__.get("_ai_candidate_pool") or [])
         for item in candidates:
             kind = item.get("kind")
             identifier = item.get("tmdb") if kind == "movie" else item.get("tvdb")
