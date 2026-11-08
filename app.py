@@ -2011,6 +2011,33 @@ def make_handler(syncer, ui_password):
                     return self._send(409, {"error": str(e)})
                 except requests.RequestException as e:
                     return self._send(502, {"error": ("Radarr: " if kind == "movie" else "Sonarr: ") + str(e)[:200]})
+            if p == "/api/tv/ai/search":
+                qs = parse_qs(urlparse(self.path).query)
+                supplied = (qs.get("viewer") or [""])[0][:128]
+                verified = self._ai_viewer(supplied)
+                if not verified:
+                    return self._send(403, {"error": "verified profile required"})
+                query = (qs.get("q") or [""])[0]
+                mood = (qs.get("mood") or ["any"])[0]
+                try:
+                    diversity = max(0, min(100, int((qs.get("diversity") or ["35"])[0])))
+                    return self._send(200, syncer.tv_ai_search(verified, query, mood, diversity))
+                except (ValueError, TypeError) as exc:
+                    return self._send(400, {"error": str(exc)[:120]})
+                except requests.RequestException:
+                    return self._send(502, {"error": "AI search unavailable"})
+            if p == "/api/tv/ai/stats":
+                qs = parse_qs(urlparse(self.path).query)
+                supplied = (qs.get("viewer") or [""])[0][:128]
+                verified = self._ai_viewer(supplied)
+                if not verified:
+                    return self._send(403, {"error": "verified profile required"})
+                try:
+                    return self._send(200, syncer.tv_ai_stats(verified))
+                except ValueError as exc:
+                    return self._send(400, {"error": str(exc)[:120]})
+                except requests.RequestException:
+                    return self._send(502, {"error": "AI metrics unavailable"})
             if p == "/api/tv/discover":
                 qs = parse_qs(urlparse(self.path).query)
                 viewer = (qs.get("viewer") or [""])[0][:128]
@@ -2020,7 +2047,10 @@ def make_handler(syncer, ui_password):
                     diversity = 35
                 try:
                     # No per-user preference data without API authentication.
-                    return self._send(200, syncer.tv_discover(self._ai_viewer(viewer), diversity))
+                    mood = (qs.get("mood") or ["any"])[0]
+                    if mood not in ("any", "relaxing", "mind_bending", "intense", "short", "surprise"):
+                        mood = "any"
+                    return self._send(200, syncer.tv_discover(self._ai_viewer(viewer), diversity, mood))
                 except requests.RequestException as e:
                     return self._send(502, {"error": "Radarr: " + str(e)[:200]})
             if p == "/api/tv/subtitles":
@@ -2072,6 +2102,20 @@ def make_handler(syncer, ui_password):
             if p in ("/sync", "/api/sync"):
                 syncer.wake.set()
                 return self._send(202, {"queued": True})
+            if p == "/api/tv/ai/event":
+                if not ui_password:
+                    return self._send(403, {"error": "UI_PASSWORD required"})
+                supplied = str(body.get("viewer") or "")[:128]
+                verified = self._ai_viewer(supplied)
+                if not verified:
+                    return self._send(403, {"error": "verified profile required"})
+                try:
+                    return self._send(200, syncer.tv_ai_event(
+                        verified, body.get("event"), body.get("source"), body.get("count", 1)))
+                except (ValueError, TypeError) as exc:
+                    return self._send(400, {"error": str(exc)[:120]})
+                except requests.RequestException:
+                    return self._send(502, {"error": "local AI metrics unavailable"})
             if p == "/api/tv/feedback":
                 # Personal feedback requires an authenticated LAN-only TV API.
                 if not ui_password:
