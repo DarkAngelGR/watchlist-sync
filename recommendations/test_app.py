@@ -29,7 +29,7 @@ class RecommenderTests(unittest.TestCase):
                 self.assertEqual(params["accountID"], ai.PLEX_ACCOUNT_ID)
                 return {"MediaContainer": {"Metadata": history}}
             return {"MediaContainer": {"Metadata": [{"title": "Film", "Genre": [{"tag": "Thriller"}],
-                                                      "summary": "A mystery"}]}}
+                                                      "summary": "A mystery", "Guid": [{"id": "tmdb://222"}]}]}}
         with patch.object(ai, "get_plex", side_effect=plex):
             favorites = ai.plex_preferences()
         movie = next(x for x in favorites if x["kind"] == "movie")
@@ -37,6 +37,7 @@ class RecommenderTests(unittest.TestCase):
         self.assertEqual(movie["weight"], 8)
         self.assertGreater(show["weight"], 8)
         self.assertEqual(movie["genres"], ["Thriller"])
+        self.assertEqual(movie["external_ids"], {"tmdb": "222"})
 
     def test_metadata_ranking_favors_similar_genres_and_keeps_existing_items(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -185,6 +186,24 @@ class RecommenderTests(unittest.TestCase):
                 engine.rank([], mood="secret")
             with self.assertRaises(ValueError):
                 engine.rank([{}] * 121)
+
+    def test_exact_provider_ids_exclude_watched_without_guessing_by_title(self):
+        with tempfile.TemporaryDirectory() as temp:
+            engine = ai.Recommender(temp, start_worker=False)
+            engine.favorites = [
+                {"kind": "movie", "title": "Watched Film", "genres": ["Mystery"],
+                 "external_ids": {"tmdb": "4321"}, "weight": 15}
+            ]
+            options = [
+                {"kind": "movie", "tmdb": 4321, "title": "Watched Film"},
+                {"kind": "movie", "tmdb": 4322, "title": "Watched Film"},
+            ]
+            engine.embed_lock.acquire()
+            try:
+                result = engine.rank(options)
+            finally:
+                engine.embed_lock.release()
+            self.assertEqual([item["tmdb"] for item in result["items"]], [4322])
 
     def test_empty_history_preserves_original_order(self):
         with tempfile.TemporaryDirectory() as temp:
