@@ -65,6 +65,7 @@ def plex_preferences():
     """Plex history is individual completion events (not playback progress)."""
     count = defaultdict(Counter)
     labels = {}
+    seen_history = set()
     for start in range(0, HISTORY_LIMIT, 200):
         page = get_plex("/status/sessions/history/all", {
             "accountID": PLEX_ACCOUNT_ID, "sort": "viewedAt:desc",
@@ -73,7 +74,15 @@ def plex_preferences():
         rows = page.get("Metadata") or []
         if not rows:
             break
+        fresh_events = 0
         for row in rows:
+            # A server that ignores paging must not fabricate rewatch signals.
+            history_id = str(row.get("historyKey") or row.get("id") or "")
+            if history_id and history_id in seen_history:
+                continue
+            if history_id:
+                seen_history.add(history_id)
+            fresh_events += 1
             kind = row.get("type")
             if kind == "movie":
                 item_key = str(row.get("ratingKey") or "")
@@ -94,7 +103,7 @@ def plex_preferences():
                 continue
             count[group_key][episode_key] += 1
             labels[group_key] = (kind, item_key, title)
-        if len(rows) < 200:
+        if len(rows) < 200 or not fresh_events:
             break
     favorites = []
     for key, episodes in count.items():
