@@ -158,7 +158,7 @@ def plex_preferences():
                 ids = {}
                 for g in (m.get("Guid") or []):
                     value = g.get("id", "") if isinstance(g, dict) else ""
-                    found = re.match(r"^(tmdb|tvdb)://(\\d+)$", str(value))
+                    found = re.match(r"^(tmdb|tvdb)://(\d+)$", str(value))
                     if found:
                         ids[found.group(1)] = found.group(2)
                 if ids:
