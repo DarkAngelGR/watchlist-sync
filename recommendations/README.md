@@ -209,7 +209,7 @@ in the existing Search screen (e.g. "dark psychological mystery with twists").
 Run a synthetic 120-candidate / 30-favorite benchmark after cloning:
 
 ~~~bash
-python3 recommendations/benchmark.py
+python3 benchmark.py  # from the recommendations/ directory
 ~~~
 
 Report median and p95 values, plus actual Docker CPU/RAM usage during the first
@@ -234,9 +234,9 @@ volume (never commit this file):
 
 Set RECOMMENDER_PROFILES_FILE=/data/recommender-profiles.json on the NAS. When
 this is set, it overrides the single-profile variables; unlisted profiles fall
-back to generic Discover. This is explicit routing, not verified identity.
+back to generic Discover. The TV profile UUID is independently validated
+against the signed-in user's Plex or Jellyfin token before routing.
 You can find the active Orama profile UUID in its Settings -> AI profile ID
-row on the companion Orama feature branch. Require the UI password and limit
-access to the NAS service to trusted devices; if household-level isolation
-requires strict access controls, do not expose profile switching to others
-until authenticated profile verification is implemented.
+row on the companion Orama feature branch. Still keep UI_PASSWORD enabled,
+use a trusted HTTPS LAN endpoint, and protect individual media profiles with
+their own login or PIN.
