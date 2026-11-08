@@ -48,7 +48,7 @@ class HookTests(unittest.TestCase):
         ]}
         with patch.dict(os.environ, {"RECOMMENDER_URL": "http://localhost:8788",
                                      "RECOMMENDER_API_KEY": "secret"}), \
-             patch("app.requests.post", return_value=mock) as post:
+             patch.object(app.requests, "post", return_value=mock) as post:
             result = self.syncer._rank_discover(self.base)
         row = result["sections"][0]
         self.assertEqual(row["id"], "recommended")
