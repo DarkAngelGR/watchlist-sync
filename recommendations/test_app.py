@@ -73,6 +73,40 @@ class RecommenderTests(unittest.TestCase):
         self.assertEqual(len(favorites), 50)
         self.assertTrue(all(f["weight"] == 3 for f in favorites))
 
+    def test_feedback_persists_and_hide_excludes_a_title(self):
+        with tempfile.TemporaryDirectory() as temp:
+            engine = ai.Recommender(temp, start_worker=False)
+            engine.favorites = [{"title": "Space", "genres": ["Sci-Fi"], "weight": 15}]
+            engine.feedback("movie", 100, "more")
+            self.assertEqual(ai.Recommender(temp, start_worker=False)._feedback()[("movie", "100")], "more")
+            engine.feedback("movie", 100, "hide")
+            candidates = [
+                {"kind": "movie", "tmdb": 100, "title": "Hidden Movie", "genres": ["Sci-Fi"], "rating": 8},
+                {"kind": "movie", "tmdb": 101, "title": "Other Movie", "genres": ["Sci-Fi"], "rating": 7.6,
+                 "source_rows": ["discovery"]},
+            ]
+            engine.embed_lock.acquire()
+            try:
+                out = engine.rank(candidates, diversity=85)
+            finally:
+                engine.embed_lock.release()
+            self.assertEqual([x["tmdb"] for x in out["items"]], [101])
+            self.assertEqual([x["tmdb"] for x in out["hidden_gems"]], [101])
+            self.assertIn("Similar to", out["items"][0]["ai_reason"])
+            engine.feedback("movie", 100, "clear")
+            self.assertNotIn(("movie", "100"), engine._feedback())
+
+    def test_jellyfin_play_count_without_completed_flag_is_not_a_finish(self):
+        response = {"Items": [
+            {"Id": "1", "Type": "Movie", "Name": "Started Only",
+             "UserData": {"PlayCount": 4, "Played": False}},
+            {"Id": "2", "Type": "Movie", "Name": "Actually Finished",
+             "UserData": {"PlayCount": 2, "Played": True}},
+        ]}
+        with patch.object(ai, "get_json", return_value=response):
+            results = ai.jellyfin_preferences()
+        self.assertEqual([x["title"] for x in results], ["Actually Finished"])
+
     def test_empty_history_preserves_original_order(self):
         with tempfile.TemporaryDirectory() as temp:
             engine = ai.Recommender(temp, start_worker=False)
