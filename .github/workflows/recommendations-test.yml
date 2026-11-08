@@ -1,0 +1,29 @@
+name: Local AI recommendations tests
+on:
+  pull_request:
+    paths:
+      - "recommendations/**"
+      - "app.py"
+      - ".github/workflows/recommendations-test.yml"
+  push:
+    branches: [main]
+    paths:
+      - "recommendations/**"
+      - "app.py"
+      - ".github/workflows/recommendations-test.yml"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install server test dependency
+        run: python -m pip install requests
+      - name: Check Python syntax
+        run: python -m compileall -q app.py recommendations/app.py recommendations/test_app.py
+      - name: Run existing server regression tests
+        run: python test_app.py
+      - name: Test recommendation service without live servers
+        run: python -m unittest discover -s recommendations -p 'test_app.py' -v
