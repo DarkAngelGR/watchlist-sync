@@ -1204,13 +1204,13 @@ class Syncer:
             })
         return out
 
-    def tv_discover(self):
+    def tv_discover(self, viewer="", diversity=35):
         """Titles you don't have yet: trending and popular movies and movies
         recommended from your library (Radarr's Discover, no key needed), and
         trending shows when a TMDB key is set. {'sections': [{id, title, items}]}."""
         hit = self.__dict__.get("_discover_cache")
         if hit and time.time() - hit[0] < self.DISCOVER_TTL:
-            return self._rank_discover(hit[1])
+            return self._rank_discover(hit[1], viewer, diversity)
         cfg = Config(self.settings.all())
         trending_m, popular, recommended, shows, notes = [], [], [], [], []
         if cfg.radarr.enabled:
@@ -1247,19 +1247,19 @@ class Syncer:
         ]
         res = {"sections": [x for x in sections if x["items"]], "notes": notes}
         self._discover_cache = (time.time(), res)
-        return self._rank_discover(res)
+        return self._rank_discover(res, viewer, diversity)
 
-    def _rank_discover(self, original):
+    def _rank_discover(self, original, viewer="", diversity=35):
         """Optionally replace the recommendation row with local personalized ranking.
 
         The original Radarr/TMDB results remain the source of candidates and are
         returned unchanged when the AI service is not configured or unhealthy.
         No Plex/Sonarr/Radarr credentials are sent to the recommender.
         """
-        base = os.getenv("RECOMMENDER_URL", "").strip().rstrip("/")
-        secret = os.getenv("RECOMMENDER_API_KEY", "").strip()
-        if not (base and secret):
+        target = self._ai_target(viewer)
+        if not target:
             return original
+        base, secret = target
         sections = original.get("sections") or []
         choices = {}
         for section in sections:
@@ -1277,7 +1277,7 @@ class Syncer:
             return original
         try:
             response = requests.post(base + "/v1/rank",
-                                     json={"items": list(choices.values())},
+                                     json={"items": list(choices.values()), "diversity": diversity},
                                      headers={"Authorization": "Bearer " + secret},
                                      timeout=(2, 5))
             response.raise_for_status()
