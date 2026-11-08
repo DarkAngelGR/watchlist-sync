@@ -27,3 +27,5 @@ jobs:
         run: python test_app.py
       - name: Test recommendation service without live servers
         run: python -m unittest discover -s recommendations -p 'test_*.py' -v
+      - name: Log CPU-only metadata benchmark (GitHub runner, not UN1250)
+        run: python recommendations/benchmark.py
