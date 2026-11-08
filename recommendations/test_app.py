@@ -56,6 +56,23 @@ class RecommenderTests(unittest.TestCase):
             self.assertEqual([i["tmdb"] for i in output["items"]], [2, 1])
             self.assertEqual(len(engine.rank([])["items"]), 0)
 
+    def test_repeated_plex_page_does_not_count_as_rewatch(self):
+        history = [
+            {"type": "movie", "ratingKey": str(i), "historyKey": "/history/" + str(i),
+             "title": "Film " + str(i)} for i in range(200)
+        ]
+        calls = []
+        def plex(_path, params=None):
+            if params is not None:
+                calls.append(params["X-Plex-Container-Start"])
+                return {"MediaContainer": {"Metadata": history}}
+            return {"MediaContainer": {"Metadata": []}}
+        with patch.object(ai, "get_plex", side_effect=plex):
+            favorites = ai.plex_preferences()
+        self.assertEqual(calls, [0, 200])
+        self.assertEqual(len(favorites), 50)
+        self.assertTrue(all(f["weight"] == 3 for f in favorites))
+
     def test_empty_history_preserves_original_order(self):
         with tempfile.TemporaryDirectory() as temp:
             engine = ai.Recommender(temp, start_worker=False)
