@@ -1,9 +1,15 @@
 """Check that the NAS-side integration is opt-in and keeps trusted metadata."""
+import base64
 import importlib.util
+import json
+import threading
 import os
 from pathlib import Path
 import tempfile
 import unittest
+from http.server import ThreadingHTTPServer
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 from unittest.mock import patch, Mock
 
 import requests
@@ -45,6 +51,56 @@ class HookTests(unittest.TestCase):
             result = self.syncer._rank_discover(self.base, "someone-else")
             self.assertIs(result, self.base)
             post.assert_not_called()
+
+    def test_plex_user_token_must_match_claimed_uuid(self):
+        with patch.dict(os.environ, {"RECOMMENDER_AUTH_PROVIDER": "plex"}):
+            response = Mock()
+            response.json.return_value = {"uuid": "real-uuid"}
+            with patch.object(app.requests, "get", return_value=response) as get:
+                self.assertTrue(self.syncer._ai_verified("real-uuid", "signed-user-token"))
+                self.assertFalse(self.syncer._ai_verified("another-uuid", "signed-user-token"))
+                self.assertEqual(get.call_args.kwargs["headers"]["X-Plex-Token"], "signed-user-token")
+                self.assertNotIn("signed-user-token", repr(self.syncer._ai_verification_cache))
+        with patch.dict(os.environ, {"RECOMMENDER_AUTH_PROVIDER": ""}):
+            self.assertFalse(self.syncer._ai_verified("real-uuid", "signed-user-token"))
+
+    def test_jellyfin_token_identity_is_enforced(self):
+        with patch.dict(os.environ, {"RECOMMENDER_AUTH_PROVIDER": "jellyfin",
+                                     "RECOMMENDER_JELLYFIN_URL": "http://127.0.0.1:8096"}):
+            response = Mock()
+            response.json.return_value = {"Id": "jellyfin-user"}
+            with patch.object(app.requests, "get", return_value=response):
+                self.assertTrue(self.syncer._ai_verified("jellyfin-user", "user-access-token"))
+                self.assertFalse(self.syncer._ai_verified("another-user", "user-access-token"))
+
+    def test_tv_api_denies_claimed_profile_without_verified_token(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), app.make_handler(self.syncer, "super-secret"))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = "http://127.0.0.1:%s" % server.server_port
+        basic = "Basic " + base64.b64encode(b"user:super-secret").decode()
+        try:
+            with patch.object(self.syncer, "_ai_verified", return_value=False), \
+                 patch.object(self.syncer, "tv_discover", return_value={"sections": []}) as discover:
+                req = Request(base + "/api/tv/discover?viewer=other-user",
+                              headers={"Authorization": basic})
+                with urlopen(req, timeout=3) as resp:
+                    self.assertEqual(json.load(resp), {"sections": []})
+                self.assertEqual(discover.call_args.args[0], "")
+                unauthorized = Request(base + "/api/tv/ai/stats?viewer=other-user",
+                                       headers={"Authorization": basic})
+                with self.assertRaises(HTTPError) as err:
+                    urlopen(unauthorized, timeout=3)
+                self.assertEqual(err.exception.code, 403)
+                feedback = Request(base + "/api/tv/feedback",
+                                   headers={"Authorization": basic, "Content-Type": "application/json"},
+                                   data=b'{"viewer":"other-user","kind":"movie","id":1,"action":"more"}')
+                with self.assertRaises(HTTPError) as err:
+                    urlopen(feedback, timeout=3)
+                self.assertEqual(err.exception.code, 403)
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_rank_order_uses_upstream_candidate_records(self):
         malicious = {"kind": "movie", "tmdb": 2, "title": "Fake injected title",
