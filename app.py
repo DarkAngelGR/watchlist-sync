@@ -1834,8 +1834,14 @@ def make_handler(syncer, ui_password):
                 except requests.RequestException as e:
                     return self._send(502, {"error": ("Radarr: " if kind == "movie" else "Sonarr: ") + str(e)[:200]})
             if p == "/api/tv/discover":
+                qs = parse_qs(urlparse(self.path).query)
+                viewer = (qs.get("viewer") or [""])[0][:128]
                 try:
-                    return self._send(200, syncer.tv_discover())
+                    diversity = max(0, min(100, int((qs.get("diversity") or ["35"])[0])))
+                except (TypeError, ValueError):
+                    diversity = 35
+                try:
+                    return self._send(200, syncer.tv_discover(viewer, diversity))
                 except requests.RequestException as e:
                     return self._send(502, {"error": "Radarr: " + str(e)[:200]})
             if p == "/api/tv/subtitles":
@@ -1887,6 +1893,18 @@ def make_handler(syncer, ui_password):
             if p in ("/sync", "/api/sync"):
                 syncer.wake.set()
                 return self._send(202, {"queued": True})
+            if p == "/api/tv/feedback":
+                # Personal feedback requires an authenticated LAN-only TV API.
+                if not ui_password:
+                    return self._send(403, {"error": "UI_PASSWORD is required for AI feedback"})
+                try:
+                    return self._send(200, syncer.tv_feedback(
+                        str(body.get("viewer") or "")[:128], body.get("kind"),
+                        body.get("id"), body.get("action")))
+                except ValueError as e:
+                    return self._send(400, {"error": str(e)})
+                except requests.RequestException:
+                    return self._send(502, {"error": "local AI unavailable"})
             if p == "/api/tv/sync":
                 # A TV just added something to the Plex Watchlist: sync now.
                 syncer.wake.set()
