@@ -89,7 +89,7 @@ released version that includes the integration. The current published
 latest container will NOT have unmerged code. Preserve the current
 watchlist-sync data volume, settings and image backup during upgrades.
 
-Add these two variables to your *existing* watchlist-sync Compose service
+Add these variables to your *existing* watchlist-sync Compose service
 environment (keep all existing variables and settings):
 
 ~~~yaml
@@ -100,6 +100,10 @@ environment:
   UI_PASSWORD: "A_STRONG_SEPARATE_NAS_UI_PASSWORD"
   # TMDB_API_KEY: "..."  # optional, expands movie discovery
 ~~~
+
+If UI_PASSWORD is not set, only generic Discover is returned and taste feedback
+is disabled to avoid exposing viewing preferences. Use the password on Orama's
+Settings -> Downloads screen as well.
 
 If watchlist-sync uses host networking, the NAS can reach the UN1250 using
 its LAN IP. Never commit these credentials. Rebuild and redeploy the
@@ -118,6 +122,7 @@ curl -fsS -H "Authorization: Bearer YOUR_SECRET" \
 A personalized true result means the configured viewer's history has been
 loaded. Embedding caches improve results as they populate asynchronously.
 
+Install the companion Orama PR on a staging TV (its changes are not in main).
 The Orama feature-branch client passes its active profile UUID and diversity
 level to the TV discovery endpoint. The server returns personalized rows only
 for configured profiles. When history is available, Home shows "For you · Based
