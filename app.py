@@ -1205,11 +1205,12 @@ class Syncer:
             })
         return out
 
-    def _more_movie_candidates(self, tmdb_key, known):
+    def _more_movie_candidates(self, tmdb_key, known, genre_id=None):
         """Optional wider TMDB catalog for personalized movie recommendations."""
         try:
             data = self._tmdb(tmdb_key, "/discover/movie",
-                              sort_by="vote_average.desc", **{"vote_count.gte": 150, "page": 1})
+                              sort_by="vote_average.desc", **({"vote_count.gte": 150, "page": 1, "with_genres": genre_id}
+                                                             if genre_id else {"vote_count.gte": 150, "page": 1}))
             codes = self._tmdb(tmdb_key, "/genre/movie/list").get("genres") or []
             labels = {g["id"]: g["name"] for g in codes if g.get("id") and g.get("name")}
         except requests.RequestException as exc:
@@ -1237,13 +1238,13 @@ class Syncer:
                 break
         return items
 
-    def tv_discover(self, viewer="", diversity=35):
+    def tv_discover(self, viewer="", diversity=35, mood="any"):
         """Titles you don't have yet: trending and popular movies and movies
         recommended from your library (Radarr's Discover, no key needed), and
         trending shows when a TMDB key is set. {'sections': [{id, title, items}]}."""
         hit = self.__dict__.get("_discover_cache")
         if hit and time.time() - hit[0] < self.DISCOVER_TTL:
-            return self._rank_discover(hit[1], viewer, diversity)
+            return self._rank_discover(hit[1], viewer, diversity, mood=mood)
         cfg = Config(self.settings.all())
         trending_m, popular, recommended, shows, notes = [], [], [], [], []
         if cfg.radarr.enabled:
@@ -1288,7 +1289,86 @@ class Syncer:
             except (requests.RequestException, LookupError) as exc:
                 log.warning("Extended discovery unavailable: %s", type(exc).__name__)
         self._discover_cache = (time.time(), res)
-        return self._rank_discover(res, viewer, diversity)
+        return self._rank_discover(res, viewer, diversity, mood=mood)
+
+    def _ai_search_candidates(self, query, mood):
+        """Query-guided TMDB catalog expansion; never run an LLM or scrape media."""
+        cfg = Config(self.settings.all())
+        if not cfg.tmdb_key:
+            return []
+        lower = (query + " " + (mood or "")).lower()
+        categories = [
+            (("sci-fi", "science fiction", "space", "time travel", "mind_bending"), 878),
+            (("mystery", "detective", "puzzle"), 9648),
+            (("thriller", "suspense", "intense"), 53),
+            (("comedy", "funny", "relaxing"), 35),
+            (("horror", "scary"), 27),
+            (("fantasy", "magic"), 14),
+            (("romance", "romantic"), 10749),
+            (("animation", "animated", "anime"), 16),
+            (("documentary", "true story"), 99),
+        ]
+        genre = next((id for words, id in categories if any(w in lower for w in words)), None)
+        if not genre:
+            return []
+        known = set()
+        if cfg.radarr.enabled:
+            try:
+                known = self._library(Arr("Radarr", cfg.radarr), "movie")
+            except requests.RequestException:
+                pass
+        return self._more_movie_candidates(cfg.tmdb_key, known, genre_id=genre)
+
+    def tv_ai_search(self, viewer, query, mood="any", diversity=35):
+        if not isinstance(query, str) or not 3 <= len(query.strip()) <= 180:
+            raise ValueError("enter a search description of 3-180 characters")
+        if mood not in ("any", "relaxing", "mind_bending", "intense", "short", "surprise"):
+            raise ValueError("unknown mood")
+        if not self._ai_target(viewer):
+            return {"available": False, "items": []}
+        # Reuse the cached baseline pool, then optionally expand by requested genre.
+        hit = self.__dict__.get("_discover_cache")
+        if not hit or time.time() - hit[0] >= self.DISCOVER_TTL:
+            self.tv_discover("", diversity)
+            hit = self.__dict__.get("_discover_cache")
+        base = hit[1] if hit else {"sections": []}
+        expanded = self._ai_search_candidates(query, mood)
+        result = self._rank_discover(base, viewer, diversity, query=query,
+                                     mood=mood, extra_candidates=expanded)
+        sections = result.get("sections") or []
+        for section in sections:
+            if section.get("id") == "recommended" and section.get("title", "").startswith("For you"):
+                return {"available": True, "items": section.get("items", [])[:24]}
+        return {"available": False, "items": []}
+
+    def tv_ai_stats(self, viewer):
+        target = self._ai_target(viewer)
+        if not target:
+            raise ValueError("recommendations are not configured for this profile")
+        base, secret = target
+        response = requests.get(base + "/v1/stats",
+                                headers={"Authorization": "Bearer " + secret},
+                                timeout=(2, 5))
+        response.raise_for_status()
+        return response.json()
+
+    def tv_ai_event(self, viewer, event, source, count):
+        if event not in ("served", "open", "request"):
+            raise ValueError("invalid metric event")
+        if source not in ("recommended", "hidden-gems", "trending", "popular", "ai-search"):
+            raise ValueError("invalid metric source")
+        if type(count) is not int or not 1 <= count <= 120:
+            raise ValueError("invalid metric count")
+        target = self._ai_target(viewer)
+        if not target:
+            raise ValueError("recommendations are not configured for this profile")
+        base, secret = target
+        response = requests.post(base + "/v1/event",
+                                 json={"event": event, "source": source, "count": count},
+                                 headers={"Authorization": "Bearer " + secret},
+                                 timeout=(2, 5))
+        response.raise_for_status()
+        return {"ok": True}
 
     def _ai_verified(self, viewer, token):
         """Validate the active Plex/Jellyfin user token, never a caller-supplied UUID.
@@ -1362,7 +1442,7 @@ class Syncer:
         secret = os.getenv("RECOMMENDER_API_KEY", "").strip()
         return (base, secret) if base and len(secret) >= 24 else None
 
-    def _rank_discover(self, original, viewer="", diversity=35):
+    def _rank_discover(self, original, viewer="", diversity=35, query="", mood="any", extra_candidates=None):
         """Optional per-profile personalization, with upstream-safe fallback."""
         target = self._ai_target(viewer)
         if not target:
@@ -1377,6 +1457,8 @@ class Syncer:
             for item in section.get("items") or []:
                 candidates.append({**item, "source_rows": [section.get("id", "")]})
         candidates.extend(self.__dict__.get("_ai_candidate_pool") or [])
+        if extra_candidates:
+            candidates = list(extra_candidates) + candidates
         for item in candidates:
             kind = item.get("kind")
             identifier = item.get("tmdb") if kind == "movie" else item.get("tvdb")
@@ -1396,7 +1478,8 @@ class Syncer:
             return original
         try:
             response = requests.post(base + "/v1/rank",
-                                     json={"items": list(choices.values()), "diversity": diversity},
+                                     json={"items": list(choices.values()), "diversity": diversity,
+                                           "query": query, "mood": mood},
                                      headers={"Authorization": "Bearer " + secret},
                                      timeout=(2, 5))
             response.raise_for_status()
