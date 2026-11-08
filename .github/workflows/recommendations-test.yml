@@ -26,4 +26,4 @@ jobs:
       - name: Run existing server regression tests
         run: python test_app.py
       - name: Test recommendation service without live servers
-        run: python -m unittest discover -s recommendations -p 'test_app.py' -v
+        run: python -m unittest discover -s recommendations -p 'test_*.py' -v
