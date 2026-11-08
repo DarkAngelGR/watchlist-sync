@@ -1249,6 +1249,33 @@ class Syncer:
         self._discover_cache = (time.time(), res)
         return self._rank_discover(res, viewer, diversity)
 
+    def _ai_target(self, viewer):
+        """Choose only explicitly configured TV profiles and AI endpoints.
+
+        Viewer IDs sent by TV clients are not independently authenticated.
+        Use a UI password and private LAN for the watchlist-sync endpoint.
+        """
+        if not viewer or len(viewer) > 128:
+            return None
+        mapping = os.getenv("RECOMMENDER_PROFILES_FILE", "").strip()
+        if mapping:
+            try:
+                with open(mapping, encoding="utf-8") as f:
+                    entry = json.load(f).get(viewer)
+                if isinstance(entry, dict):
+                    base = str(entry.get("url") or "").strip().rstrip("/")
+                    key = str(entry.get("api_key") or "").strip()
+                    if base.startswith(("http://", "https://")) and len(key) >= 24:
+                        return base, key
+            except (OSError, ValueError, TypeError) as exc:
+                log.warning("AI profile map unavailable: %s", type(exc).__name__)
+            return None
+        if viewer != os.getenv("RECOMMENDER_PROFILE_UUID", "").strip():
+            return None
+        base = os.getenv("RECOMMENDER_URL", "").strip().rstrip("/")
+        secret = os.getenv("RECOMMENDER_API_KEY", "").strip()
+        return (base, secret) if base and len(secret) >= 24 else None
+
     def _rank_discover(self, original, viewer="", diversity=35):
         """Optionally replace the recommendation row with local personalized ranking.
 
