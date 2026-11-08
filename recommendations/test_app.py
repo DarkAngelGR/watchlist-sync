@@ -18,10 +18,10 @@ spec.loader.exec_module(ai)
 class RecommenderTests(unittest.TestCase):
     def test_plex_groups_completed_episodes_without_counting_each_as_rewatch(self):
         history = [
-            {"type": "movie", "ratingKey": "42", "title": "Film"},
-            {"type": "movie", "ratingKey": "42", "title": "Film"},
-            {"type": "episode", "ratingKey": "10", "grandparentRatingKey": "5", "grandparentTitle": "Show"},
-            {"type": "episode", "ratingKey": "11", "grandparentRatingKey": "5", "grandparentTitle": "Show"},
+            {"type": "movie", "ratingKey": "42", "title": "Film", "accountID": ai.PLEX_ACCOUNT_ID},
+            {"type": "movie", "ratingKey": "42", "title": "Film", "accountID": ai.PLEX_ACCOUNT_ID},
+            {"type": "episode", "ratingKey": "10", "grandparentRatingKey": "5", "grandparentTitle": "Show", "accountID": ai.PLEX_ACCOUNT_ID},
+            {"type": "episode", "ratingKey": "11", "grandparentRatingKey": "5", "grandparentTitle": "Show", "accountID": ai.PLEX_ACCOUNT_ID},
             {"type": "episode", "ratingKey": "10", "grandparentRatingKey": "5", "grandparentTitle": "Show"},
         ]
         def plex(_path, params=None):
@@ -38,6 +38,48 @@ class RecommenderTests(unittest.TestCase):
         self.assertGreater(show["weight"], 8)
         self.assertEqual(movie["genres"], ["Thriller"])
         self.assertEqual(movie["external_ids"], {"tmdb": "222"})
+
+    def test_plex_filter_400_falls_back_and_excludes_other_users(self):
+        from urllib.error import HTTPError
+        with patch.object(ai, "PLEX_ACCOUNT_ID", "770539977"):
+            seen = []
+            first = [
+                {"type": "movie", "ratingKey": "41", "title": "Another account", "accountID": 1},
+                {"type": "movie", "ratingKey": "42", "title": "Our account", "accountID": 770539977},
+                {"type": "movie", "ratingKey": "43", "title": "Unknown owner"},
+            ]
+            def plex(path, params=None):
+                if params is not None:
+                    seen.append(dict(params))
+                    if "accountID" in params:
+                        raise HTTPError("http://plex", 400, "invalid filter", {}, None)
+                    return {"MediaContainer": {"Metadata": first}}
+                return {"MediaContainer": {"Metadata": []}}
+            with patch.object(ai, "get_plex", side_effect=plex):
+                favorites = ai.plex_preferences()
+            self.assertEqual([x["title"] for x in favorites], ["Our account"])
+            self.assertEqual(len(seen), 2)
+            self.assertEqual(seen[0]["accountID"], "770539977")
+            self.assertNotIn("accountID", seen[1])
+
+    def test_other_account_only_page_does_not_terminate_history_scan(self):
+        with patch.object(ai, "PLEX_ACCOUNT_ID", "770539977"), patch.object(ai, "HISTORY_LIMIT", 400):
+            requests_seen = []
+            def plex(path, params=None):
+                if params is not None:
+                    requests_seen.append(params["X-Plex-Container-Start"])
+                    if params["X-Plex-Container-Start"] == 0:
+                        return {"MediaContainer": {"Metadata": [
+                            {"type": "movie", "ratingKey": str(i), "accountID": "1", "historyKey": str(i)}
+                            for i in range(200)]}}
+                    return {"MediaContainer": {"Metadata": [
+                        {"type": "movie", "ratingKey": "900", "title": "My show", "accountID": "770539977"}
+                    ]}}
+                return {"MediaContainer": {"Metadata": []}}
+            with patch.object(ai, "get_plex", side_effect=plex):
+                favorites = ai.plex_preferences()
+            self.assertEqual(requests_seen, [0, 200])
+            self.assertEqual([x["title"] for x in favorites], ["My show"])
 
     def test_metadata_ranking_favors_similar_genres_and_keeps_existing_items(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -59,7 +101,7 @@ class RecommenderTests(unittest.TestCase):
 
     def test_repeated_plex_page_does_not_count_as_rewatch(self):
         history = [
-            {"type": "movie", "ratingKey": str(i), "historyKey": "/history/" + str(i),
+            {"type": "movie", "ratingKey": str(i), "accountID": ai.PLEX_ACCOUNT_ID, "historyKey": "/history/" + str(i),
              "title": "Film " + str(i)} for i in range(200)
         ]
         calls = []
