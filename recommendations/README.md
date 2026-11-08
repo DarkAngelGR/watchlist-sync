@@ -1,5 +1,53 @@
 # Orama local recommendations — Minisforum UN1250
 
+## Phase 3: local-language search, moods, franchise filters, quality analytics
+
+The paired Orama draft PR includes **AI picks** on the existing Search screen
+(for descriptions of at least 3 words), selectable mood presets in Settings,
+franchise-diversified recommendations, and an **AI quality report**. The backend
+uses *local embeddings + text/genre ranking*, not a conversational chatbot.
+It can interpret descriptions loosely; it is not guaranteed to understand
+negation, all plot details or every possible genre.
+
+The dashboard counts tiles **served**, title pages opened, and confirmed
+requests; it does not claim that every served tile was seen or that an
+individual later completed a recommendation. Counters are anonymized,
+aggregated by UTC day and row type, retained for 90 days; the report covers
+the last 30 days. Natural-language search text is **never logged as an event**.
+A new `recommendations/benchmark.py` allows measuring cold-cache metadata
+ranking on the actual UN1250 (no cloud or external model required).
+
+### Required profile authentication and transport
+
+**Personalized features now fail closed until all of the following are set:**
+
+1. `UI_PASSWORD` is set on NAS watchlist-sync and configured in Orama.
+2. `RECOMMENDER_AUTH_PROVIDER=plex` for Plex or `jellyfin` for Jellyfin is set
+   on NAS watchlist-sync. With Jellyfin also set
+   `RECOMMENDER_JELLYFIN_URL=http://NAS_IP:8096` (or its trusted HTTPS URL).
+3. `RECOMMENDER_PROFILE_UUID` matches Orama Settings → AI profile ID, or
+   `RECOMMENDER_PROFILES_FILE` explicitly maps that ID to a separate instance.
+4. **Orama is configured to access watchlist-sync via HTTPS with a certificate
+   trusted by the Samsung TV.** Its client intentionally never sends a
+   Plex/Jellyfin user token to plain HTTP. Configure a LAN-only TLS reverse
+   proxy on the NAS and set Orama's watchlist-sync manual URL to its HTTPS
+   endpoint. For custom hostnames, add the trusted name to `ALLOWED_HOSTS`
+   on watchlist-sync (comma-separated). Never port-forward these services.
+   An existing HTTP setup continues to serve **generic Discover** safely.
+
+When HTTPS is in place, Orama submits its current media-user access token
+only with AI-related requests. watchlist-sync independently checks it against
+Plex's official user API or Jellyfin's `/Users/Me`, and compares the confirmed
+identity to the claimed profile. Verification is cached for 60 seconds in
+memory, by token hash; credentials are neither persisted nor logged.
+Plex verification uses plex.tv; no external generative AI is involved.
+
+**This verification is not equivalent to a guarantee of isolation from someone
+with access to your unlocked Plex Home profile or TV.** Protect each media
+profile with its own login/PIN, and restrict access to the private LAN. Do not
+share access tokens or long-lived service API keys in GitHub issues or chats.
+
+
 An optional local AI ranking service for Orama / watchlist-sync, using media
 history and metadata only. No video files are transferred or analyzed.
 
@@ -8,8 +56,8 @@ history and metadata only. No video files are transferred or analyzed.
 - One explicitly configured Plex account or Jellyfin user **per AI instance**.
   The NAS routes the active Orama profile UUID to a configured instance.
   Additional household users need separate instances with their own scoped credentials.
-  Profile IDs supplied by clients are not cryptographically verified: use a strong
-  UI_PASSWORD and private LAN, and do not expose this API to untrusted clients.
+  Profile IDs now require matching Plex/Jellyfin access tokens verified server-side;
+  user profile PIN/login controls remain a separate authorization boundary.
 - Plex: server playback-history entries, grouped into movies and shows;
   rewatching the same episode is stronger than simply watching more episodes.
   Plex history records a server-counted play, not necessarily a genuine
@@ -98,6 +146,9 @@ environment:
   RECOMMENDER_API_KEY: "THE_SAME_SECRET_AS_API_KEY"
   RECOMMENDER_PROFILE_UUID: "CURRENT_ORAMA_PROFILE_UUID"
   UI_PASSWORD: "A_STRONG_SEPARATE_NAS_UI_PASSWORD"
+  RECOMMENDER_AUTH_PROVIDER: "plex"  # or jellyfin
+  # RECOMMENDER_JELLYFIN_URL: "http://NAS_IP:8096"
+  # ALLOWED_HOSTS: "nas.example.com"  # if using trusted LAN-only TLS reverse proxy
   # TMDB_API_KEY: "..."  # optional, expands movie discovery
 ~~~
 
@@ -123,8 +174,8 @@ A personalized true result means the configured viewer's history has been
 loaded. Embedding caches improve results as they populate asynchronously.
 
 Install the companion Orama PR on a staging TV (its changes are not in main).
-The Orama feature-branch client passes its active profile UUID and diversity
-level to the TV discovery endpoint. The server returns personalized rows only
+The Orama feature-branch client passes its active, verified profile UUID,
+diversity level and selected mood to the TV discovery endpoint. The server returns personalized rows only
 for configured profiles. When history is available, Home shows "For you · Based
 on your viewing" and, when there are eligible items, "Hidden gems for you".
 If the AI is unavailable, the original "Recommended for you" row remains.
@@ -133,7 +184,10 @@ The TV adds "Your taste" on external catalog item details with More like this,
 Less like this, Hide and Clear. Feedback uses the configured watchlist-sync
 UI_PASSWORD; setting the password in Orama Settings -> Downloads is necessary.
 A "Why recommended" note is shown on items ranked by the local engine.
-Settings -> AI discovery cycles exploration from 0 to 100%.
+Settings -> AI discovery cycles exploration from 0 to 100%, and Settings -> AI mood
+chooses the active mood without overwriting long-term preferences. The same
+Settings screen links to the AI quality report. Enter descriptive searches
+in the existing Search screen (e.g. "dark psychological mystery with twists").
 
 ## Troubleshooting / rollback
 
@@ -146,8 +200,22 @@ Settings -> AI discovery cycles exploration from 0 to 100%.
 - Run offline tests with:
   python -m unittest discover -s recommendations -p 'test_*.py' -v
   python test_app.py
-- All AI and history data stays local. No cloud LLM or external API calls
-  are required by the recommender.
+- All embedding inference and stored feedback/history signals remain local.
+  Plex profile verification contacts plex.tv, and optional wider candidate
+  discovery contacts TMDB; there is no cloud LLM integration.
+
+## Performance check on your UN1250
+
+Run a synthetic 120-candidate / 30-favorite benchmark after cloning:
+
+~~~bash
+python3 recommendations/benchmark.py
+~~~
+
+Report median and p95 values, plus actual Docker CPU/RAM usage during the first
+Ollama indexing pass. The script exercises metadata ranking only and does not
+pretend to measure hardware-dependent Qwen3 embedding warm-up. On the TV, the
+normal Plex/Jellyfin Search is not blocked by the AI result row.
 
 ## Multiple profiles (optional)
 
