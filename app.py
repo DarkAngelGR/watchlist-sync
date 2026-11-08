@@ -15,6 +15,7 @@ owner's token; each friend's Plex privacy setting for "Watchlist" must be
 """
 import base64
 import hmac
+import hashlib
 import ipaddress
 import json
 import logging
@@ -1289,6 +1290,51 @@ class Syncer:
         self._discover_cache = (time.time(), res)
         return self._rank_discover(res, viewer, diversity)
 
+    def _ai_verified(self, viewer, token):
+        """Validate the active Plex/Jellyfin user token, never a caller-supplied UUID.
+
+        This is optional only in the sense that unconfigured services revert to
+        generic discovery. No raw tokens are cached, persisted or logged.
+        """
+        if not isinstance(viewer, str) or not 4 <= len(viewer) <= 128:
+            return False
+        if not isinstance(token, str) or not 8 <= len(token) <= 512:
+            return False
+        source = os.getenv("RECOMMENDER_AUTH_PROVIDER", "").lower().strip()
+        if source not in ("plex", "jellyfin"):
+            return False
+        signature = hashlib.sha256((source + "\0" + viewer + "\0" + token).encode()).hexdigest()
+        cache = self.__dict__.setdefault("_ai_verification_cache", {})
+        now = time.monotonic()
+        if cache.get(signature, 0) > now:
+            return True
+        try:
+            if source == "plex":
+                response = requests.get(
+                    "https://plex.tv/api/v2/user",
+                    headers={"X-Plex-Token": token, "Accept": "application/json",
+                             "X-Plex-Product": "Orama", "X-Plex-Client-Identifier": self.client_id},
+                    timeout=(2, 4))
+                response.raise_for_status()
+                data = response.json()
+                observed = data.get("uuid") or (data.get("user") or {}).get("uuid")
+            else:
+                base = os.getenv("RECOMMENDER_JELLYFIN_URL", "").rstrip("/")
+                if not base.startswith(("http://", "https://")):
+                    return False
+                response = requests.get(base + "/Users/Me",
+                                        headers={"X-Emby-Token": token}, timeout=(2, 4))
+                response.raise_for_status()
+                observed = response.json().get("Id")
+            if not isinstance(observed, str) or not hmac.compare_digest(observed.lower(), viewer.lower()):
+                return False
+            if len(cache) > 256:
+                cache.clear()
+            cache[signature] = now + 60
+            return True
+        except (requests.RequestException, TypeError, ValueError, KeyError):
+            return False
+
     def _ai_target(self, viewer):
         """Choose only explicitly configured TV profiles and AI endpoints.
 
@@ -1749,7 +1795,7 @@ def make_handler(syncer, ui_password):
             if self._tv() and origin_allowed(origin, self.headers.get("Host")):
                 self.send_header("Access-Control-Allow-Origin", origin or "*")
                 self.send_header("Vary", "Origin")
-                self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Orama-Profile-Token")
                 self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
                 self.send_header("Access-Control-Max-Age", "600")
 
@@ -1802,6 +1848,14 @@ def make_handler(syncer, ui_password):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return False
+
+        def _ai_viewer(self, supplied):
+            # Basic UI auth is necessary but does not identify a specific user.
+            # A second independently verified media-user token is required.
+            token = self.headers.get("X-Orama-Profile-Token") or ""
+            if ui_password and syncer._ai_verified(supplied, token):
+                return supplied
+            return ""
 
         def _body(self):
             n = int(self.headers.get("Content-Length") or 0)
@@ -1883,7 +1937,7 @@ def make_handler(syncer, ui_password):
                     diversity = 35
                 try:
                     # No per-user preference data without API authentication.
-                    return self._send(200, syncer.tv_discover(viewer if ui_password else "", diversity))
+                    return self._send(200, syncer.tv_discover(self._ai_viewer(viewer), diversity))
                 except requests.RequestException as e:
                     return self._send(502, {"error": "Radarr: " + str(e)[:200]})
             if p == "/api/tv/subtitles":
@@ -1940,8 +1994,12 @@ def make_handler(syncer, ui_password):
                 if not ui_password:
                     return self._send(403, {"error": "UI_PASSWORD is required for AI feedback"})
                 try:
+                    supplied = str(body.get("viewer") or "")[:128]
+                    verified = self._ai_viewer(supplied)
+                    if not verified:
+                        return self._send(403, {"error": "verified profile required"})
                     return self._send(200, syncer.tv_feedback(
-                        str(body.get("viewer") or "")[:128], body.get("kind"),
+                        verified, body.get("kind"),
                         body.get("id"), body.get("action")))
                 except ValueError as e:
                     return self._send(400, {"error": str(e)})
