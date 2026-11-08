@@ -153,9 +153,7 @@ def plex_preferences():
         # people's history. Such pages must not prevent later matches.
         if len(rows) < params["X-Plex-Container-Size"]:
             break
-        if not fresh_events and use_server_filter:
-            break
-        if not fresh_events and not use_server_filter and start > 0:
+        if not fresh_events and start > 0:
             # No new event IDs: the server may be ignoring pagination.
             # Distinguish repetition from an unrelated user's page.
             event_ids = {str(row.get("historyKey") or row.get("id") or "")
