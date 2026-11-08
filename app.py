@@ -1882,7 +1882,8 @@ def make_handler(syncer, ui_password):
                 except (TypeError, ValueError):
                     diversity = 35
                 try:
-                    return self._send(200, syncer.tv_discover(viewer, diversity))
+                    # No per-user preference data without API authentication.
+                    return self._send(200, syncer.tv_discover(viewer if ui_password else "", diversity))
                 except requests.RequestException as e:
                     return self._send(502, {"error": "Radarr: " + str(e)[:200]})
             if p == "/api/tv/subtitles":
