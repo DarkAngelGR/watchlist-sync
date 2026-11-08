@@ -36,7 +36,18 @@ DATA_DIR = os.getenv("DATA_DIR", "/data")
 HISTORY_LIMIT = min(4000, max(50, int(os.getenv("HISTORY_LIMIT", "1500"))))
 REFRESH_MINUTES = max(5, int(os.getenv("REFRESH_MINUTES", "15")))
 PORT = int(os.getenv("PORT", "8788"))
-STOPWORDS = set("a an and at by for from in is it of on or the to with this that some about into after who what are".split())
+STOPWORDS = set("a an and at by for from in is it of on or the to with this that some about into after who what are find me please something like movie show series".split())
+MOODS = {
+    "any": "",
+    "relaxing": "gentle feel good comforting comedy family friendship peaceful lighthearted",
+    "mind_bending": "mind bending science fiction mystery time travel twist philosophical complex psychological",
+    "intense": "tense high stakes suspense thriller action horror gripping",
+    "short": "short movie under one hundred minutes concise enjoyable",
+    "surprise": "unexpected unusual genre hidden gem discovery",
+}
+ALLOWED_EVENTS = {"served", "open", "request"}
+ALLOWED_GROUPS = {"recommended", "hidden-gems", "trending", "popular", "ai-search"}
+
 
 
 def get_json(url, headers=None, timeout=15):
@@ -213,7 +224,8 @@ def jellyfin_preferences():
 
 
 def terms(item):
-    txt = str(item.get("title") or "") + " " + str(item.get("overview") or "")[:750]
+    txt = (str(item.get("title") or "") + " " + str(item.get("overview") or "")[:750]
+           + " " + " ".join(genres(item)))
     return {w for w in re.findall(r"[a-zA-Z]{3,}", txt.lower()) if w not in STOPWORDS}
 
 
@@ -236,6 +248,32 @@ def normalize(values):
     return [x / length for x in values] if length else []
 
 
+def collection_key(item):
+    """Only group explicitly identified franchise collections or clear sequel titles.
+
+    Generic shared words do not imply that two titles share a franchise.
+    """
+    raw = item.get("collection_id") or item.get("franchise_id")
+    if not raw and isinstance(item.get("collection"), dict):
+        raw = item["collection"].get("id")
+    if raw and str(raw).isdigit():
+        return "collection:" + str(raw)
+    title = str(item.get("title") or "").casefold()
+    # Conservative fallback: e.g. 'Example: Chapter 2', 'Example 3'.
+    hit = re.match(r"^([a-z][a-z0-9 ':-]{3,55}?)(?:[: ]+(?:part|chapter|episode|vol\.?|volume)\s*\d+|\s+[23456789]|\s+(?:ii|iii|iv|v|vi))$", title)
+    if hit:
+        return "sequel:" + hit.group(1).strip(" :")
+    return ""
+
+
+def query_match(item, query):
+    query_terms = terms({"title": query})
+    if not query_terms:
+        return 0.
+    candidate_terms = terms(item)
+    return len(query_terms & candidate_terms) / len(query_terms)
+
+
 def metadata_score(candidate, favorite):
     cg, fg = genres(candidate), genres(favorite)
     overlap = len(cg & fg) / max(1, len(cg | fg)) if cg and fg else 0.
@@ -253,6 +291,9 @@ class Recommender:
             conn.execute("CREATE TABLE IF NOT EXISTS feedback (kind TEXT NOT NULL, item_id TEXT NOT NULL,"
                          " action TEXT NOT NULL, updated_at INTEGER NOT NULL,"
                          " PRIMARY KEY(kind, item_id))")
+            conn.execute("CREATE TABLE IF NOT EXISTS metrics (day TEXT NOT NULL, event TEXT NOT NULL,"
+                         " source TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0,"
+                         " PRIMARY KEY(day,event,source))")
         self.lock = threading.RLock()
         self.embed_lock = threading.Lock()
         self.favorites = []
@@ -331,6 +372,36 @@ class Recommender:
         with sqlite3.connect(self.db, timeout=5) as conn:
             return {(kind, item_id): action for kind, item_id, action in
                     conn.execute("SELECT kind,item_id,action FROM feedback")}
+
+    def metric(self, event, source, count=1):
+        """Only aggregated counters; no search prompts, item IDs or user tokens."""
+        if event not in ALLOWED_EVENTS or source not in ALLOWED_GROUPS:
+            raise ValueError("invalid metric")
+        if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 120:
+            raise ValueError("invalid metric count")
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        cutoff = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 90 * 86400))
+        with sqlite3.connect(self.db, timeout=5) as conn:
+            conn.execute("INSERT INTO metrics(day,event,source,count) VALUES(?,?,?,?) "
+                         "ON CONFLICT(day,event,source) DO UPDATE SET count=count+excluded.count",
+                         (today, event, source, count))
+            conn.execute("DELETE FROM metrics WHERE day < ?", (cutoff,))
+        return {"ok": True}
+
+    def stats(self):
+        cutoff = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 30 * 86400))
+        with sqlite3.connect(self.db, timeout=5) as conn:
+            rows = conn.execute("SELECT source,event,SUM(count) FROM metrics "
+                                "WHERE day >= ? GROUP BY source,event", (cutoff,)).fetchall()
+            feedback = conn.execute("SELECT action,COUNT(*) FROM feedback GROUP BY action").fetchall()
+        summary = {source: {"served": 0, "open": 0, "request": 0}
+                   for source in sorted(ALLOWED_GROUPS)}
+        for source, event, count in rows:
+            summary[source][event] = count
+        for group in summary.values():
+            group["open_per_100_served"] = round(100 * group["open"] / group["served"], 1) if group["served"] else None
+        return {"window_days": 30, "by_source": summary,
+                "feedback": dict(feedback), "note": "Served counts are tiles delivered, not guaranteed on-screen views."}
 
     def rank(self, candidates, diversity=35):
         """Rank candidates with taste, feedback and a deterministic diversity penalty.
