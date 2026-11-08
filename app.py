@@ -1210,7 +1210,7 @@ class Syncer:
         trending shows when a TMDB key is set. {'sections': [{id, title, items}]}."""
         hit = self.__dict__.get("_discover_cache")
         if hit and time.time() - hit[0] < self.DISCOVER_TTL:
-            return hit[1]
+            return self._rank_discover(hit[1])
         cfg = Config(self.settings.all())
         trending_m, popular, recommended, shows, notes = [], [], [], [], []
         if cfg.radarr.enabled:
@@ -1247,7 +1247,63 @@ class Syncer:
         ]
         res = {"sections": [x for x in sections if x["items"]], "notes": notes}
         self._discover_cache = (time.time(), res)
-        return res
+        return self._rank_discover(res)
+
+    def _rank_discover(self, original):
+        """Optionally replace the recommendation row with local personalized ranking.
+
+        The original Radarr/TMDB results remain the source of candidates and are
+        returned unchanged when the AI service is not configured or unhealthy.
+        No Plex/Sonarr/Radarr credentials are sent to the recommender.
+        """
+        base = os.getenv("RECOMMENDER_URL", "").strip().rstrip("/")
+        secret = os.getenv("RECOMMENDER_API_KEY", "").strip()
+        if not (base and secret):
+            return original
+        sections = original.get("sections") or []
+        choices = {}
+        for section in sections:
+            for item in section.get("items") or []:
+                kind = item.get("kind")
+                identifier = item.get("tmdb") if kind == "movie" else item.get("tvdb")
+                if kind not in ("movie", "show") or not identifier:
+                    continue
+                choices.setdefault((kind, str(identifier)), item)
+                if len(choices) >= 120:
+                    break
+            if len(choices) >= 120:
+                break
+        if not choices:
+            return original
+        try:
+            response = requests.post(base + "/v1/rank",
+                                     json={"items": list(choices.values())},
+                                     headers={"Authorization": "Bearer " + secret},
+                                     timeout=(2, 5))
+            response.raise_for_status()
+            result = response.json()
+            if result.get("personalized") is not True or not isinstance(result.get("items"), list):
+                return original
+            selected, used = [], set()
+            for item in result["items"]:
+                if not isinstance(item, dict):
+                    continue
+                kind = item.get("kind")
+                identifier = item.get("tmdb") if kind == "movie" else item.get("tvdb")
+                key = (kind, str(identifier))
+                if key in choices and key not in used:
+                    selected.append(choices[key])  # use trusted upstream metadata, not remote mutations
+                    used.add(key)
+            if not selected:
+                return original
+            row = {"id": "recommended", "title": "For you · Based on your viewing",
+                   "items": selected[:30]}
+            return {**original, "sections": [row] +
+                    [s for s in sections if s.get("id") != "recommended"]}
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            log.warning("Optional local recommender unavailable (%s); using original Discover",
+                        type(exc).__name__)
+            return original
 
     def tv_request(self, kind, ext_id, user=""):
         """Add a movie to Radarr or a show to Sonarr, the way a watchlist add
