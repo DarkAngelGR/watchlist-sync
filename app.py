@@ -1136,7 +1136,7 @@ class Syncer:
         ratings = x.get("ratings") or {}
         rating = ((ratings.get("tmdb") or {}).get("value") or (ratings.get("imdb") or {}).get("value")
                   or ratings.get("value") or 0)
-        return {
+        item = {
             "kind": kind, "title": x.get("title") or "?", "year": x.get("year") or None,
             "overview": x.get("overview") or "", "genres": (x.get("genres") or [])[:4],
             "runtime": x.get("runtime") or 0, "rating": rating,
@@ -1146,6 +1146,14 @@ class Syncer:
             "poster": self._poster(x), "fanart": self._image(x, "fanart"),
             "status": library.get(ext, "none"),
         }
+        # Sonarr/Radarr sometimes supply collection membership directly.
+        # Preserve it for the local franchise diversity filter when available.
+        collection = x.get("collection")
+        if isinstance(collection, dict):
+            collection_id = collection.get("tmdbId") or collection.get("id")
+            if str(collection_id or "").isdigit():
+                item["collection_id"] = int(collection_id)
+        return item
 
     def tv_lookup(self, kind, q="", ext_id=0):
         """Movies (Radarr) or shows (Sonarr) matching `q`, or the one with this
