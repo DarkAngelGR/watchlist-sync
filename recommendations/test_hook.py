@@ -30,11 +30,21 @@ class HookTests(unittest.TestCase):
 
     def test_opt_in_and_failure_fallback(self):
         with patch.dict(os.environ, {"RECOMMENDER_URL": "", "RECOMMENDER_API_KEY": ""}):
-            self.assertIs(self.syncer._rank_discover(self.base), self.base)
+            self.assertIs(self.syncer._rank_discover(self.base, "test-profile"), self.base)
         with patch.dict(os.environ, {"RECOMMENDER_URL": "http://localhost:8788",
-                                     "RECOMMENDER_API_KEY": "secret"}), \
+                                     "RECOMMENDER_API_KEY": "x" * 32,
+                                     "RECOMMENDER_PROFILE_UUID": "test-profile"}), \
              patch.object(app.requests, "post", side_effect=requests.Timeout):
-            self.assertIs(self.syncer._rank_discover(self.base), self.base)
+            self.assertIs(self.syncer._rank_discover(self.base, "test-profile"), self.base)
+
+    def test_different_profile_never_receives_personalized_row(self):
+        with patch.dict(os.environ, {"RECOMMENDER_URL": "http://localhost:8788",
+                                     "RECOMMENDER_API_KEY": "x" * 32,
+                                     "RECOMMENDER_PROFILE_UUID": "test-profile"}), \
+             patch.object(app.requests, "post") as post:
+            result = self.syncer._rank_discover(self.base, "someone-else")
+            self.assertIs(result, self.base)
+            post.assert_not_called()
 
     def test_rank_order_uses_upstream_candidate_records(self):
         malicious = {"kind": "movie", "tmdb": 2, "title": "Fake injected title",
@@ -47,9 +57,10 @@ class HookTests(unittest.TestCase):
             {"kind": "movie", "tmdb": 1, "title": "One"},
         ]}
         with patch.dict(os.environ, {"RECOMMENDER_URL": "http://localhost:8788",
-                                     "RECOMMENDER_API_KEY": "secret"}), \
+                                     "RECOMMENDER_API_KEY": "x" * 32,
+                                     "RECOMMENDER_PROFILE_UUID": "test-profile"}), \
              patch.object(app.requests, "post", return_value=mock) as post:
-            result = self.syncer._rank_discover(self.base)
+            result = self.syncer._rank_discover(self.base, "test-profile", 75)
         row = result["sections"][0]
         self.assertEqual(row["id"], "recommended")
         self.assertEqual([x["title"] for x in row["items"]], ["Two", "Three", "One"])
