@@ -8,6 +8,7 @@ from collections import Counter, defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 import hashlib
 import hmac
 import json
@@ -80,16 +81,35 @@ def plex_preferences():
     labels = {}
     seen_history = set()
     last_seen = {}
+    use_server_filter = True
     for start in range(0, HISTORY_LIMIT, 200):
-        page = get_plex("/status/sessions/history/all", {
-            "accountID": PLEX_ACCOUNT_ID, "sort": "viewedAt:desc",
-            "X-Plex-Container-Start": start, "X-Plex-Container-Size": 200,
-        }).get("MediaContainer", {})
+        params = {
+            "sort": "viewedAt:desc",
+            "X-Plex-Container-Start": start, "X-Plex-Container-Size": min(200, HISTORY_LIMIT - start),
+        }
+        try:
+            page = get_plex("/status/sessions/history/all",
+                            {**params, "accountID": PLEX_ACCOUNT_ID} if use_server_filter
+                            else params).get("MediaContainer", {})
+        except HTTPError as exc:
+            if exc.code != 400 or not use_server_filter:
+                raise
+            # Some Plex installations reject accountID even when it is
+            # numeric and present in history. Retry without the server filter.
+            # Per-row accountID checks below are still mandatory.
+            log.warning("Plex rejected the accountID history filter (HTTP 400); "
+                        "switching to locally filtered history events")
+            use_server_filter = False
+            page = get_plex("/status/sessions/history/all", params).get("MediaContainer", {})
         rows = page.get("Metadata") or []
         if not rows:
             break
         fresh_events = 0
         for row in rows:
+            # Fail closed: do not ingest events from a different account, or
+            # from entries that lack a verifiable account ID.
+            if str(row.get("accountID") or "") != PLEX_ACCOUNT_ID:
+                continue
             # A server that ignores paging must not fabricate rewatch signals.
             history_id = str(row.get("historyKey") or row.get("id") or "")
             if history_id and history_id in seen_history:
@@ -129,8 +149,19 @@ def plex_preferences():
                 last_seen[group_key] = max(last_seen.get(group_key, 0), int(row.get("viewedAt") or 0))
             except (TypeError, ValueError):
                 pass
-        if len(rows) < 200 or not fresh_events:
+        # Stop on short pages, but not on a page containing only other
+        # people's history. Such pages must not prevent later matches.
+        if len(rows) < params["X-Plex-Container-Size"]:
             break
+        if not fresh_events and use_server_filter:
+            break
+        if not fresh_events and not use_server_filter and start > 0:
+            # No new event IDs: the server may be ignoring pagination.
+            # Distinguish repetition from an unrelated user's page.
+            event_ids = {str(row.get("historyKey") or row.get("id") or "")
+                         for row in rows if row.get("historyKey") or row.get("id")}
+            if event_ids and event_ids <= seen_history:
+                break
     favorites = []
     for key, episodes in count.items():
         kind, item_key, title = labels[key]
