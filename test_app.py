@@ -605,6 +605,71 @@ requests.Session.request = prev_fake
 requests.get = lambda url, **kw: fake(None, "GET", url, **kw)
 print("discover tests OK")
 
+# The ranking route is optional and uses the same credentials as the TV API.
+with ThreadingHTTPServer(("127.0.0.1", 0), app.make_handler(s, "pw")) as ranking_server:
+    threading.Thread(target=ranking_server.serve_forever, daemon=True).start()
+    rank_url = f"http://127.0.0.1:{ranking_server.server_port}/api/tv/recommend"
+    rank_body = {
+        "taste": {"genres": ["Mystery"], "token": "private"},
+        "seed": {"title": "Severance", "kind": "show", "genres": ["Drama"]},
+        "candidates": [
+            {"id": "dark", "kind": "show", "title": "Dark", "year": 2017, "genres": ["Mystery"]},
+            {"id": "arrival", "kind": "movie", "title": "Arrival", "year": 2016, "genres": ["Drama"]},
+        ],
+    }
+
+    def post_ranking(body=rank_body, headers=auth, url=rank_url):
+        req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=4) as res:
+                return res.status, json.load(res)
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"{}")
+
+    from io import BytesIO
+    from unittest.mock import patch
+
+    with patch.dict(os.environ, {"RECOMMEND_URL": "", "RECOMMEND_MODEL": ""}):
+        assert post_ranking()[0] == 503, "ranking is disabled without provider config"
+
+    def provider_reply(content):
+        res = requests.Response()
+        res.status_code = 200
+        res.raw = BytesIO(json.dumps({"choices": [{"message": {"content": content}}]}).encode())
+        res._content_consumed = False
+        return res
+
+    with patch.dict(os.environ, {
+        "RECOMMEND_URL": "http://model.local/v1/chat/completions",
+        "RECOMMEND_MODEL": "test-model",
+        "RECOMMEND_API_KEY": "model-secret",
+    }):
+        with patch.object(requests, "post", return_value=provider_reply(json.dumps({"picks": [
+            {"id": "dark", "reason": "A slow-burn mystery."},
+            {"id": "invented", "reason": "Not a candidate"},
+            {"id": "dark", "reason": "Duplicate"},
+            {"id": "arrival", "reason": "a" * 160},
+        ]}))) as provider:
+            assert post_ranking(headers={})[0] == 401
+            assert post_ranking(url=base + "/api/tv/recommend")[0] == 503
+            assert post_ranking({**rank_body, "candidates": rank_body["candidates"] * 13})[0] == 400
+            assert post_ranking({**rank_body, "ignored": "x" * 25000})[0] == 413
+            assert not provider.called
+            assert post_ranking() == (200, {"picks": [
+                {"id": "dark", "reason": "A slow-burn mystery."},
+                {"id": "arrival", "reason": "a" * 120},
+            ]})
+            provider_payload = provider.call_args.kwargs["json"]
+            assert "private" not in json.dumps(provider_payload)
+            assert provider.call_args.kwargs["headers"]["Authorization"] == "Bearer model-secret"
+        with patch.object(requests, "post", return_value=provider_reply("bad json")):
+            assert post_ranking()[0] == 502
+        with patch.object(requests, "post", side_effect=requests.Timeout("provider detail")):
+            code, err = post_ranking()
+            assert code == 502 and "provider detail" not in err["error"]
+    ranking_server.shutdown()
+print("recommendation tests OK")
+
 call("/api/plex/logout", {})
 assert call("/api/status")["account"] is None and not s.settings.all()["plex_token"]
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])

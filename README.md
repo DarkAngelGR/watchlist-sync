@@ -151,9 +151,22 @@ These are the only endpoints that allow cross-origin calls. They need `UI_PASSWO
 | `POST /api/tv/subtitles/download` | `{token, index}`: download one of those results through Bazarr. Bazarr's own subtitle ids never leave watchlist-sync |
 | `GET /api/tv/lookup?kind=movie\|show&q=TEXT` (or `&id=ID`) | Search Radarr/Sonarr's lookup (or one TMDB/TVDB id). Each result says whether it's already there: `have`, `requested` or `none` |
 | `GET /api/tv/discover` | Titles you don't have yet: trending, popular and recommended movies (Radarr's Discover, no key needed) and trending shows (with a TMDB key) |
+| `POST /api/tv/recommend` | Rank a shortlist from Orama and return up to three title IDs and reasons. Requires `UI_PASSWORD` and a configured AI model |
 | `POST /api/tv/request` | `{kind: "movie"\|"show", tmdb\|tvdb, user}`: add it to Radarr/Sonarr like a Watchlist add would (nothing in dry run) |
 | `POST /api/tv/delete` | `{kind: "movie"\|"show", tmdb\|tvdb, imdb}`: delete from Radarr/Sonarr with files (nothing in dry run). It isn't re-added while it stays on the same Watchlists; adding it to a Watchlist again later brings it back |
 </details>
+
+### Optional AI ranking for Orama
+
+Set `UI_PASSWORD`, `RECOMMEND_URL` (the full URL of a chat completions endpoint), and `RECOMMEND_MODEL`
+in the container environment. Set `RECOMMEND_API_KEY` when the endpoint requires a bearer token.
+Choose a model endpoint reachable from the container. With a recent Orama build, add the companion
+password under **Settings › Downloads**, then enable **AI recommendations** for the current viewer.
+
+Orama sends preferred genres, the just-watched title when available, and a shortlist from that
+viewer’s library. A hosted model provider receives that selection. The recommendation endpoint
+ranks titles from the shortlist and returns picks and reasons. Plex Watchlist sync operates
+independently of the model.
 
 ## For developers
 
