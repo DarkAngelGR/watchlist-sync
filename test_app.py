@@ -101,6 +101,9 @@ def fake(self, method, url, params=None, json=None, headers=None, timeout=None):
             return Resp(body={"id": tags[json["label"]], "label": json["label"]})
         return Resp(body=[{"id": i, "label": l} for l, i in tags.items()])
     if url.endswith("/series") and method == "GET":
+        if params and "tvdbId" in params:
+            want = params["tvdbId"]
+            return Resp(body=[x for x in sonarr_series if str(x.get("tvdbId")) == str(want)])
         return Resp(body=sonarr_series)
     if url.endswith("/series/lookup"):
         tid = int(params["term"].split(":")[1])
@@ -109,6 +112,9 @@ def fake(self, method, url, params=None, json=None, headers=None, timeout=None):
         sonarr_series.append({"id": len(sonarr_series) + 100, "tvdbId": json["tvdbId"], "tags": json["tags"], "title": json["title"]})
         return Resp(201, json)
     if url.endswith("/movie") and method == "GET":
+        if params and "tmdbId" in params:
+            want = params["tmdbId"]
+            return Resp(body=[x for x in radarr_movies if str(x.get("tmdbId")) == str(want)])
         return Resp(body=radarr_movies)
     if "/movie/lookup/tmdb" in url:
         return Resp(body={"title": "Inception", "tmdbId": params["tmdbId"]})
@@ -374,10 +380,18 @@ def del_fake(self, method, url, params=None, json=None, headers=None, timeout=No
     if method == "DELETE":
         deleted.append((url.split("/api/v3")[1], dict(params or {})))
         return Resp(body={})
-    if url.endswith(":7878/api/v3/movie") and not params:
-        return Resp(body=[{"id": 31, "tmdbId": 27205, "imdbId": "tt1375666", "title": "Inception"}])
-    if url.endswith(":8989/api/v3/series") and not params:
-        return Resp(body=[{"id": 41, "tvdbId": 121361, "imdbId": "tt0944947", "title": "Game of Thrones"}])
+    if url.endswith(":7878/api/v3/movie"):
+        movies = [{"id": 31, "tmdbId": 27205, "imdbId": "tt1375666", "title": "Inception"}]
+        if params and "tmdbId" in params:
+            want = params["tmdbId"]
+            return Resp(body=[x for x in movies if str(x.get("tmdbId")) == str(want)])
+        return Resp(body=movies)
+    if url.endswith(":8989/api/v3/series"):
+        series = [{"id": 41, "tvdbId": 121361, "imdbId": "tt0944947", "title": "Game of Thrones"}]
+        if params and "tvdbId" in params:
+            want = params["tvdbId"]
+            return Resp(body=[x for x in series if str(x.get("tvdbId")) == str(want)])
+        return Resp(body=series)
     return prev3(self, method, url, params=params, json=json, headers=headers, timeout=timeout)
 requests.Session.request = del_fake
 assert call("/api/tv/delete", {"kind": "movie", "tmdb": 27205})["dry_run"] and not deleted   # dry run deletes nothing
@@ -409,9 +423,17 @@ prev_get, prev_post = requests.get, requests.post
 bz = {"posted": None}
 def tv4_fake(self, method, url, params=None, json=None, headers=None, timeout=None, data=None):
     if url.endswith(":7878/api/v3/movie"):
-        return Resp(body=[{"id": 31, "tmdbId": 27205, "imdbId": "tt1375666", "title": "Inception"}])
+        movies = [{"id": 31, "tmdbId": 27205, "imdbId": "tt1375666", "title": "Inception"}]
+        if params and "tmdbId" in params:
+            want = params["tmdbId"]
+            return Resp(body=[x for x in movies if str(x.get("tmdbId")) == str(want)])
+        return Resp(body=movies)
     if url.endswith(":8989/api/v3/series"):
-        return Resp(body=[{"id": 41, "tvdbId": 121361, "title": "Game of Thrones"}])
+        series = [{"id": 41, "tvdbId": 121361, "title": "Game of Thrones"}]
+        if params and "tvdbId" in params:
+            want = params["tvdbId"]
+            return Resp(body=[x for x in series if str(x.get("tvdbId")) == str(want)])
+        return Resp(body=series)
     if url.endswith(":8989/api/v3/episode"):
         assert params["seriesId"] == 41
         return Resp(body=[{"id": 900, "seasonNumber": 1, "episodeNumber": 2}, {"id": 901, "seasonNumber": 1, "episodeNumber": 3}])
@@ -1069,6 +1091,9 @@ def error_path_tests():
                     return Resp(body={"records": [], "totalRecords": 0})
                 if url.endswith("/movie"):
                     if method == "GET":
+                        p = kw.get("params")
+                        if p and "tmdbId" in p:
+                            return Resp(body=[x for x in radarr_db if str(x.get("tmdbId")) == str(p["tmdbId"])])
                         return Resp(body=radarr_db)
                     if method == "POST":
                         radarr_db.append({"id": 801, "tmdbId": 8001, "title": "Pending Movie"})
@@ -1432,6 +1457,56 @@ def tv_log_tests():
             log_syncer.state.db.close()
 
 tv_log_tests()
+
+def single_title_lookup_tests():
+    cfg = app.Config(s.settings.all())
+    r_arr = app.Arr("Radarr", cfg.radarr)
+    s_arr = app.Arr("Sonarr", cfg.sonarr)
+
+    # 1. Movie lookup by tmdbId: requests ?tmdbId=..., never unfiltered /movie
+    radarr_movies[:] = [{"id": 501, "tmdbId": 12345, "title": "Single Movie", "imdbId": "tt12345"}]
+    calls.clear()
+    found = r_arr.find(12345)
+    assert found and found["id"] == 501
+    movie_calls = [c for c in calls if c[0] == "GET" and c[1].endswith("/movie")]
+    assert len(movie_calls) == 1, movie_calls
+    assert movie_calls[0][2] == {"tmdbId": 12345}, movie_calls[0]
+
+    # 2. Series lookup by tvdbId: requests ?tvdbId=..., never unfiltered /series
+    sonarr_series[:] = [{"id": 601, "tvdbId": 54321, "title": "Single Show", "imdbId": "tt54321"}]
+    calls.clear()
+    found = s_arr.find(54321)
+    assert found and found["id"] == 601
+    series_calls = [c for c in calls if c[0] == "GET" and c[1].endswith("/series")]
+    assert len(series_calls) == 1, series_calls
+    assert series_calls[0][2] == {"tvdbId": 54321}, series_calls[0]
+
+    # 3. Lookup when ID not found and no IMDb given: no unfiltered list call
+    calls.clear()
+    not_found = r_arr.find(99999)
+    assert not_found is None
+    movie_calls = [c for c in calls if c[0] == "GET" and c[1].endswith("/movie")]
+    assert len(movie_calls) == 1 and movie_calls[0][2] == {"tmdbId": 99999}
+
+    # 4. Lookup when ID not found BUT IMDb is given: falls back to unfiltered list
+    calls.clear()
+    found_imdb = r_arr.find(99999, imdb="tt12345")
+    assert found_imdb and found_imdb["id"] == 501
+    movie_calls = [c for c in calls if c[0] == "GET" and c[1].endswith("/movie")]
+    assert len(movie_calls) == 2
+    assert movie_calls[0][2] == {"tmdbId": 99999}
+    assert not movie_calls[1][2], movie_calls[1]
+
+    # 5. Lookup with only IMDb given (no ext_id): requests unfiltered list directly
+    calls.clear()
+    found_imdb_only = r_arr.find(None, imdb="tt12345")
+    assert found_imdb_only and found_imdb_only["id"] == 501
+    movie_calls = [c for c in calls if c[0] == "GET" and c[1].endswith("/movie")]
+    assert len(movie_calls) == 1 and not movie_calls[0][2]
+
+    print("single-title lookup tests OK")
+
+single_title_lookup_tests()
 
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])
 print("ALL OK")

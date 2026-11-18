@@ -605,12 +605,12 @@ class Arr:
         """Return the series/movie object in Sonarr/Radarr for a TVDB/TMDB id
         (or, failing that, an IMDb id), or None."""
         key, path = ("tvdbId", "/series") if self.name == "Sonarr" else ("tmdbId", "/movie")
-        items = dicts(self.get(path))
-        for x in items:
-            if ext_id and x.get(key) == ext_id:
-                return x
+        if ext_id:
+            for x in dicts(self.get(path, **{key: ext_id})):
+                if x.get(key) == ext_id or str(x.get(key)) == str(ext_id):
+                    return x
         if imdb:
-            for x in items:
+            for x in dicts(self.get(path)):
                 if (x.get("imdbId") or "").lower() == imdb.lower():
                     return x
         return None
