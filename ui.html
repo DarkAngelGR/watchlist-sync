@@ -260,9 +260,9 @@ function renderStatus(st){
   if (st.users && st.users.length){
     const note = {ok:"", private:"Watchlist is private — they need to set Watchlist visibility to Friends in their Plex privacy settings", excluded:"Excluded in settings"};
     $("#usersBox").innerHTML = `<table><tr><th>User</th><th>Role</th><th>Watchlist</th><th>Status</th><th></th></tr>${
-      st.users.map(u => `<tr><td>${esc(u.name)}</td><td class="mute">${u.role}</td>
-        <td>${u.items ?? "—"}</td><td><span class="tag ${u.status}">${u.status === "ok" ? "readable" : u.status}</span>
-        ${note[u.status] ? `<div class="small mute">${note[u.status]}</div>` : ""}</td>
+      st.users.map(u => `<tr><td>${esc(u.name)}</td><td class="mute">${esc(u.role)}</td>
+        <td>${esc(u.items ?? "—")}</td><td><span class="tag ${esc(u.status)}">${u.status === "ok" ? "readable" : esc(u.status)}</span>
+        ${note[u.status] ? `<div class="small mute">${esc(note[u.status])}</div>` : ""}</td>
         <td style="text-align:right">${u.status === "excluded"
           ? `<button class="link" data-include="${esc(u.name)}">Include again</button>`
           : `<button class="link" data-exclude="${esc(u.name)}">Exclude…</button>`}</td></tr>`).join("")}</table>`;
@@ -274,7 +274,7 @@ function renderStatus(st){
   // requests
   const f = $("#userFilter"), cur = f.value;
   const names = [...new Set((st.recent||[]).flatMap(x => x.users ? x.users.split(",") : []))].sort();
-  f.innerHTML = `<option value="">Everyone</option>` + names.map(n => `<option ${n===cur?"selected":""}>${esc(n)}</option>`).join("");
+  f.innerHTML = `<option value="">Everyone</option>` + names.map(n => `<option value="${esc(n)}" ${n===cur?"selected":""}>${esc(n)}</option>`).join("");
   renderRequests();
 }
 
@@ -357,7 +357,7 @@ function fillSelect(name, options, current, placeholder){
   const sel = form.elements[name];
   const opts = options.slice();
   if (current && !opts.some(o => o.value === current)) opts.unshift({value: current, label: current});
-  sel.innerHTML = `<option value="">${placeholder}</option>` + opts.map(o =>
+  sel.innerHTML = `<option value="">${esc(placeholder)}</option>` + opts.map(o =>
     `<option value="${esc(o.value)}" ${o.value === current ? "selected" : ""}>${esc(o.label)}</option>`).join("");
 }
 let settings = {};
