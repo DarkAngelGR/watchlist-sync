@@ -19,6 +19,7 @@ import ipaddress
 import json
 import logging
 import os
+import posixpath
 import re
 import sqlite3
 import sys
@@ -80,11 +81,14 @@ FIELDS = {
 SECRETS = ("plex_token", "sonarr_api_key", "radarr_api_key", "bazarr_api_key", "tmdb_api_key")
 
 
-def cast(typ, v):
+def cast(typ, v, default=None):
     if typ is bool:
         return as_bool(v)
     if typ is int:
-        return max(1, int(v))
+        try:
+            return max(1, int(v))
+        except (ValueError, TypeError):
+            return default if default is not None else 1
     return str(v if v is not None else "").strip()
 
 
@@ -93,13 +97,17 @@ class Settings:
         self.state = state
 
     def _saved(self):
-        return json.loads(self.state.get("settings", "{}"))
+        try:
+            data = json.loads(self.state.get("settings", "{}"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
 
     def all(self):
         d = {}
         for k, (env_name, default, typ) in FIELDS.items():
             raw = os.environ.get(env_name)
-            d[k] = cast(typ, raw) if raw not in (None, "") else default
+            d[k] = cast(typ, raw, default) if raw not in (None, "") else default
         d.update(self._saved())
         return d
 
@@ -110,7 +118,7 @@ class Settings:
                 continue
             if k in SECRETS and v in (None, "") and k != "plex_token":
                 continue  # blank secret in the form = keep the existing one
-            saved[k] = cast(FIELDS[k][2], v)
+            saved[k] = cast(FIELDS[k][2], v, FIELDS[k][1])
         self.state.set("settings", json.dumps(saved))
 
     def public(self):
@@ -162,22 +170,29 @@ class State:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.lock = threading.Lock()
-        with self.db:
-            self.db.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)")
-            self.db.execute("CREATE TABLE IF NOT EXISTS guid_cache (rating_key TEXT PRIMARY KEY, guids TEXT)")
-            self.db.execute(
-                "CREATE TABLE IF NOT EXISTS auto_fetch (trigger TEXT PRIMARY KEY, tmdb INTEGER NOT NULL, "
-                "ts INTEGER NOT NULL, status TEXT NOT NULL)"
-            )
-            self.db.execute(
-                "CREATE TABLE IF NOT EXISTS handled (service TEXT, ext_id INTEGER, title TEXT, users TEXT, "
-                "result TEXT, ts INTEGER, PRIMARY KEY (service, ext_id))"
-            )
-            # who has each title on their watchlist right now (refreshed every sync)
-            self.db.execute(
-                "CREATE TABLE IF NOT EXISTS wants (service TEXT, ext_id INTEGER, user TEXT, "
-                "PRIMARY KEY (service, ext_id, user))"
-            )
+        with self.lock:
+            try:
+                self.db.execute("PRAGMA journal_mode=WAL")
+                self.db.execute("PRAGMA synchronous=NORMAL")
+                self.db.execute("PRAGMA busy_timeout=5000")
+            except Exception:
+                pass
+            with self.db:
+                self.db.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)")
+                self.db.execute("CREATE TABLE IF NOT EXISTS guid_cache (rating_key TEXT PRIMARY KEY, guids TEXT)")
+                self.db.execute(
+                    "CREATE TABLE IF NOT EXISTS auto_fetch (trigger TEXT PRIMARY KEY, tmdb INTEGER NOT NULL, "
+                    "ts INTEGER NOT NULL, status TEXT NOT NULL)"
+                )
+                self.db.execute(
+                    "CREATE TABLE IF NOT EXISTS handled (service TEXT, ext_id INTEGER, title TEXT, users TEXT, "
+                    "result TEXT, ts INTEGER, PRIMARY KEY (service, ext_id))"
+                )
+                # who has each title on their watchlist right now (refreshed every sync)
+                self.db.execute(
+                    "CREATE TABLE IF NOT EXISTS wants (service TEXT, ext_id INTEGER, user TEXT, "
+                    "PRIMARY KEY (service, ext_id, user))"
+                )
 
     def get(self, k, default=None):
         with self.lock:
@@ -191,7 +206,12 @@ class State:
     def cached_guids(self, rk):
         with self.lock:
             row = self.db.execute("SELECT guids FROM guid_cache WHERE rating_key=?", (rk,)).fetchone()
-        return json.loads(row[0]) if row else None
+        if not row:
+            return None
+        try:
+            return json.loads(row[0])
+        except Exception:
+            return None
 
     def cache_guids(self, rk, guids):
         with self.lock, self.db:
@@ -212,17 +232,17 @@ class State:
 
     def reserve_auto(self, trigger, tmdb):
         now = int(time.time())
-        with self.lock, self.db:
-            self.db.execute("BEGIN IMMEDIATE")
+        with self.lock:
             existing = self.db.execute("SELECT tmdb, status FROM auto_fetch WHERE trigger=?", (trigger,)).fetchone()
             if existing:
                 return existing[1] if existing[0] == tmdb else "trigger-conflict"
             if self.db.execute(
-                "SELECT 1 FROM auto_fetch WHERE status='pending' OR (status='added' AND ts > ?) LIMIT 1",
-                (now - 7 * 86400,),
+                "SELECT 1 FROM auto_fetch WHERE (status='pending' AND ts > ?) OR (status='added' AND ts > ?) LIMIT 1",
+                (now - 120, now - 7 * 86400),
             ).fetchone():
                 return "quota-reached"
-            self.db.execute("INSERT INTO auto_fetch VALUES (?, ?, ?, 'pending')", (trigger, tmdb, now))
+            with self.db:
+                self.db.execute("INSERT INTO auto_fetch VALUES (?, ?, ?, 'pending')", (trigger, tmdb, now))
             return "reserved"
 
     def finish_auto(self, trigger, status):
@@ -282,6 +302,19 @@ class State:
         return [dict(zip(("service", "id", "title", "users", "result", "ts"), r)) for r in rows]
 
 
+def redact_secrets(text, secrets=None):
+    if not text:
+        return "" if text is None else text
+    s = str(text)
+    s = re.sub(r"([?&](?:api_?key|token|password)=)[^& \'\"]+", r"\1[REDACTED]", s, flags=re.IGNORECASE)
+    s = re.sub(r"(Bearer\s+)[A-Za-z0-9._~+/-]+", r"\1[REDACTED]", s)
+    if secrets:
+        for sec in secrets:
+            if sec and len(str(sec)) >= 4:
+                s = s.replace(str(sec), "[REDACTED]")
+    return s
+
+
 # --------------------------------------------------------------------------- http
 def request(session, method, url, retries=4, **kw):
     """HTTP with backoff on 429/5xx and network errors."""
@@ -293,7 +326,7 @@ def request(session, method, url, retries=4, **kw):
         except requests.RequestException as e:
             if attempt == retries:
                 raise
-            log.debug("network error %s %s: %s", method, url, e)
+            log.debug("network error %s %s: %s", method, redact_secrets(url), redact_secrets(e))
         else:
             if r.status_code != 429 and r.status_code < 500:
                 return r
@@ -651,9 +684,32 @@ class Syncer:
         self.wake = threading.Event()
         self.cfg = None
         self.lock = threading.Lock()      # one sync or exclusion at a time
-        self.tv_write_lock = threading.Lock()
+        self.tv_write_lock = threading.RLock()
+        self.cache_lock = threading.Lock()
+        self.action_lock = threading.Lock()
         self.tv_searches = {}
         self.action = None                # progress/result of the last exclude, shown in the UI
+
+    def get_action(self):
+        with self.action_lock:
+            if not self.action:
+                return None
+            return {
+                "user": self.action.get("user", ""),
+                "state": self.action.get("state", ""),
+                "deleted": list(self.action.get("deleted") or []),
+                "untagged": list(self.action.get("untagged") or []),
+                "errors": list(self.action.get("errors") or []),
+                "total": self.action.get("total", 0),
+            }
+
+    def all_secrets(self):
+        s = self.settings.all()
+        sec = [s.get(k) for k in SECRETS]
+        rec = os.environ.get("RECOMMEND_API_KEY")
+        if rec:
+            sec.append(rec)
+        return [x for x in sec if x and len(str(x)) >= 4]
 
     # -- setup helpers
     def build(self):
@@ -810,13 +866,13 @@ class Syncer:
         """Block the user now; delete their media in the background."""
         plan = self.deletion_plan(username)
         self._set_blocked(username, True)
-        self.action = {"user": username, "state": "running", "deleted": [], "untagged": [], "errors": [],
-                       "total": len(plan["delete"]) if delete_media else 0}
+        with self.action_lock:
+            self.action = {"user": username, "state": "running", "deleted": [], "untagged": [], "errors": [],
+                           "total": len(plan["delete"]) if delete_media else 0}
         threading.Thread(target=self._do_exclude, args=(username, plan, delete_media), daemon=True).start()
         return plan
 
     def _do_exclude(self, username, plan, delete_media):
-        act = self.action
         with self.lock:
             try:
                 cfg = self.build()
@@ -828,7 +884,9 @@ class Syncer:
                         try:
                             if cfg.dry_run:
                                 log.info("[dry-run] would delete '%s' and its files", it["title"])
-                                act["deleted"].append(it["title"])
+                                with self.action_lock:
+                                    if self.action:
+                                        self.action["deleted"].append(it["title"])
                                 continue
                             if not arr:
                                 raise RuntimeError(f"{it['service'].title()} isn't configured")
@@ -836,10 +894,14 @@ class Syncer:
                             if obj:
                                 arr.delete(obj)
                             self.state.forget(it["service"], it["id"])
-                            act["deleted"].append(it["title"])
+                            with self.action_lock:
+                                if self.action:
+                                    self.action["deleted"].append(it["title"])
                             log.info("Deleted '%s' and its files (requested by %s)", it["title"], username)
                         except Exception as e:
-                            act["errors"].append(f"{it['title']}: {e}")
+                            with self.action_lock:
+                                if self.action:
+                                    self.action["errors"].append(f"{it['title']}: {e}")
                             log.error("Could not delete '%s': %s", it["title"], e)
                 # titles other people still want: just drop this user's tag
                 if cfg.tag_by_user and not cfg.dry_run:
@@ -849,11 +911,17 @@ class Syncer:
                             obj = arr.find(it["id"]) if arr else None
                             if obj:
                                 arr.remove_tag(obj, username)
-                                act["untagged"].append(it["title"])
+                                with self.action_lock:
+                                    if self.action:
+                                        self.action["untagged"].append(it["title"])
                         except Exception as e:
-                            act["errors"].append(f"{it['title']} (tag): {e}")
+                            with self.action_lock:
+                                if self.action:
+                                    self.action["errors"].append(f"{it['title']} (tag): {e}")
             finally:
-                act["state"] = "done"
+                with self.action_lock:
+                    if self.action:
+                        self.action["state"] = "done"
 
     def _group_by(self, items, id_type, summary):
         """Merge watchlist entries that point at the same TVDB/TMDB id."""
@@ -1078,7 +1146,11 @@ class Syncer:
         groups = {}
         params = {"includeEpisode": "true"} if kind == "show" else {}
         for rec in arr.queue_records(**params):
+            if not isinstance(rec, dict):
+                continue
             obj = rec.get("movie" if kind == "movie" else "series") or {}
+            if not isinstance(obj, dict):
+                obj = {}
             key = rec.get("movieId" if kind == "movie" else "seriesId")
             if key is None:
                 continue
@@ -1089,19 +1161,19 @@ class Syncer:
                 "poster": self._poster(obj), "size": 0, "sizeleft": 0, "timeleft": None,
                 "status": st, "episodes": [],
             })
-            g["size"] += rec.get("size") or 0
-            g["sizeleft"] += rec.get("sizeleft") or 0
+            g["size"] += max(0, rec.get("size") or 0)
+            g["sizeleft"] += max(0, rec.get("sizeleft") or 0)
             t = self._secs(rec.get("timeleft"))
             if t is not None:
                 g["timeleft"] = max(g["timeleft"] or 0, t)
-            if rank[st] < rank[g["status"]]:
+            if rank.get(st, 99) < rank.get(g["status"], 99):
                 g["status"] = st
             ep = rec.get("episode") or {}
-            if ep.get("episodeNumber") is not None:
+            if isinstance(ep, dict) and ep.get("episodeNumber") is not None:
                 g["episodes"].append("S%02dE%02d" % (ep.get("seasonNumber") or 0, ep["episodeNumber"]))
         out = []
         for g in groups.values():
-            g["progress"] = round(100 * (1 - g["sizeleft"] / g["size"]), 1) if g["size"] else 0
+            g["progress"] = max(0.0, min(100.0, round(100 * (1 - g["sizeleft"] / g["size"]), 1))) if g["size"] else 0
             eps = sorted(set(g.pop("episodes")))
             g["detail"] = eps[0] if len(eps) == 1 else (f"{len(eps)} episodes" if eps else "")
             out.append(g)
@@ -1115,7 +1187,9 @@ class Syncer:
         recent = [r for r in self.state.recent(500) if r["service"] == service and r["ts"] >= since]
         legacy = {r["id"] for r in recent if r["result"] == "added"}
         observed = {r["id"] for r in recent if r["result"] in ("requested", "auto-requested")}
-        observed.update(ext for (k, ext), until in tuple(self.tv_searches.items()) if k == kind and until > time.monotonic())
+        with self.tv_write_lock:
+            searches = tuple(self.tv_searches.items())
+        observed.update(ext for (k, ext), until in searches if k == kind and until > time.monotonic())
         if not (legacy or observed):
             return []
         commands = set()
@@ -1127,7 +1201,13 @@ class Syncer:
         r = request(arr.s, "GET", arr.base + ("/movie" if kind == "movie" else "/series"), retries=0, timeout=10)
         r.raise_for_status()
         out = []
-        for obj in r.json():
+        try:
+            items = r.json()
+        except Exception:
+            items = []
+        for obj in (items if isinstance(items, list) else []):
+            if not isinstance(obj, dict):
+                continue
             ext = obj.get("tmdbId" if kind == "movie" else "tvdbId")
             verified = ext in observed and obj.get("id") in commands
             if (ext not in legacy and not verified) or ext in queued_ids:
@@ -1150,10 +1230,11 @@ class Syncer:
         """The Radarr collection a movie belongs to, with every part (owned or
         not). Radarr keeps a collection for any movie it manages; for one it
         doesn't, there's nothing to list. {'collection': None} when unknown."""
-        cache = self.__dict__.setdefault("_collection_cache", {})
-        hit = cache.get(tmdb)
-        if hit and time.time() - hit[0] < self.COLLECTION_TTL:
-            return hit[1]
+        with self.cache_lock:
+            cache = self.__dict__.setdefault("_collection_cache", {})
+            hit = cache.get(tmdb)
+            if hit and time.time() - hit[0] < self.COLLECTION_TTL:
+                return hit[1]
         cfg = Config(self.settings.all())
         if not cfg.radarr.enabled:
             return {"collection": None, "reason": "radarr not set up"}
@@ -1161,26 +1242,37 @@ class Syncer:
         get = lambda path, **params: request(arr.s, "GET", arr.base + path, retries=0, params=params, timeout=10)
         r = get("/movie", tmdbId=tmdb)
         r.raise_for_status()
-        movies = r.json()
-        movie = movies[0] if movies else None
+        try:
+            movies = r.json()
+        except Exception:
+            movies = []
+        movie = movies[0] if isinstance(movies, list) and movies and isinstance(movies[0], dict) else None
         coll = (movie or {}).get("collection") or {}
         if not coll.get("tmdbId"):
             # Not in Radarr: its lookup still names the collection.
             r = get("/movie/lookup/tmdb", tmdbId=tmdb)
             if r.status_code == 200:
-                coll = (r.json() or {}).get("collection") or {}
+                try:
+                    coll = (r.json() or {}).get("collection") or {}
+                except Exception:
+                    coll = {}
         if not coll.get("tmdbId"):
             result = {"collection": None}
         else:
             r = get("/collection", tmdbId=coll["tmdbId"])
             r.raise_for_status()
-            found = r.json() or []
-            c = found[0] if found else None
+            try:
+                found = r.json() or []
+            except Exception:
+                found = []
+            c = found[0] if isinstance(found, list) and found and isinstance(found[0], dict) else None
             if not c:
                 result = {"collection": None, "title": coll.get("title")}
             else:
                 parts = []
-                for m in c.get("movies") or []:
+                for m in (c.get("movies") or []):
+                    if not isinstance(m, dict):
+                        continue
                     tid = m.get("tmdbId")
                     have = m.get("isExisting")
                     entry = {"tmdb": tid, "title": m.get("title") or "?", "year": m.get("year"),
@@ -1188,13 +1280,19 @@ class Syncer:
                              "hasFile": False, "monitored": False}
                     if have is None or have:
                         rr = get("/movie", tmdbId=tid)
-                        if rr.status_code == 200 and rr.json():
-                            rm = rr.json()[0]
-                            entry.update(inRadarr=True, hasFile=bool(rm.get("hasFile")), monitored=bool(rm.get("monitored")))
+                        if rr.status_code == 200:
+                            try:
+                                rm_list = rr.json()
+                                if isinstance(rm_list, list) and rm_list and isinstance(rm_list[0], dict):
+                                    rm = rm_list[0]
+                                    entry.update(inRadarr=True, hasFile=bool(rm.get("hasFile")), monitored=bool(rm.get("monitored")))
+                            except Exception:
+                                pass
                     parts.append(entry)
                 parts.sort(key=lambda x: (x["year"] or 9999, x["title"]))
                 result = {"collection": {"title": c.get("title") or coll.get("title"), "tmdb": coll["tmdbId"], "movies": parts}}
-        cache[tmdb] = (time.time(), result)
+        with self.cache_lock:
+            cache[tmdb] = (time.time(), result)
         return result
 
     # -- finding and requesting titles from a TV (Jellyfin has no Watchlist)
@@ -1202,21 +1300,27 @@ class Syncer:
 
     def _library(self, arr, kind, *, fresh=False):
         """Map IDs to an Arr status and whether monitored files are still missing."""
-        cache = self.__dict__.setdefault("_library_cache", {})
-        hit = cache.get(kind)
-        if not fresh and hit and time.time() - hit[0] < self.LIBRARY_TTL:
-            return hit[1]
+        with self.cache_lock:
+            cache = self.__dict__.setdefault("_library_cache", {})
+            hit = cache.get(kind)
+            if not fresh and hit and time.time() - hit[0] < self.LIBRARY_TTL:
+                return hit[1]
         out = {}
         if kind == "movie":
-            for m in arr.get("/movie"):
+            for m in (arr.get("/movie") or []):
+                if not isinstance(m, dict):
+                    continue
                 have = bool(m.get("hasFile"))
                 out[m.get("tmdbId")] = ("have" if have else "requested", not have)
         else:
-            for x in arr.get("/series"):
+            for x in (arr.get("/series") or []):
+                if not isinstance(x, dict):
+                    continue
                 stats = x.get("statistics") or {}
                 files = stats.get("episodeFileCount") or 0
                 out[x.get("tvdbId")] = ("have" if files else "requested", not files or files < (stats.get("episodeCount") or 0))
-        cache[kind] = (time.time(), out)
+        with self.cache_lock:
+            cache[kind] = (time.time(), out)
         return out
 
     def _lookup_item(self, kind, x, library):
@@ -1255,7 +1359,7 @@ class Syncer:
             found = arr.get("/movie/lookup" if kind == "movie" else "/series/lookup", term=q)
         library = self._library(arr, kind, fresh=fresh)
         key = "tmdbId" if kind == "movie" else "tvdbId"
-        return {"items": [self._lookup_item(kind, x, library) for x in (found or [])[:30] if x.get(key)]}
+        return {"items": [self._lookup_item(kind, x, library) for x in (found or [])[:30] if isinstance(x, dict) and x.get(key)]}
 
     # -- what to watch next, for Orama's Discover rows (GET /api/tv/discover)
     DISCOVER_TTL = 3 * 3600
@@ -1276,13 +1380,22 @@ class Syncer:
         """This week's trending shows from TMDB, with their TVDB ids (Sonarr's)."""
         out = []
         try:
-            genres = {g["id"]: g["name"] for g in self._tmdb(key, "/genre/tv/list").get("genres", [])}
-        except requests.RequestException:
+            genres_resp = self._tmdb(key, "/genre/tv/list")
+            genres = {g["id"]: g["name"] for g in genres_resp.get("genres", []) if isinstance(g, dict) and "id" in g and "name" in g} if isinstance(genres_resp, dict) else {}
+        except (requests.RequestException, ValueError, TypeError):
             genres = {}
-        for x in (self._tmdb(key, "/trending/tv/week").get("results") or [])[:20]:
+        try:
+            trending_resp = self._tmdb(key, "/trending/tv/week")
+            results = trending_resp.get("results") if isinstance(trending_resp, dict) else []
+        except (requests.RequestException, ValueError, TypeError):
+            results = []
+        for x in (results if isinstance(results, list) else [])[:20]:
+            if not isinstance(x, dict):
+                continue
             try:
-                tvdb = (self._tmdb(key, f"/tv/{x['id']}/external_ids") or {}).get("tvdb_id")
-            except requests.RequestException:
+                ext_resp = self._tmdb(key, f"/tv/{x['id']}/external_ids") if x.get("id") else {}
+                tvdb = ext_resp.get("tvdb_id") if isinstance(ext_resp, dict) else None
+            except (requests.RequestException, ValueError, TypeError):
                 continue
             if not tvdb or tvdb in have:
                 continue
@@ -1303,16 +1416,24 @@ class Syncer:
         """Titles you don't have yet: trending and popular movies and movies
         recommended from your library (Radarr's Discover, no key needed), and
         trending shows when a TMDB key is set. {'sections': [{id, title, items}]}."""
-        hit = self.__dict__.get("_discover_cache")
-        if hit and time.time() - hit[0] < self.DISCOVER_TTL:
-            return hit[1]
+        with self.cache_lock:
+            hit = getattr(self, "_discover_cache", None)
+            if hit and time.time() - hit[0] < self.DISCOVER_TTL:
+                return hit[1]
         cfg = Config(self.settings.all())
         trending_m, popular, recommended, shows, notes = [], [], [], [], []
         if cfg.radarr.enabled:
             arr = Arr("Radarr", cfg.radarr)
             lib = self._library(arr, "movie")
-            raw = arr.get("/importlist/movie", includeRecommendations="true", includeTrending="true", includePopular="true")
-            for x in raw or []:
+            try:
+                raw = arr.get("/importlist/movie", includeRecommendations="true", includeTrending="true", includePopular="true")
+            except requests.RequestException as e:
+                err_msg = redact_secrets(e, self.all_secrets())
+                notes.append("Radarr: " + str(err_msg)[:120])
+                raw = []
+            for x in (raw if isinstance(raw, list) else []):
+                if not isinstance(x, dict):
+                    continue
                 if x.get("isExisting") or x.get("isExcluded") or not x.get("tmdbId") or x.get("tmdbId") in lib:
                     continue
                 it = self._lookup_item("movie", x, lib)
@@ -1330,8 +1451,9 @@ class Syncer:
             try:
                 shows = self._trending_shows(cfg.tmdb_key, self._library(Arr("Sonarr", cfg.sonarr), "show"))
             except requests.RequestException as e:
-                log.warning("TMDB trending shows failed: %s", e)
-                notes.append("TMDB: " + str(e)[:120])
+                err_msg = redact_secrets(e, [cfg.tmdb_key])
+                log.warning("TMDB trending shows failed: %s", err_msg)
+                notes.append("TMDB: " + str(err_msg)[:120])
         trending = []
         for i in range(max(len(trending_m), len(shows))):     # movies and shows, alternating
             trending += [x for x in (trending_m[i:i + 1] + shows[i:i + 1])]
@@ -1341,52 +1463,55 @@ class Syncer:
             {"id": "popular", "title": "Popular movies", "items": [m for m in popular if m not in trending_m][:30]},
         ]
         res = {"sections": [x for x in sections if x["items"]], "notes": notes}
-        self._discover_cache = (time.time(), res)
+        with self.cache_lock:
+            self._discover_cache = (time.time(), res)
         return res
 
     def tv_request(self, kind, ext_id, user="", *, cfg=None, arr=None, root=None):
         """Add a movie to Radarr or a show to Sonarr, the way a watchlist add
         would (same profiles, folders, anime handling and search)."""
-        auto = arr is not None
-        cfg = cfg or Config(self.settings.all())
-        arr_cfg = cfg.radarr if kind == "movie" else cfg.sonarr
-        svc = "Radarr" if kind == "movie" else "Sonarr"
-        if not arr_cfg.enabled:
-            raise LookupError(svc + " isn't set up in watchlist-sync")
-        arr = arr or Arr(svc, arr_cfg)
-        service = svc.lower()
-        users = {user} if user else {"tv"}
-        if arr.find(ext_id):
-            return {"ok": True, "status": "already-there", "service": svc}
-        if kind == "movie":
-            movie = arr.get("/movie/lookup/tmdb", tmdbId=ext_id)
-            movie = movie[0] if isinstance(movie, list) and movie else movie
-            if not movie:
-                raise LookupError(f"{svc} couldn't find that movie")
-            if cfg.dry_run:
-                return {"ok": True, "status": "dry-run", "service": svc}
-            body = self._radarr_body(arr, cfg, movie, users, arr.quality_profile_id(), root or arr.root_folder())
-            title, anime = movie.get("title") or "?", False
-        else:
-            found = arr.get("/series/lookup", term=f"tvdb:{ext_id}")
-            if not found:
-                raise LookupError(f"{svc} couldn't find that show")
-            if cfg.dry_run:
-                return {"ok": True, "status": "dry-run", "service": svc}
-            body, anime = self._sonarr_body(arr, cfg, self._sonarr_ctx(arr, cfg), found[0], users)
-            title = found[0].get("title") or "?"
-        try:
-            arr.post("/movie" if kind == "movie" else "/series", body, retries=0 if auto else 4)
-        except ArrError as e:
-            if e.already_exists:
+        with self.tv_write_lock:
+            auto = arr is not None
+            cfg = cfg or Config(self.settings.all())
+            arr_cfg = cfg.radarr if kind == "movie" else cfg.sonarr
+            svc = "Radarr" if kind == "movie" else "Sonarr"
+            if not arr_cfg.enabled:
+                raise LookupError(svc + " isn't set up in watchlist-sync")
+            arr = arr or Arr(svc, arr_cfg)
+            service = svc.lower()
+            users = {user} if user else {"tv"}
+            if arr.find(ext_id):
                 return {"ok": True, "status": "already-there", "service": svc}
-            raise
-        self.state.mark(service, ext_id, title, users, "auto-requested" if auto else "requested")
-        self.__dict__.get("_library_cache", {}).pop(kind, None)
-        self.__dict__.pop("_discover_cache", None)
-        self.__dict__.pop("_queue_cache", None)
-        log.info("Added %s '%s' requested from a TV by %s", "anime" if anime else kind, title, ", ".join(users))
-        return {"ok": True, "status": "added", "service": svc, "title": title}
+            if kind == "movie":
+                movie = arr.get("/movie/lookup/tmdb", tmdbId=ext_id)
+                movie = movie[0] if isinstance(movie, list) and movie else movie
+                if not movie:
+                    raise LookupError(f"{svc} couldn't find that movie")
+                if cfg.dry_run:
+                    return {"ok": True, "status": "dry-run", "service": svc}
+                body = self._radarr_body(arr, cfg, movie, users, arr.quality_profile_id(), root or arr.root_folder())
+                title, anime = movie.get("title") or "?", False
+            else:
+                found = arr.get("/series/lookup", term=f"tvdb:{ext_id}")
+                if not found:
+                    raise LookupError(f"{svc} couldn't find that show")
+                if cfg.dry_run:
+                    return {"ok": True, "status": "dry-run", "service": svc}
+                body, anime = self._sonarr_body(arr, cfg, self._sonarr_ctx(arr, cfg), found[0], users)
+                title = found[0].get("title") or "?"
+            try:
+                arr.post("/movie" if kind == "movie" else "/series", body, retries=0 if auto else 4)
+            except ArrError as e:
+                if e.already_exists:
+                    return {"ok": True, "status": "already-there", "service": svc}
+                raise
+            self.state.mark(service, ext_id, title, users, "auto-requested" if auto else "requested")
+            with self.cache_lock:
+                self.__dict__.get("_library_cache", {}).pop(kind, None)
+                self.__dict__.pop("_discover_cache", None)
+                self.__dict__.pop("_queue_cache", None)
+            log.info("Added %s '%s' requested from a TV by %s", "anime" if anime else kind, title, ", ".join(users))
+            return {"ok": True, "status": "added", "service": svc, "title": title}
 
     def tv_search_again(self, kind, ext_id):
         with self.tv_write_lock:
@@ -1477,7 +1602,9 @@ class Syncer:
                 root = arr.root_folder(folders=folders)
             except RuntimeError:
                 return {"status": "space-unavailable"}
-            folder = next(f for f in folders if f["path"] == root)
+            folder = next((f for f in folders if isinstance(f, dict) and f.get("path") == root), None)
+            if not folder:
+                return {"status": "space-unavailable"}
             free = folder.get("freeSpace")
             if folder.get("accessible") is not True or type(free) is not int:
                 return {"status": "space-unavailable"}
@@ -1588,18 +1715,30 @@ class Syncer:
             raise LookupError("Bazarr rejected the API key")
         if r.status_code >= 400:
             raise LookupError("Bazarr: " + (r.text.strip().strip('"')[:200] or f"HTTP {r.status_code}"))
-        found = (r.json() or {}).get("data") or []
+        try:
+            payload = r.json() or {}
+        except Exception:
+            raise LookupError("Bazarr returned invalid JSON")
+        found = payload.get("data") if isinstance(payload, dict) else []
+        if not isinstance(found, list):
+            found = []
         want = (lang or "").lower()
         results = []
         for x in found:
+            if not isinstance(x, dict):
+                continue
             code = str(x.get("language") or "").split(":")[0].lower()
             if want and code != want:
                 continue
+            try:
+                score = float(x.get("score") or 0)
+            except (ValueError, TypeError):
+                score = 0.0
             results.append({
                 "provider": x.get("provider") or "", "language": code,
                 "hi": str(x.get("hearing_impaired")).lower() == "true",
                 "forced": str(x.get("forced")).lower() == "true",
-                "score": x.get("score") or 0, "release": (x.get("release_info") or [""])[0] or "",
+                "score": score, "release": (x.get("release_info") or [""])[0] or "",
                 "uploader": x.get("uploader") or "",
                 "_post": {"hi": str(x.get("hearing_impaired") or "False"), "forced": str(x.get("forced") or "False"),
                           "original_format": str(x.get("original_format") or "False"),
@@ -1608,16 +1747,18 @@ class Syncer:
         results.sort(key=lambda x: -x["score"])
         results = results[:40]
         token = uuid.uuid4().hex
-        cache = self.__dict__.setdefault("_subs_cache", {})
         now = time.time()
-        for k in [k for k, v in cache.items() if now - v["at"] > self.SUBS_TTL]:
-            del cache[k]
-        cache[token] = {"at": now, "kind": kind, "target": target, "results": results}
+        with self.cache_lock:
+            cache = self.__dict__.setdefault("_subs_cache", {})
+            for k in [k for k, v in cache.items() if now - v["at"] > self.SUBS_TTL]:
+                del cache[k]
+            cache[token] = {"at": now, "kind": kind, "target": target, "results": results}
         return {"token": token, "results": [{k: v for k, v in x.items() if k != "_post"} for x in results]}
 
     def tv_subtitle_download(self, token, index):
         cfg, base, headers = self._bazarr()
-        entry = self.__dict__.get("_subs_cache", {}).get(token)
+        with self.cache_lock:
+            entry = self.__dict__.get("_subs_cache", {}).get(token)
         if not entry or time.time() - entry["at"] > self.SUBS_TTL:
             raise LookupError("Those search results expired; search again")
         if not (0 <= index < len(entry["results"])):
@@ -1636,9 +1777,10 @@ class Syncer:
 
     def tv_upcoming(self, days=7):
         days = max(1, min(30, int(days)))
-        hit = self.__dict__.get("_upcoming_cache")
-        if hit and hit[0] == days and time.time() - hit[1] < self.UPCOMING_TTL:
-            return hit[2]
+        with self.cache_lock:
+            hit = self.__dict__.get("_upcoming_cache")
+            if hit and hit[0] == days and time.time() - hit[1] < self.UPCOMING_TTL:
+                return hit[2]
         cfg = Config(self.settings.all())
         if not cfg.sonarr.enabled:
             return {"items": [], "reason": "sonarr not set up"}
@@ -1647,8 +1789,12 @@ class Syncer:
         end = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + days * 86400))
         eps = arr.get("/calendar", start=start, end=end, includeSeries="true", unmonitored="false")
         items = []
-        for e in eps:
+        for e in (eps if isinstance(eps, list) else []):
+            if not isinstance(e, dict):
+                continue
             se = e.get("series") or {}
+            if not isinstance(se, dict):
+                se = {}
             if e.get("hasFile"):
                 continue  # already here: it's in Plex
             items.append({
@@ -1659,7 +1805,8 @@ class Syncer:
             })
         items.sort(key=lambda x: x["air"])
         res = {"items": items[:40]}
-        self._upcoming_cache = (days, time.time(), res)
+        with self.cache_lock:
+            self._upcoming_cache = (days, time.time(), res)
         return res
 
     @staticmethod
@@ -1671,9 +1818,10 @@ class Syncer:
 
     def tv_queue(self):
         now = time.time()
-        cached = getattr(self, "_queue_cache", None)
-        if cached and now - cached[0] < self.QUEUE_TTL:
-            return cached[1]
+        with self.cache_lock:
+            cached = getattr(self, "_queue_cache", None)
+            if cached and now - cached[0] < self.QUEUE_TTL:
+                return cached[1]
         cfg = Config(self.settings.all())
         items, errors = [], {}
         for name, acfg, kind in (("radarr", cfg.radarr, "movie"), ("sonarr", cfg.sonarr, "show")):
@@ -1686,14 +1834,15 @@ class Syncer:
                 items += q
                 try:
                     items += self._searching(arr, kind, ids)
-                except requests.RequestException as e:
+                except Exception as e:
                     log.debug("searching check failed for %s: %s", name, e)
-            except requests.RequestException as e:
-                errors[name] = str(e)[:200]
+            except Exception as e:
+                errors[name] = str(redact_secrets(e, self.all_secrets()))[:200]
         order = {"downloading": 0, "importing": 1, "stalled": 2, "paused": 3, "queued": 4, "searching": 5, "failed": 6}
         items.sort(key=lambda x: (order.get(x["status"], 9), -(x["progress"] or 0)))
         result = {"items": items, "errors": errors}
-        self._queue_cache = (now, result)
+        with self.cache_lock:
+            self._queue_cache = (now, result)
         return result
 
     def _nudge_bazarr(self, summary, cfg=None):
@@ -1850,8 +1999,11 @@ def make_handler(syncer, ui_password):
         page = f.read()
 
     class H(BaseHTTPRequestHandler):
+        def _clean_path(self):
+            return posixpath.normpath(urlparse(self.path).path)
+
         def _tv(self):
-            return self.path.split("?")[0].startswith("/api/tv")
+            return self._clean_path().startswith("/api/tv")
 
         def _cors(self):
             # Only the TV endpoints are cross-origin: a TV app's page isn't served
@@ -1871,6 +2023,10 @@ def make_handler(syncer, ui_password):
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "SAMEORIGIN")
+            if ctype.startswith("text/html"):
+                self.send_header("Content-Security-Policy", "default-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'")
             self._cors()
             self.end_headers()
             self.wfile.write(body)
@@ -1896,7 +2052,8 @@ def make_handler(syncer, ui_password):
             self.end_headers()
 
         def _authed(self):
-            if not ui_password or self.path.startswith("/health"):
+            p = self._clean_path()
+            if not ui_password or p == "/health":
                 return True
             hdr = self.headers.get("Authorization", "")
             if hdr.startswith("Basic "):
@@ -1912,19 +2069,29 @@ def make_handler(syncer, ui_password):
             else:
                 self.send_header("WWW-Authenticate", 'Basic realm="watchlist-sync"')
             self.send_header("Content-Length", "0")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "SAMEORIGIN")
             self.end_headers()
             return False
 
         def _body(self):
-            n = int(self.headers.get("Content-Length") or 0)
-            return json.loads(self.rfile.read(n) or b"{}") if n else {}
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except (ValueError, TypeError):
+                raise ValueError("bad content length")
+            if n < 0:
+                raise ValueError("negative content length")
+            if n > 1_048_576:
+                raise OverflowError("payload too large")
+            raw = self.rfile.read(n) if n else b"{}"
+            return json.loads(raw or b"{}")
 
         def do_GET(self):
-            if not self.path.startswith("/health") and not self._guard():
+            p = self._clean_path()
+            if p != "/health" and not self._guard():
                 return
             if not self._authed():
                 return
-            p = self.path.split("?")[0]
             if p == "/health":
                 return self._send(200, {"ok": True})
             if p == "/":
@@ -1941,7 +2108,7 @@ def make_handler(syncer, ui_password):
                     "last_run": syncer.last_run,
                     "users": syncer.users,
                     "recent": syncer.state.recent(),
-                    "action": syncer.action,
+                    "action": syncer.get_action(),
                 })
             if p == "/api/settings":
                 return self._send(200, syncer.settings.public())
@@ -1960,20 +2127,25 @@ def make_handler(syncer, ui_password):
                 qs = parse_qs(urlparse(self.path).query)
                 try:
                     tmdb = int((qs.get("tmdb") or [""])[0])
+                    if tmdb <= 0:
+                        raise ValueError
                 except ValueError:
                     return self._send(400, {"error": "tmdb id needed"})
                 try:
                     return self._send(200, syncer.tv_collection(tmdb))
                 except requests.RequestException as e:
-                    return self._send(502, {"error": "Radarr: " + str(e)[:200]})
+                    return self._send(502, {"error": "Radarr: " + str(redact_secrets(e, syncer.all_secrets()))[:200]})
             if p == "/api/tv/upcoming":
                 qs = parse_qs(urlparse(self.path).query)
                 try:
-                    return self._send(200, syncer.tv_upcoming(int((qs.get("days") or ["7"])[0])))
+                    days = int((qs.get("days") or ["7"])[0])
+                    if days < 1 or days > 365:
+                        raise ValueError
+                    return self._send(200, syncer.tv_upcoming(days))
                 except ValueError:
                     return self._send(400, {"error": "bad days"})
                 except requests.RequestException as e:
-                    return self._send(502, {"error": "Sonarr: " + str(e)[:200]})
+                    return self._send(502, {"error": "Sonarr: " + str(redact_secrets(e, syncer.all_secrets()))[:200]})
             if p == "/api/tv/lookup":
                 qs = parse_qs(urlparse(self.path).query)
                 q = lambda k, d="": (qs.get(k) or [d])[0]
@@ -1982,6 +2154,8 @@ def make_handler(syncer, ui_password):
                     return self._send(400, {"error": "kind must be movie or show"})
                 try:
                     ext_id = int(q("id", "0") or 0)
+                    if ext_id < 0:
+                        raise ValueError
                 except ValueError:
                     return self._send(400, {"error": "bad id"})
                 term = q("q").strip()[:200]
@@ -1992,12 +2166,12 @@ def make_handler(syncer, ui_password):
                 except LookupError as e:
                     return self._send(409, {"error": str(e)})
                 except requests.RequestException as e:
-                    return self._send(502, {"error": ("Radarr: " if kind == "movie" else "Sonarr: ") + str(e)[:200]})
+                    return self._send(502, {"error": ("Radarr: " if kind == "movie" else "Sonarr: ") + str(redact_secrets(e, syncer.all_secrets()))[:200]})
             if p == "/api/tv/discover":
                 try:
                     return self._send(200, syncer.tv_discover())
                 except requests.RequestException as e:
-                    return self._send(502, {"error": "Radarr: " + str(e)[:200]})
+                    return self._send(502, {"error": "Radarr: " + str(redact_secrets(e, syncer.all_secrets()))[:200]})
             if p == "/api/tv/subtitles":
                 qs = parse_qs(urlparse(self.path).query)
                 q = lambda k, d="": (qs.get(k) or [d])[0]
@@ -2006,30 +2180,39 @@ def make_handler(syncer, ui_password):
                     return self._send(400, {"error": "kind must be movie or episode"})
                 try:
                     num = lambda k: int(q(k, "0") or 0)
-                    res = syncer.tv_subtitle_search(kind, tmdb=num("tmdb"), tvdb=num("tvdb"), imdb=q("imdb"),
-                                                    season=num("season"), episode=num("episode"), lang=q("lang"))
+                    tmdb_v = num("tmdb")
+                    tvdb_v = num("tvdb")
+                    season_v = num("season")
+                    ep_v = num("episode")
+                    if tmdb_v < 0 or tvdb_v < 0 or season_v < 0 or ep_v < 0:
+                        raise ValueError
+                    res = syncer.tv_subtitle_search(kind, tmdb=tmdb_v, tvdb=tvdb_v, imdb=q("imdb").strip()[:20],
+                                                    season=season_v, episode=ep_v, lang=q("lang").strip()[:10])
                 except ValueError:
                     return self._send(400, {"error": "bad number"})
                 except LookupError as e:
                     return self._send(409, {"error": str(e)})
                 except requests.RequestException as e:
-                    return self._send(502, {"error": "Couldn't reach Bazarr/Sonarr/Radarr: " + str(e)[:150]})
+                    return self._send(502, {"error": "Couldn't reach Bazarr/Sonarr/Radarr: " + str(redact_secrets(e, syncer.all_secrets()))[:150]})
                 return self._send(200, res)
             m = re.fullmatch(r"/api/users/([^/]+)/plan", p)
             if m:
-                return self._send(200, syncer.deletion_plan(unquote(m.group(1))))
+                return self._send(200, syncer.deletion_plan(unquote(m.group(1)).strip()[:100]))
             m = re.fullmatch(r"/api/plex/pin/(\d+)", p)
             if m:
                 try:
                     token = plex_check_pin(syncer.client_id, m.group(1))
                 except Exception as e:
-                    return self._send(502, {"error": str(e)})
+                    return self._send(502, {"error": str(redact_secrets(e, syncer.all_secrets()))[:200]})
                 if not token:
                     return self._send(200, {"done": False})
-                acct = plex_account(syncer.client_id, token)
+                try:
+                    acct = plex_account(syncer.client_id, token)
+                except Exception as e:
+                    return self._send(502, {"error": str(redact_secrets(e, syncer.all_secrets()))[:200]})
                 syncer.settings.update({"plex_token": token})
                 syncer.state.set("plex_account", json.dumps(acct))
-                log.info("Signed in to Plex as %s", acct["username"])
+                log.info("Signed in to Plex as %s", acct.get("username", "?"))
                 syncer.wake.set()
                 return self._send(200, {"done": True, "account": acct})
             self._send(404, {"error": "not found"})
@@ -2039,11 +2222,13 @@ def make_handler(syncer, ui_password):
                 return
             if not self._authed():
                 return
-            p = self.path.split("?")[0]
+            p = self._clean_path()
             if p == "/api/tv/recommend":
                 return self._recommend()
             try:
                 body = self._body()
+            except OverflowError:
+                return self._send(413, {"error": "payload too large"})
             except ValueError:
                 return self._send(400, {"error": "bad json"})
             if not isinstance(body, dict):
@@ -2061,16 +2246,18 @@ def make_handler(syncer, ui_password):
                     return self._send(400, {"error": "kind must be movie or show"})
                 try:
                     ext_id = int(body.get("tmdb" if kind == "movie" else "tvdb") or 0)
+                    if ext_id < 0:
+                        raise ValueError
                 except (TypeError, ValueError):
                     ext_id = 0
-                imdb = str(body.get("imdb") or "")
+                imdb = str(body.get("imdb") or "").strip()[:20]
                 if not ext_id and not imdb:
                     return self._send(400, {"error": "No TMDB/TVDB or IMDb id for this title"})
                 try:
-                    return self._send(200, syncer.tv_delete(kind, ext_id, imdb, str(body.get("title") or "")))
+                    return self._send(200, syncer.tv_delete(kind, ext_id, imdb, str(body.get("title") or "").strip()[:200]))
                 except (requests.RequestException, ArrError) as e:
                     svc = "Radarr" if kind == "movie" else "Sonarr"
-                    return self._send(502, {"error": f"{svc}: {str(e)[:200]}"})
+                    return self._send(502, {"error": f"{svc}: {str(redact_secrets(e, syncer.all_secrets()))[:200]}"})
             if p == "/api/tv/auto-fetch":
                 return self._auto_fetch(body.get("tmdb"), body.get("triggerId"))
             if p in ("/api/tv/request", "/api/tv/search-again"):
@@ -2095,21 +2282,26 @@ def make_handler(syncer, ui_password):
                     return self._send(409, {"error": str(e)})
                 except (requests.RequestException, ArrError, RuntimeError) as e:
                     svc = "Radarr" if kind == "movie" else "Sonarr"
-                    return self._send(502, {"error": f"{svc}: {str(e)[:200]}"})
+                    return self._send(502, {"error": f"{svc}: {str(redact_secrets(e, syncer.all_secrets()))[:200]}"})
             if p == "/api/tv/subtitles/download":
+                token = str(body.get("token") or "").strip()[:64]
                 try:
-                    return self._send(200, syncer.tv_subtitle_download(str(body.get("token") or ""), int(body.get("index", -1))))
+                    idx = int(body.get("index", -1))
+                    if idx < 0:
+                        raise ValueError
                 except (TypeError, ValueError):
                     return self._send(400, {"error": "bad index"})
+                try:
+                    return self._send(200, syncer.tv_subtitle_download(token, idx))
                 except LookupError as e:
                     return self._send(409, {"error": str(e)})
                 except requests.RequestException as e:
-                    return self._send(502, {"error": "Couldn't reach Bazarr: " + str(e)[:150]})
+                    return self._send(502, {"error": "Couldn't reach Bazarr: " + str(redact_secrets(e, syncer.all_secrets()))[:150]})
             if p == "/api/plex/pin":
                 try:
                     return self._send(200, plex_create_pin(syncer.client_id))
                 except Exception as e:
-                    return self._send(502, {"error": f"Could not reach plex.tv: {e}"})
+                    return self._send(502, {"error": f"Could not reach plex.tv: {redact_secrets(e, syncer.all_secrets())}"})
             if p == "/api/plex/logout":
                 syncer.settings.update({"plex_token": ""})
                 syncer.state.set("plex_account", "null")
@@ -2122,20 +2314,23 @@ def make_handler(syncer, ui_password):
                 return self._send(200, syncer.settings.public())
             m = re.fullmatch(r"/api/users/([^/]+)/(exclude|include)", p)
             if m:
-                name = unquote(m.group(1))
+                name = unquote(m.group(1)).strip()[:100]
+                if not name:
+                    return self._send(400, {"error": "username required"})
                 if m.group(2) == "include":
                     syncer.include_user(name)
                     return self._send(200, {"ok": True})
-                if syncer.action and syncer.action.get("state") == "running":
-                    return self._send(409, {"error": "Another exclusion is still running"})
+                with syncer.action_lock:
+                    if syncer.action and syncer.action.get("state") == "running":
+                        return self._send(409, {"error": "Another exclusion is still running"})
                 plan = syncer.exclude_user(name, bool(body.get("delete")))
                 return self._send(200, {"ok": True, "plan": plan})
             m = re.fullmatch(r"/api/test/(sonarr|radarr|bazarr)", p)
             if m:
                 svc = m.group(1)
                 cur = syncer.settings.all()
-                url = (body.get("url") or cur[f"{svc}_url"]).strip()
-                key = (body.get("api_key") or cur[f"{svc}_api_key"]).strip()
+                url = str(body.get("url") or cur[f"{svc}_url"]).strip()[:500]
+                key = str(body.get("api_key") or cur[f"{svc}_api_key"]).strip()[:200]
                 if not (url and key):
                     return self._send(400, {"error": "URL and API key are required"})
                 try:
@@ -2146,13 +2341,13 @@ def make_handler(syncer, ui_password):
                         info = Arr(svc.title(), fake).probe()
                     return self._send(200, {"ok": True, **info})
                 except Exception as e:
-                    return self._send(200, {"ok": False, "error": str(e)})
+                    return self._send(200, {"ok": False, "error": str(redact_secrets(e, syncer.all_secrets() + [key]))[:200]})
             self._send(404, {"error": "not found"})
 
         def _auto_fetch(self, tid, trigger, *, status_only=False):
             if not ui_password:
                 return self._send(403, {"error": "Set a Watchlist Sync password to allow auto-fetch"})
-            if status_only and isinstance(tid, str) and re.fullmatch(r"[0-9]{1,10}", tid):
+            if isinstance(tid, str) and re.fullmatch(r"[0-9]{1,10}", tid):
                 tid = int(tid)
             if (type(tid) is not int or not 0 < tid <= 2147483647 or not isinstance(trigger, str)
                     or not re.fullmatch(r"[A-Za-z0-9:_-]{1,150}", trigger)):
@@ -2160,8 +2355,8 @@ def make_handler(syncer, ui_password):
             try:
                 fn = syncer.tv_auto_status if status_only else syncer.tv_auto_fetch
                 return self._send(200, fn(tid, trigger))
-            except (requests.RequestException, LookupError, TypeError, ValueError):
-                return self._send(502, {"error": "Could not verify Radarr availability"})
+            except Exception as e:
+                return self._send(502, {"error": "Could not verify Radarr availability: " + str(redact_secrets(e, syncer.all_secrets()))[:150]})
 
         def _recommend(self):
             url = os.environ.get("RECOMMEND_URL", "").strip()
@@ -2173,7 +2368,7 @@ def make_handler(syncer, ui_password):
                 if not 0 < size <= 20000:
                     return self._send(413, {"error": "Recommendation payload size is out of range"})
                 data, allowed = recommendation_input(self._body())
-            except (ValueError, RecursionError):
+            except (ValueError, RecursionError, OverflowError):
                 return self._send(400, {"error": "Invalid recommendation payload"})
             try:
                 result = rank_recommendations(url, model, data, allowed)
