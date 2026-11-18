@@ -106,8 +106,11 @@ def fake(self, method, url, params=None, json=None, headers=None, timeout=None):
             return Resp(body=[x for x in sonarr_series if str(x.get("tvdbId")) == str(want)])
         return Resp(body=sonarr_series)
     if url.endswith("/series/lookup"):
-        tid = int(params["term"].split(":")[1])
-        return Resp(body=[{"title": f"show{tid}", "tvdbId": tid, "seasons": [], **LOOKUP_EXTRA.get(tid, {})}])
+        term = (params or {}).get("term", "")
+        if ":" in term:
+            tid = int(term.split(":")[1])
+            return Resp(body=[{"title": f"show{tid}", "tvdbId": tid, "seasons": [], **LOOKUP_EXTRA.get(tid, {})}])
+        return Resp(body=[])
     if url.endswith("/series") and method == "POST":
         sonarr_series.append({"id": len(sonarr_series) + 100, "tvdbId": json["tvdbId"], "tags": json["tags"], "title": json["title"]})
         return Resp(201, json)
@@ -116,6 +119,8 @@ def fake(self, method, url, params=None, json=None, headers=None, timeout=None):
             want = params["tmdbId"]
             return Resp(body=[x for x in radarr_movies if str(x.get("tmdbId")) == str(want)])
         return Resp(body=radarr_movies)
+    if url.endswith("/movie/lookup"):
+        return Resp(body=[])
     if "/movie/lookup/tmdb" in url:
         return Resp(body={"title": "Inception", "tmdbId": params["tmdbId"]})
     if url.endswith("/movie") and method == "POST":
@@ -1507,6 +1512,49 @@ def single_title_lookup_tests():
     print("single-title lookup tests OK")
 
 single_title_lookup_tests()
+
+def shared_library_tests():
+    # 1. Clear cache and calls
+    s._invalidate_library()
+    calls.clear()
+
+    # Restore plex token so sync cycle runs
+    s.settings.update({"plex_token": "tok-from-pin"})
+    r_res = s.run_once()
+    assert "skipped" not in r_res, r_res
+    initial_movie_full = len([c for c in calls if c[0] == "GET" and c[1].endswith("/movie") and not c[2]])
+    initial_series_full = len([c for c in calls if c[0] == "GET" and c[1].endswith("/series") and not c[2]])
+    assert initial_movie_full == 1, f"Expected 1 full /movie fetch in sync cycle, got {initial_movie_full}"
+    assert initial_series_full == 1, f"Expected 1 full /series fetch in sync cycle, got {initial_series_full}"
+
+    # Now perform TV lookups (e.g. for movie and show)
+    # Since _library() was seeded by the sync cycle, TV lookups must reuse the cached library
+    s.tv_lookup("movie", ext_id=27205)
+    s.tv_lookup("show", ext_id=81189)
+
+    total_movie_full = len([c for c in calls if c[0] == "GET" and c[1].endswith("/movie") and not c[2]])
+    total_series_full = len([c for c in calls if c[0] == "GET" and c[1].endswith("/series") and not c[2]])
+
+    assert total_movie_full == 1, f"Expected still 1 full /movie fetch across sync + lookup, got {total_movie_full}"
+    assert total_series_full == 1, f"Expected still 1 full /series fetch across sync + lookup, got {total_series_full}"
+
+    # 2. Test invalidation after delete
+    was_dry = s.settings.all()["dry_run"]
+    s.settings.update({"dry_run": False})
+    # Add a mock movie to delete
+    radarr_movies[:] = [x for x in radarr_movies if x.get("tmdbId") != 27205] + [{"id": 31, "tmdbId": 27205, "title": "Inception"}]
+    s.tv_delete("movie", 27205, "", "Inception")
+    s.settings.update({"dry_run": was_dry})
+
+    # Cache for movie should be invalidated
+    calls.clear()
+    s.tv_lookup("movie", ext_id=27205)
+    after_del_movie_full = len([c for c in calls if c[0] == "GET" and c[1].endswith("/movie") and not c[2]])
+    assert after_del_movie_full == 1, f"Expected re-fetch after delete invalidation, got {after_del_movie_full}"
+
+    print("shared library tests OK")
+
+shared_library_tests()
 
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])
 print("ALL OK")

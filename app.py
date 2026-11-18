@@ -982,6 +982,7 @@ class Syncer:
                                 if self.action:
                                     self.action["errors"].append(f"{it['title']}: {e}")
                             log.error("Could not delete '%s': %s", it["title"], e)
+                    self._invalidate_library()
                 # titles other people still want: just drop this user's tag
                 if cfg.tag_by_user and not cfg.dry_run:
                     for it in plan["keep"]:
@@ -1062,7 +1063,7 @@ class Syncer:
     def _sync_sonarr(self, shows, summary):
         s = self.sonarr
         ctx = self._sonarr_ctx(s, self.cfg)
-        existing = {x.get("tvdbId") for x in s.get("/series")}
+        existing = {k for k in self._library(s, "show") if k}
 
         grouped = self._group_by(shows, "tvdb", summary)
         summary["shows"] = len(grouped)
@@ -1102,12 +1103,14 @@ class Syncer:
             except Exception as e:
                 log.error("Sonarr: failed on '%s': %s", title, e)
                 summary["errors"].append(f"sonarr:{title}: {e}")
+        if summary["added_series"]:
+            self._invalidate_library("show")
 
     def _sync_radarr(self, movies, summary):
         r = self.radarr
         profile_id = r.quality_profile_id()
         root = r.root_folder()
-        existing = {x.get("tmdbId") for x in r.get("/movie")}
+        existing = {k for k in self._library(r, "movie") if k}
 
         grouped = self._group_by(movies, "tmdb", summary)
         summary["movies"] = len(grouped)
@@ -1148,6 +1151,8 @@ class Syncer:
             except Exception as e:
                 log.error("Radarr: failed on '%s': %s", title, e)
                 summary["errors"].append(f"radarr:{title}: {e}")
+        if summary["added_movies"]:
+            self._invalidate_library("movie")
 
     @staticmethod
     def _radarr_body(r, cfg, movie, users, profile_id, root):
@@ -1351,18 +1356,27 @@ class Syncer:
             cache[tmdb] = (time.time(), result)
         return result
 
+    def _invalidate_library(self, kind=None):
+        with self.cache_lock:
+            cache = self.__dict__.get("_library_cache", {})
+            if kind:
+                cache.pop("movie" if kind == "movie" else "show", None)
+            else:
+                cache.clear()
+
     # -- finding and requesting titles from a TV (Jellyfin has no Watchlist)
     LIBRARY_TTL = 30
 
     def _library(self, arr, kind, *, fresh=False):
         """Map IDs to an Arr status and whether monitored files are still missing."""
+        key = "movie" if kind == "movie" else "show"
         with self.cache_lock:
             cache = self.__dict__.setdefault("_library_cache", {})
-            hit = cache.get(kind)
+            hit = cache.get(key)
             if not fresh and hit and time.time() - hit[0] < self.LIBRARY_TTL:
                 return hit[1]
         out = {}
-        if kind == "movie":
+        if key == "movie":
             for m in dicts(arr.get("/movie")):
                 have = bool(m.get("hasFile"))
                 out[m.get("tmdbId")] = ("have" if have else "requested", not have)
@@ -1372,7 +1386,7 @@ class Syncer:
                 files = stats.get("episodeFileCount") or 0
                 out[x.get("tvdbId")] = ("have" if files else "requested", not files or files < (stats.get("episodeCount") or 0))
         with self.cache_lock:
-            cache[kind] = (time.time(), out)
+            cache[key] = (time.time(), out)
         return out
 
     def _lookup_item(self, kind, x, library):
@@ -1549,8 +1563,8 @@ class Syncer:
                     return {"ok": True, "status": "already-there", "service": svc}
                 raise
             self.state.mark(service, ext_id, title, users, "auto-requested" if auto else "requested")
+            self._invalidate_library(kind)
             with self.cache_lock:
-                self.__dict__.get("_library_cache", {}).pop(kind, None)
                 self.__dict__.pop("_discover_cache", None)
                 self.__dict__.pop("_queue_cache", None)
             log.info("Added %s '%s' requested from a TV by %s", "anime" if anime else kind, title, ", ".join(users))
@@ -1702,6 +1716,7 @@ class Syncer:
                 self.state.mark(service, int(real_id), label, self.state.wanters(service, int(real_id)), "deleted")
         self._queue_cache = None
         self.__dict__.get("_collection_cache", {}).clear()
+        self._invalidate_library(kind)
         log.info("Deleted '%s' and its files from %s (from a TV)", label, name)
         return {"service": service, "configured": True, "found": True, "deleted": True, "title": label}
 
