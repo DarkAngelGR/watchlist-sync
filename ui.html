@@ -166,6 +166,8 @@ dialog li{margin:2px 0}
           <label><input type="checkbox" name="only_server_users"> Only friends with server access</label>
           <label><input type="checkbox" name="tag_by_user"> Tag by requester</label>
           <label><input type="checkbox" name="dry_run"> Dry run (don't add anything)</label>
+          <label><input type="checkbox" name="auto_fetch"> Allow movie auto-fetch from opted-in Orama viewers</label>
+          <label>Free space required for auto-fetch (GiB) <input type="number" min="1" name="auto_fetch_free_gib"></label>
         </div></div>
         <div class="row"><label>Only these users</label><input type="text" name="user_allow" placeholder="comma-separated, blank = everyone"></div>
         <div class="row"><label>Ignore these users</label><input type="text" name="user_block" placeholder="comma-separated"></div>
@@ -284,7 +286,7 @@ function renderRequests(){
     ? `<table><tr><th>Title</th><th>Where</th><th>Requested by</th><th>Result</th><th>When</th></tr>${
         rows.map(x => `<tr><td>${esc(x.title)}</td><td class="mute">${x.service === "sonarr" ? "Sonarr" : "Radarr"}</td>
           <td>${esc((x.users||"").split(",").join(", "))}</td>
-          <td><span class="tag ${x.result === "added" ? "added" : ""}">${x.result === "added" ? "added" : x.result === "deleted" ? "deleted on a TV" : "already there"}</span></td>
+          <td><span class="tag ${x.result === "added" || x.result === "auto-requested" ? "added" : ""}">${({added:"added", requested:"requested", "auto-requested":"auto-requested", deleted:"deleted on a TV"})[x.result] || "already there"}</span></td>
           <td class="mute small">${ago(x.ts)}</td></tr>`).join("")}</table>`
     : `<span class="mute small">Nothing yet.</span>`;
 }

@@ -54,6 +54,8 @@ FIELDS = {
     "user_block": ("USER_BLOCKLIST", "", str),
     "tag_by_user": ("TAG_BY_USER", True, bool),
     "dry_run": ("DRY_RUN", True, bool),
+    "auto_fetch": ("AUTO_FETCH", False, bool),
+    "auto_fetch_free_gib": ("AUTO_FETCH_FREE_GIB", 50, int),
     "sonarr_url": ("SONARR_URL", "", str),
     "sonarr_api_key": ("SONARR_API_KEY", "", str),
     "sonarr_quality_profile": ("SONARR_QUALITY_PROFILE", "", str),
@@ -140,6 +142,8 @@ class Config:
         self.user_block = {x.strip().lower() for x in s["user_block"].split(",") if x.strip()}
         self.tag_by_user = s["tag_by_user"]
         self.dry_run = s["dry_run"]
+        self.auto_fetch = s["auto_fetch"]
+        self.auto_fetch_free_gib = s["auto_fetch_free_gib"]
         self.sonarr = ArrConfig(s, "sonarr")
         self.sonarr_monitor = s["sonarr_monitor"]
         self.sonarr_series_type = s["sonarr_series_type"]
@@ -161,6 +165,10 @@ class State:
         with self.db:
             self.db.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)")
             self.db.execute("CREATE TABLE IF NOT EXISTS guid_cache (rating_key TEXT PRIMARY KEY, guids TEXT)")
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS auto_fetch (trigger TEXT PRIMARY KEY, tmdb INTEGER NOT NULL, "
+                "ts INTEGER NOT NULL, status TEXT NOT NULL)"
+            )
             self.db.execute(
                 "CREATE TABLE IF NOT EXISTS handled (service TEXT, ext_id INTEGER, title TEXT, users TEXT, "
                 "result TEXT, ts INTEGER, PRIMARY KEY (service, ext_id))"
@@ -194,6 +202,32 @@ class State:
             return self.db.execute(
                 "SELECT 1 FROM handled WHERE service=? AND ext_id=?", (service, ext_id)
             ).fetchone() is not None
+
+    def auto_attempts(self, trigger):
+        with self.lock:
+            return self.db.execute(
+                "SELECT trigger, tmdb, ts, status FROM auto_fetch WHERE trigger=? OR status='pending'",
+                (trigger,),
+            ).fetchall()
+
+    def reserve_auto(self, trigger, tmdb):
+        now = int(time.time())
+        with self.lock, self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            existing = self.db.execute("SELECT tmdb, status FROM auto_fetch WHERE trigger=?", (trigger,)).fetchone()
+            if existing:
+                return existing[1] if existing[0] == tmdb else "trigger-conflict"
+            if self.db.execute(
+                "SELECT 1 FROM auto_fetch WHERE status='pending' OR (status='added' AND ts > ?) LIMIT 1",
+                (now - 7 * 86400,),
+            ).fetchone():
+                return "quota-reached"
+            self.db.execute("INSERT INTO auto_fetch VALUES (?, ?, ?, 'pending')", (trigger, tmdb, now))
+            return "reserved"
+
+    def finish_auto(self, trigger, status):
+        with self.lock, self.db:
+            self.db.execute("UPDATE auto_fetch SET status=? WHERE trigger=? AND status='pending'", (status, trigger))
 
     def mark(self, service, ext_id, title, users, result):
         with self.lock, self.db:
@@ -453,8 +487,8 @@ class Arr:
         r.raise_for_status()
         return r.json()
 
-    def post(self, path, body):
-        r = request(self.s, "POST", self.base + path, json=body, timeout=60)
+    def post(self, path, body, *, retries=4):
+        r = request(self.s, "POST", self.base + path, json=body, timeout=60, retries=retries)
         if r.status_code >= 400:
             raise ArrError(r.status_code, r.text[:500])
         return r.json()
@@ -472,8 +506,8 @@ class Arr:
                                f"(have: {', '.join(p['name'] for p in profiles)})")
         return profiles[0]["id"]
 
-    def root_folder(self, want=None):
-        paths = [f["path"] for f in self.get("/rootfolder")]
+    def root_folder(self, want=None, *, folders=None):
+        paths = [f["path"] for f in (self.get("/rootfolder") if folders is None else folders)]
         if not paths:
             raise RuntimeError(f"{self.name}: no root folders configured")
         want = self.cfg.root_folder if want is None else want
@@ -508,6 +542,53 @@ class Arr:
                 if (x.get("imdbId") or "").lower() == imdb.lower():
                     return x
         return None
+
+    def queue_records(self, **params):
+        params = {"pageSize": 200, "includeMovie" if self.name == "Radarr" else "includeSeries": "true", **params}
+        for page in range(1, 21):
+            res = request(self.s, "GET", self.base + "/queue", params={**params, "page": page}, retries=0, timeout=8)
+            res.raise_for_status()
+            payload = res.json()
+            records = payload.get("records") if isinstance(payload, dict) else None
+            if not isinstance(records, list):
+                raise requests.RequestException("Invalid queue response")
+            if any(not isinstance(record, dict) for record in records):
+                raise requests.RequestException("Invalid queue record")
+            total = payload.get("totalRecords")
+            if not records and isinstance(total, int) and (page - 1) * params["pageSize"] < total:
+                raise requests.RequestException("Incomplete queue response")
+            yield from records
+            complete = page * params["pageSize"] >= total if isinstance(total, int) else len(records) < params["pageSize"]
+            if complete:
+                return
+        raise requests.RequestException("Queue exceeds the supported paging limit")
+
+    def queued(self, item_id=None, *, tmdb=None):
+        record_id = "movieId" if self.name == "Radarr" else "seriesId"
+        return any((item_id and row.get(record_id) == item_id) or
+                   (tmdb and (row.get("movie") or {}).get("tmdbId") == tmdb) for row in self.queue_records())
+
+    def active_search_ids(self):
+        res = request(self.s, "GET", self.base + "/command", retries=0, timeout=4)
+        res.raise_for_status()
+        commands = res.json()
+        if not isinstance(commands, list):
+            raise requests.RequestException("Invalid command response")
+        ids = set()
+        for cmd in commands:
+            if str(cmd.get("status", "")).lower() not in ("queued", "started", "running"):
+                continue
+            name = str(cmd.get("name") or (cmd.get("body") or {}).get("name") or "").lower()
+            if "search" not in name:
+                continue
+            args = cmd.get("body") or {}
+            if self.name == "Radarr":
+                ids.update(args.get("movieIds") or [])
+            else:
+                ids.update(args.get("seriesIds") or [])
+                if args.get("seriesId"):
+                    ids.add(args["seriesId"])
+        return ids
 
     def delete(self, obj):
         path = "/series" if self.name == "Sonarr" else "/movie"
@@ -570,6 +651,8 @@ class Syncer:
         self.wake = threading.Event()
         self.cfg = None
         self.lock = threading.Lock()      # one sync or exclusion at a time
+        self.tv_write_lock = threading.Lock()
+        self.tv_searches = {}
         self.action = None                # progress/result of the last exclude, shown in the UI
 
     # -- setup helpers
@@ -992,30 +1075,25 @@ class Syncer:
     def _queue_of(self, arr, kind):
         """Group one Sonarr/Radarr queue by movie/series."""
         rank = {"downloading": 0, "importing": 1, "stalled": 2, "paused": 3, "queued": 4, "failed": 5}
-        params = {"page": 1, "pageSize": 200}
-        params["includeMovie" if kind == "movie" else "includeSeries"] = "true"
-        if kind == "show":
-            params["includeEpisode"] = "true"
-        r = request(arr.s, "GET", arr.base + "/queue", retries=0, params=params, timeout=8)
-        r.raise_for_status()
         groups = {}
-        for rec in r.json().get("records", []):
+        params = {"includeEpisode": "true"} if kind == "show" else {}
+        for rec in arr.queue_records(**params):
             obj = rec.get("movie" if kind == "movie" else "series") or {}
             key = rec.get("movieId" if kind == "movie" else "seriesId")
             if key is None:
                 continue
+            st = self._status(rec)
             g = groups.setdefault(key, {
                 "kind": kind, "title": obj.get("title") or rec.get("title") or "?", "year": obj.get("year"),
                 "tmdb": obj.get("tmdbId"), "tvdb": obj.get("tvdbId"), "imdb": obj.get("imdbId") or "",
                 "poster": self._poster(obj), "size": 0, "sizeleft": 0, "timeleft": None,
-                "status": "queued", "episodes": [],
+                "status": st, "episodes": [],
             })
             g["size"] += rec.get("size") or 0
             g["sizeleft"] += rec.get("sizeleft") or 0
             t = self._secs(rec.get("timeleft"))
             if t is not None:
                 g["timeleft"] = max(g["timeleft"] or 0, t)
-            st = self._status(rec)
             if rank[st] < rank[g["status"]]:
                 g["status"] = st
             ep = rec.get("episode") or {}
@@ -1034,26 +1112,35 @@ class Syncer:
         downloaded and aren't in the queue: Sonarr/Radarr are still looking."""
         service = "radarr" if kind == "movie" else "sonarr"
         since = time.time() - self.SEARCHING_DAYS * 86400
-        recent = {int(r["id"]) for r in self.state.recent(500)
-                  if r["service"] == service and r["result"] == "added" and r["ts"] >= since and str(r["id"]).isdigit()}
-        if not recent:
+        recent = [r for r in self.state.recent(500) if r["service"] == service and r["ts"] >= since]
+        legacy = {r["id"] for r in recent if r["result"] == "added"}
+        observed = {r["id"] for r in recent if r["result"] in ("requested", "auto-requested")}
+        observed.update(ext for (k, ext), until in tuple(self.tv_searches.items()) if k == kind and until > time.monotonic())
+        if not (legacy or observed):
             return []
+        commands = set()
+        if observed:
+            try:
+                commands = arr.active_search_ids()
+            except requests.RequestException:
+                pass
         r = request(arr.s, "GET", arr.base + ("/movie" if kind == "movie" else "/series"), retries=0, timeout=10)
         r.raise_for_status()
         out = []
         for obj in r.json():
             ext = obj.get("tmdbId" if kind == "movie" else "tvdbId")
-            if ext not in recent or ext in queued_ids:
+            verified = ext in observed and obj.get("id") in commands
+            if (ext not in legacy and not verified) or ext in queued_ids:
                 continue
             if kind == "movie":
                 empty = not obj.get("hasFile")
             else:
                 empty = not (obj.get("statistics") or {}).get("episodeFileCount")
-            if empty and obj.get("monitored", True):
+            if (empty or verified) and obj.get("monitored", True):
                 out.append({"kind": kind, "title": obj.get("title") or "?", "year": obj.get("year"),
                             "tmdb": obj.get("tmdbId"), "tvdb": obj.get("tvdbId"), "imdb": obj.get("imdbId") or "",
                             "poster": self._poster(obj), "size": 0, "sizeleft": 0, "timeleft": None,
-                            "status": "searching", "progress": 0, "detail": ""})
+                            "status": "searching", "progress": 0, "detail": "", "estimated": not verified})
         return out
 
     # -- a movie's collection, for Orama (GET /api/tv/collection?tmdb=ID)
@@ -1113,25 +1200,28 @@ class Syncer:
     # -- finding and requesting titles from a TV (Jellyfin has no Watchlist)
     LIBRARY_TTL = 30
 
-    def _library(self, arr, kind):
-        """{tmdb or tvdb id: 'have' | 'requested'} for what Radarr/Sonarr already hold."""
+    def _library(self, arr, kind, *, fresh=False):
+        """Map IDs to an Arr status and whether monitored files are still missing."""
         cache = self.__dict__.setdefault("_library_cache", {})
         hit = cache.get(kind)
-        if hit and time.time() - hit[0] < self.LIBRARY_TTL:
+        if not fresh and hit and time.time() - hit[0] < self.LIBRARY_TTL:
             return hit[1]
         out = {}
         if kind == "movie":
             for m in arr.get("/movie"):
-                out[m.get("tmdbId")] = "have" if m.get("hasFile") else "requested"
+                have = bool(m.get("hasFile"))
+                out[m.get("tmdbId")] = ("have" if have else "requested", not have)
         else:
             for x in arr.get("/series"):
-                files = ((x.get("statistics") or {}).get("episodeFileCount") or 0)
-                out[x.get("tvdbId")] = "have" if files else "requested"
+                stats = x.get("statistics") or {}
+                files = stats.get("episodeFileCount") or 0
+                out[x.get("tvdbId")] = ("have" if files else "requested", not files or files < (stats.get("episodeCount") or 0))
         cache[kind] = (time.time(), out)
         return out
 
     def _lookup_item(self, kind, x, library):
         ext = x.get("tmdbId") if kind == "movie" else x.get("tvdbId")
+        status, missing = library.get(ext, ("none", False))
         ratings = x.get("ratings") or {}
         rating = ((ratings.get("tmdb") or {}).get("value") or (ratings.get("imdb") or {}).get("value")
                   or ratings.get("value") or 0)
@@ -1143,10 +1233,10 @@ class Syncer:
             "certification": x.get("certification") or "",
             "tmdb": x.get("tmdbId") or 0, "tvdb": x.get("tvdbId") or 0, "imdb": x.get("imdbId") or "",
             "poster": self._poster(x), "fanart": self._image(x, "fanart"),
-            "status": library.get(ext, "none"),
+            "status": status, "missing_files": missing,
         }
 
-    def tv_lookup(self, kind, q="", ext_id=0):
+    def tv_lookup(self, kind, q="", ext_id=0, *, fresh=False):
         """Movies (Radarr) or shows (Sonarr) matching `q`, or the one with this
         TMDB/TVDB id, each with whether it's already there: 'have' (has files),
         'requested' (added, nothing downloaded yet) or 'none'."""
@@ -1163,7 +1253,7 @@ class Syncer:
                 found = arr.get("/series/lookup", term=f"tvdb:{ext_id}")
         else:
             found = arr.get("/movie/lookup" if kind == "movie" else "/series/lookup", term=q)
-        library = self._library(arr, kind)
+        library = self._library(arr, kind, fresh=fresh)
         key = "tmdbId" if kind == "movie" else "tvdbId"
         return {"items": [self._lookup_item(kind, x, library) for x in (found or [])[:30] if x.get(key)]}
 
@@ -1185,6 +1275,10 @@ class Syncer:
     def _trending_shows(self, key, have):
         """This week's trending shows from TMDB, with their TVDB ids (Sonarr's)."""
         out = []
+        try:
+            genres = {g["id"]: g["name"] for g in self._tmdb(key, "/genre/tv/list").get("genres", [])}
+        except requests.RequestException:
+            genres = {}
         for x in (self._tmdb(key, "/trending/tv/week").get("results") or [])[:20]:
             try:
                 tvdb = (self._tmdb(key, f"/tv/{x['id']}/external_ids") or {}).get("tvdb_id")
@@ -1195,7 +1289,8 @@ class Syncer:
             first = x.get("first_air_date") or ""
             out.append({
                 "kind": "show", "title": x.get("name") or "?", "year": int(first[:4]) if first[:4].isdigit() else None,
-                "overview": x.get("overview") or "", "genres": [], "runtime": 0,
+                "overview": x.get("overview") or "", "genres": [genres[i] for i in (x.get("genre_ids") or []) if i in genres],
+                "runtime": 0,
                 "rating": round(float(x.get("vote_average") or 0), 1), "network": "", "certification": "",
                 "tmdb": x.get("id") or 0, "tvdb": tvdb, "imdb": "",
                 "poster": self.TMDB_IMG + "w342" + x["poster_path"] if x.get("poster_path") else "",
@@ -1249,15 +1344,16 @@ class Syncer:
         self._discover_cache = (time.time(), res)
         return res
 
-    def tv_request(self, kind, ext_id, user=""):
+    def tv_request(self, kind, ext_id, user="", *, cfg=None, arr=None, root=None):
         """Add a movie to Radarr or a show to Sonarr, the way a watchlist add
         would (same profiles, folders, anime handling and search)."""
-        cfg = Config(self.settings.all())
+        auto = arr is not None
+        cfg = cfg or Config(self.settings.all())
         arr_cfg = cfg.radarr if kind == "movie" else cfg.sonarr
         svc = "Radarr" if kind == "movie" else "Sonarr"
         if not arr_cfg.enabled:
             raise LookupError(svc + " isn't set up in watchlist-sync")
-        arr = Arr(svc, arr_cfg)
+        arr = arr or Arr(svc, arr_cfg)
         service = svc.lower()
         users = {user} if user else {"tv"}
         if arr.find(ext_id):
@@ -1267,28 +1363,145 @@ class Syncer:
             movie = movie[0] if isinstance(movie, list) and movie else movie
             if not movie:
                 raise LookupError(f"{svc} couldn't find that movie")
-            body = self._radarr_body(arr, cfg, movie, users, arr.quality_profile_id(), arr.root_folder())
+            if cfg.dry_run:
+                return {"ok": True, "status": "dry-run", "service": svc}
+            body = self._radarr_body(arr, cfg, movie, users, arr.quality_profile_id(), root or arr.root_folder())
             title, anime = movie.get("title") or "?", False
         else:
             found = arr.get("/series/lookup", term=f"tvdb:{ext_id}")
             if not found:
                 raise LookupError(f"{svc} couldn't find that show")
+            if cfg.dry_run:
+                return {"ok": True, "status": "dry-run", "service": svc}
             body, anime = self._sonarr_body(arr, cfg, self._sonarr_ctx(arr, cfg), found[0], users)
             title = found[0].get("title") or "?"
-        if cfg.dry_run:
-            log.info("[dry-run] would add %s '%s' requested from a TV by %s", kind, title, ", ".join(users))
-            return {"ok": True, "status": "dry-run", "service": svc}
         try:
-            arr.post("/movie" if kind == "movie" else "/series", body)
+            arr.post("/movie" if kind == "movie" else "/series", body, retries=0 if auto else 4)
         except ArrError as e:
             if e.already_exists:
                 return {"ok": True, "status": "already-there", "service": svc}
             raise
-        self.state.mark(service, ext_id, title, users, "requested")
+        self.state.mark(service, ext_id, title, users, "auto-requested" if auto else "requested")
         self.__dict__.get("_library_cache", {}).pop(kind, None)
         self.__dict__.pop("_discover_cache", None)
+        self.__dict__.pop("_queue_cache", None)
         log.info("Added %s '%s' requested from a TV by %s", "anime" if anime else kind, title, ", ".join(users))
         return {"ok": True, "status": "added", "service": svc, "title": title}
+
+    def tv_search_again(self, kind, ext_id):
+        with self.tv_write_lock:
+            cfg = Config(self.settings.all())
+            is_movie = kind == "movie"
+            svc, settings = ("Radarr", cfg.radarr) if is_movie else ("Sonarr", cfg.sonarr)
+            if not settings.enabled:
+                raise LookupError(svc + " isn't set up in watchlist-sync")
+            arr = Arr(svc, settings)
+            item = arr.find(ext_id)
+            if not item:
+                return {"status": "not-tracked"}
+            if not item.get("monitored", True):
+                return {"status": "unmonitored"}
+            stats = item.get("statistics") or {}
+            if (is_movie and item.get("hasFile")) or (
+                not is_movie and stats.get("episodeCount", 0) > 0
+                and stats.get("episodeFileCount", 0) >= stats["episodeCount"]
+            ):
+                return {"status": "have"}
+            if cfg.dry_run:
+                return {"status": "dry-run"}
+            now = time.monotonic()
+            self.tv_searches = {k: until for k, until in self.tv_searches.items() if until > now}
+            key = kind, ext_id
+            if key in self.tv_searches or arr.queued(item["id"]):
+                return {"status": "active"}
+            if item["id"] in arr.active_search_ids():
+                return {"status": "active"}
+            body = {"name": "MoviesSearch", "movieIds": [item["id"]]} if is_movie else {
+                "name": "MissingEpisodeSearch", "seriesId": item["id"], "monitored": True,
+            }
+            self.tv_searches[key] = now + 120
+            arr.post("/command", body, retries=0)
+            self.__dict__.pop("_queue_cache", None)
+            return {"status": "searching"}
+
+    def _reconcile_auto(self, arr, attempt):
+        token, ext_id, ts, status = attempt
+        if status != "pending" or not arr:
+            return status
+        try:
+            movie = arr.find(ext_id)
+        except requests.RequestException:
+            return "pending"
+        if movie:
+            status = "added"
+            if not self.state.is_handled("radarr", ext_id):
+                self.state.mark("radarr", ext_id, movie.get("title") or "?", {"Orama Auto-fetch"}, "auto-requested")
+        elif time.time() - ts >= 120:
+            status = "unconfirmed"
+        self.state.finish_auto(token, status)
+        return status
+
+    def tv_auto_status(self, tmdb, trigger):
+        with self.tv_write_lock:
+            cfg = Config(self.settings.all())
+            arr = Arr("Radarr", cfg.radarr) if cfg.radarr.enabled else None
+            for attempt in self.state.auto_attempts(trigger):
+                token, ext_id, _, _ = attempt
+                if token == trigger:
+                    return {"status": self._reconcile_auto(arr, attempt) if ext_id == tmdb else "trigger-conflict"}
+            return {"status": "not-recorded"}
+
+    def tv_auto_fetch(self, tmdb, trigger):
+        with self.tv_write_lock:
+            settings = self.settings.all()
+            cfg = Config(settings)
+            if not cfg.auto_fetch:
+                return {"status": "disabled"}
+            if cfg.dry_run:
+                return {"status": "dry-run"}
+            if not cfg.radarr.enabled or not cfg.radarr.search:
+                return {"status": "unavailable"}
+            arr = Arr("Radarr", cfg.radarr)
+            for attempt in self.state.auto_attempts(trigger):
+                token, ext_id, _, _ = attempt
+                status = self._reconcile_auto(arr, attempt)
+                if token == trigger:
+                    return {"status": status if ext_id == tmdb else "trigger-conflict"}
+                if status == "pending":
+                    return {"status": "quota-reached"}
+
+            if arr.find(tmdb) or arr.queued(tmdb=tmdb):
+                return {"status": "already-there"}
+            folders = arr.get("/rootfolder")
+            try:
+                root = arr.root_folder(folders=folders)
+            except RuntimeError:
+                return {"status": "space-unavailable"}
+            folder = next(f for f in folders if f["path"] == root)
+            free = folder.get("freeSpace")
+            if folder.get("accessible") is not True or type(free) is not int:
+                return {"status": "space-unavailable"}
+            if free < cfg.auto_fetch_free_gib * 1024**3:
+                return {"status": "low-space"}
+            if self.settings.all() != settings:
+                return {"status": "unavailable"}
+            reserved = self.state.reserve_auto(trigger, tmdb)
+            if reserved != "reserved":
+                return {"status": reserved}
+            try:
+                result = self.tv_request("movie", tmdb, "Orama Auto-fetch", cfg=cfg, arr=arr, root=root)
+            except (LookupError, RuntimeError):
+                self.state.finish_auto(trigger, "unavailable")
+                return {"status": "unavailable"}
+            except ArrError as e:
+                if 400 <= e.status < 500 and e.status != 429:
+                    self.state.finish_auto(trigger, "unavailable")
+                    return {"status": "unavailable"}
+                return {"status": "pending"}
+            except requests.RequestException:
+                return {"status": "pending"}
+            self.state.finish_auto(trigger, result["status"])
+            return result
 
     # -- deleting a title from a TV (POST /api/tv/delete)
     def tv_delete(self, kind, ext_id, imdb, title):
@@ -1733,9 +1946,16 @@ def make_handler(syncer, ui_password):
             if p == "/api/settings":
                 return self._send(200, syncer.settings.public())
             if p == "/api/tv":
-                return self._send(200, syncer.tv_info())
+                info = syncer.tv_info()
+                info["search_again"] = bool(ui_password)
+                cfg = Config(syncer.settings.all())
+                info["auto_fetch"] = bool(ui_password and cfg.auto_fetch and cfg.radarr.enabled and cfg.radarr.search and not cfg.dry_run)
+                return self._send(200, info)
             if p == "/api/tv/queue":
                 return self._send(200, syncer.tv_queue())
+            if p == "/api/tv/auto-fetch":
+                qs = parse_qs(urlparse(self.path).query)
+                return self._auto_fetch((qs.get("tmdb") or [""])[0], (qs.get("triggerId") or [""])[0], status_only=True)
             if p == "/api/tv/collection":
                 qs = parse_qs(urlparse(self.path).query)
                 try:
@@ -1768,7 +1988,7 @@ def make_handler(syncer, ui_password):
                 if not term and not ext_id:
                     return self._send(400, {"error": "q or id needed"})
                 try:
-                    return self._send(200, syncer.tv_lookup(kind, term, ext_id))
+                    return self._send(200, syncer.tv_lookup(kind, term, ext_id, fresh=q("fresh") == "1"))
                 except LookupError as e:
                     return self._send(409, {"error": str(e)})
                 except requests.RequestException as e:
@@ -1826,6 +2046,8 @@ def make_handler(syncer, ui_password):
                 body = self._body()
             except ValueError:
                 return self._send(400, {"error": "bad json"})
+            if not isinstance(body, dict):
+                return self._send(400, {"error": "expected a JSON object"})
             if p in ("/sync", "/api/sync"):
                 syncer.wake.set()
                 return self._send(202, {"queued": True})
@@ -1849,7 +2071,12 @@ def make_handler(syncer, ui_password):
                 except (requests.RequestException, ArrError) as e:
                     svc = "Radarr" if kind == "movie" else "Sonarr"
                     return self._send(502, {"error": f"{svc}: {str(e)[:200]}"})
-            if p == "/api/tv/request":
+            if p == "/api/tv/auto-fetch":
+                return self._auto_fetch(body.get("tmdb"), body.get("triggerId"))
+            if p in ("/api/tv/request", "/api/tv/search-again"):
+                search_again = p.endswith("/search-again")
+                if search_again and not ui_password:
+                    return self._send(403, {"error": "Set a Watchlist Sync password to allow Search again"})
                 kind = body.get("kind")
                 if kind not in ("movie", "show"):
                     return self._send(400, {"error": "kind must be movie or show"})
@@ -1861,6 +2088,8 @@ def make_handler(syncer, ui_password):
                     return self._send(400, {"error": "TMDB (movie) or TVDB (show) id needed"})
                 user = re.sub(r"[^\w .@-]", "", str(body.get("user") or ""))[:40].strip()
                 try:
+                    if search_again:
+                        return self._send(200, syncer.tv_search_again(kind, ext_id))
                     return self._send(200, syncer.tv_request(kind, ext_id, user))
                 except LookupError as e:
                     return self._send(409, {"error": str(e)})
@@ -1919,6 +2148,20 @@ def make_handler(syncer, ui_password):
                 except Exception as e:
                     return self._send(200, {"ok": False, "error": str(e)})
             self._send(404, {"error": "not found"})
+
+        def _auto_fetch(self, tid, trigger, *, status_only=False):
+            if not ui_password:
+                return self._send(403, {"error": "Set a Watchlist Sync password to allow auto-fetch"})
+            if status_only and isinstance(tid, str) and re.fullmatch(r"[0-9]{1,10}", tid):
+                tid = int(tid)
+            if (type(tid) is not int or not 0 < tid <= 2147483647 or not isinstance(trigger, str)
+                    or not re.fullmatch(r"[A-Za-z0-9:_-]{1,150}", trigger)):
+                return self._send(400, {"error": "A TMDB movie ID and a valid trigger ID are required"})
+            try:
+                fn = syncer.tv_auto_status if status_only else syncer.tv_auto_fetch
+                return self._send(200, fn(tid, trigger))
+            except (requests.RequestException, LookupError, TypeError, ValueError):
+                return self._send(502, {"error": "Could not verify Radarr availability"})
 
         def _recommend(self):
             url = os.environ.get("RECOMMEND_URL", "").strip()

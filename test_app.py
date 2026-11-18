@@ -567,9 +567,11 @@ def disc_fake(self, method, url, params=None, json=None, headers=None, timeout=N
             {"title": "From a list", "year": 2019, "tmdbId": 9, "lists": [1]}])
     if "api.themoviedb.org" in url:
         tmdb_calls.append((url, dict(params or {}), dict(headers or {})))
+        if url.endswith("/genre/tv/list"):
+            return Resp(body={"genres": [{"id": 18, "name": "Drama"}, {"id": 9648, "name": "Mystery"}]})
         if url.endswith("/trending/tv/week"):
             return Resp(body={"results": [
-                {"id": 100088, "name": "The Last of Us", "first_air_date": "2023-01-15", "poster_path": "/p.jpg", "backdrop_path": "/b.jpg", "vote_average": 8.55},
+                {"id": 100088, "name": "The Last of Us", "first_air_date": "2023-01-15", "poster_path": "/p.jpg", "backdrop_path": "/b.jpg", "vote_average": 8.55, "genre_ids": [18, 9648]},
                 {"id": 1396, "name": "Breaking Bad", "first_air_date": "2008-01-20"},
                 {"id": 1, "name": "No tvdb"}]})
         m = re.search(r"/tv/(\d+)/external_ids$", url)
@@ -595,6 +597,7 @@ tr = [x for x in d2["sections"] if x["id"] == "trending"][0]["items"]
 assert [(m["kind"], m["title"]) for m in tr] == [("movie", "Sinners"), ("show", "The Last of Us")], tr   # Breaking Bad is in Sonarr
 lou = tr[1]
 assert lou["tvdb"] == 392256 and lou["year"] == 2023 and lou["poster"].endswith("/w342/p.jpg") and lou["rating"] == 8.6
+assert lou["genres"] == ["Drama", "Mystery"]
 assert tmdb_calls[0][1].get("api_key") == "v3key"
 assert call("/api/tv/discover") == d2          # cached
 s.settings.update({"tmdb_api_key": "eyJabc"})
@@ -669,6 +672,110 @@ with ThreadingHTTPServer(("127.0.0.1", 0), app.make_handler(s, "pw")) as ranking
             assert code == 502 and "provider detail" not in err["error"]
     ranking_server.shutdown()
 print("recommendation tests OK")
+
+# --- Acquisition writes and restart recovery ---
+def acquisition_tests(directory):
+    syncer = app.Syncer(directory)
+    state = {"space": 100 * 1024**3, "queued": False, "timeout": False, "commands": [], "writes": [], "disable_at_disk_check": False}
+
+    def acquisition_fake(self, method, url, params=None, json=None, headers=None, timeout=None):
+        if url.endswith("/rootfolder") and ":7878" in url:
+            if state["disable_at_disk_check"]:
+                syncer.settings.update({"auto_fetch": False})
+            return Resp(body=[{"path": "/movies", "accessible": True, "freeSpace": state["space"]}])
+        if url.endswith("/queue"):
+            records = [{"movieId": 201, "movie": {"tmdbId": 7001}}] if state["queued"] else []
+            return Resp(body={"records": records, "totalRecords": len(records)})
+        if url.endswith("/command"):
+            if method == "GET":
+                return Resp(body=state.get("active_commands", []))
+            state["commands"].append(json)
+            return Resp(201, {"id": 55, "status": "queued"})
+        if url.endswith("/movie") and method == "POST":
+            state["writes"].append(json["tmdbId"])
+            if state["timeout"]:
+                radarr_movies.append({"id": 900, "tmdbId": json["tmdbId"], "title": "Recovered"})
+                raise requests.Timeout("reply lost after the write")
+        return fake(self, method, url, params=params, json=json, headers=headers, timeout=timeout)
+
+    syncer.settings.update({"tag_by_user": True})
+    radarr_movies.append({"id": 201, "tmdbId": 7001, "title": "Missing", "monitored": True})
+    sonarr_series.append({"id": 301, "tvdbId": 9100, "title": "Show", "monitored": True})
+    with patch.object(requests.Session, "request", acquisition_fake):
+        assert syncer.tv_auto_fetch(7002, "disabled")["status"] == "disabled"
+        syncer.settings.update({"auto_fetch": True, "auto_fetch_free_gib": 50, "dry_run": True})
+        assert syncer.tv_auto_fetch(7002, "dry")["status"] == "dry-run"
+        assert syncer.tv_search_again("movie", 7001)["status"] == "dry-run"
+        before_tags = dict(tags)
+        assert syncer.tv_request("movie", 7002, "should-not-create-a-tag")["status"] == "dry-run"
+        assert tags == before_tags
+        syncer.settings.update({"dry_run": False})
+        assert syncer.tv_search_again("movie", 9999)["status"] == "not-tracked"
+        state["queued"] = True
+        assert syncer.tv_search_again("movie", 7001)["status"] == "active"
+        state["queued"] = False
+        assert syncer.tv_search_again("movie", 7001)["status"] == "searching"
+        assert syncer.tv_search_again("movie", 7001)["status"] == "active"
+        assert syncer.tv_search_again("show", 9100)["status"] == "searching"
+        assert state["commands"] == [{"name": "MoviesSearch", "movieIds": [201]},
+                                     {"name": "MissingEpisodeSearch", "seriesId": 301, "monitored": True}]
+        assert not state["writes"]
+
+        assert syncer.tv_auto_fetch(7001, "existing")["status"] == "already-there"
+        state["space"] = None
+        assert syncer.tv_auto_fetch(7002, "unknown-space")["status"] == "space-unavailable"
+        state["space"] = 20 * 1024**3
+        assert syncer.tv_auto_fetch(7002, "low-space")["status"] == "low-space"
+        state["space"] = 100 * 1024**3
+        state["disable_at_disk_check"] = True
+        assert syncer.tv_auto_fetch(7002, "disabled-during-check")["status"] == "unavailable"
+        assert not state["writes"]
+        state["disable_at_disk_check"] = False
+        syncer.settings.update({"auto_fetch": True})
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda tid: syncer.tv_auto_fetch(*tid)["status"],
+                                    [(7002, "winner"), (7003, "second")]))
+        assert sorted(results) == ["added", "quota-reached"], results
+        winning_id = state["writes"][0]
+        trigger = "winner" if winning_id == 7002 else "second"
+        assert app.Syncer(directory).tv_auto_fetch(winning_id, trigger)["status"] == "added"
+        assert len(state["writes"]) == 1
+        assert all(row["tmdb"] != winning_id for row in syncer.tv_queue()["items"]), "An empty search should leave the queue"
+
+        with tempfile.TemporaryDirectory() as retry_dir:
+            restart = app.Syncer(retry_dir)
+            restart.settings.update({"auto_fetch": True})
+            state["timeout"] = True
+            assert restart.tv_auto_fetch(7004, "lost-reply")["status"] == "pending"
+            recovered = app.Syncer(retry_dir)
+            assert recovered.tv_auto_status(7005, "lost-reply")["status"] == "trigger-conflict"
+            assert recovered.tv_auto_status(7004, "lost-reply")["status"] == "added"
+            assert recovered.tv_auto_fetch(7004, "lost-reply")["status"] == "added"
+            assert recovered.tv_auto_fetch(7005, "another")["status"] == "quota-reached"
+            assert state["writes"].count(7004) == 1
+            restart.state.db.close()
+            recovered.state.db.close()
+    syncer.state.db.close()
+
+acquisition_tests(tempfile.mkdtemp())
+print("acquisition tests OK")
+
+pages = []
+def paging_fake(self, method, url, params=None, **kw):
+    page = params["page"]
+    pages.append(page)
+    if page == 1:
+        return Resp(body={"records": [{"movieId": i, "status": "queued"} for i in range(1, 201)], "totalRecords": 201})
+    return Resp(body={"records": [{"movieId": 201, "status": "failed", "movie": {"tmdbId": 77}}], "totalRecords": 201})
+
+with patch.object(requests.Session, "request", paging_fake):
+    arr = app.Arr("Radarr", app.Config(s.settings.all()).radarr)
+    assert next(x for x in s._queue_of(arr, "movie") if x["tmdb"] == 77)["status"] == "failed"
+    assert pages == [1, 2]
+
+for route in ("/api/tv/search-again", "/api/tv/auto-fetch"):
+    assert raw(route, "POST")[0] == 403
 
 call("/api/plex/logout", {})
 assert call("/api/status")["account"] is None and not s.settings.all()["plex_token"]

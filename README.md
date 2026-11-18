@@ -153,6 +153,9 @@ These are the only endpoints that allow cross-origin calls. They need `UI_PASSWO
 | `GET /api/tv/discover` | Titles you don't have yet: trending, popular and recommended movies (Radarr's Discover, no key needed) and trending shows (with a TMDB key) |
 | `POST /api/tv/recommend` | Rank a shortlist from Orama and return up to three title IDs and reasons. Requires `UI_PASSWORD` and a configured AI model |
 | `POST /api/tv/request` | `{kind: "movie"\|"show", tmdb\|tvdb, user}`: add it to Radarr/Sonarr like a Watchlist add would (nothing in dry run) |
+| `POST /api/tv/search-again` | Search for missing files on a tracked title using its TMDB or TVDB ID. Requires `UI_PASSWORD` |
+| `POST /api/tv/auto-fetch` | Request one missing movie using `{tmdb, triggerId}` and the household’s auto-fetch policy |
+| `GET /api/tv/auto-fetch` | Check the outcome for an automatic request using `tmdb` and `triggerId` |
 | `POST /api/tv/delete` | `{kind: "movie"\|"show", tmdb\|tvdb, imdb}`: delete from Radarr/Sonarr with files (nothing in dry run). It isn't re-added while it stays on the same Watchlists; adding it to a Watchlist again later brings it back |
 </details>
 
@@ -163,10 +166,22 @@ in the container environment. Set `RECOMMEND_API_KEY` when the endpoint requires
 Choose a model endpoint reachable from the container. With a recent Orama build, add the companion
 password under **Settings › Downloads**, then enable **AI recommendations** for the current viewer.
 
-Orama sends preferred genres, the just-watched title when available, and a shortlist from that
-viewer’s library. A hosted model provider receives that selection. The recommendation endpoint
+Orama sends preferred genres, the just-watched title when available, and a shortlist of playable
+or requestable titles. A hosted model provider receives that selection. The recommendation endpoint
 ranks titles from the shortlist and returns picks and reasons. Plex Watchlist sync operates
 independently of the model.
+
+### Optional movie auto-fetch
+
+Set a `UI_PASSWORD` and enable **Allow movie auto-fetch** in Watchlist Sync’s settings. Each
+viewer can then opt in under **Settings › Auto-fetch movies** on the TV. Watchlist Sync accepts
+up to one automatic movie request per rolling seven days for the household. It checks the
+configured Radarr library folder for at least 50 GiB free by default. Adjust the minimum in the
+companion’s settings.
+
+Auto-fetch uses the configured Radarr quality profile and search-on-add policy. Turn off
+**Allow movie auto-fetch** to disable automatic requests across the household. Dry run also
+prevents automatic writes. Manual movie and series requests are available from the TV.
 
 ## For developers
 
