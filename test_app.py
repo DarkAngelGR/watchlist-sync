@@ -841,7 +841,10 @@ def send_custom_post(server_url, path, data, headers=None):
         with urllib.request.urlopen(req) as r:
             return r.status, r.read()
     except urllib.error.HTTPError as e:
-        return e.code, e.read()
+        try:
+            return e.code, e.read()
+        except Exception:
+            return e.code, b""
 
 # Payload > 1MB returns 413
 huge_payload = json.dumps({"test": "x" * (1_048_576 + 10)}).encode()

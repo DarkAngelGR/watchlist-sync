@@ -315,6 +315,30 @@ def redact_secrets(text, secrets=None):
     return s
 
 
+def json_or(r, default=None):
+    if hasattr(r, "json"):
+        try:
+            val = r.json()
+            return default if val is None else val
+        except Exception:
+            return default
+    return default if r is None else r
+
+
+def dicts(items):
+    if isinstance(items, (list, tuple)):
+        return [x for x in items if isinstance(x, dict)]
+    if isinstance(items, dict):
+        return [items]
+    if hasattr(items, "__next__"):
+        return [x for x in items if isinstance(x, dict)]
+    return []
+
+
+def safe_err(e, secrets=None, limit=200, prefix=""):
+    return prefix + str(redact_secrets(e, secrets))[:limit]
+
+
 # --------------------------------------------------------------------------- http
 def request(session, method, url, retries=4, **kw):
     """HTTP with backoff on 429/5xx and network errors."""
@@ -566,7 +590,7 @@ class Arr:
         """Return the series/movie object in Sonarr/Radarr for a TVDB/TMDB id
         (or, failing that, an IMDb id), or None."""
         key, path = ("tvdbId", "/series") if self.name == "Sonarr" else ("tmdbId", "/movie")
-        items = self.get(path)
+        items = dicts(self.get(path))
         for x in items:
             if ext_id and x.get(key) == ext_id:
                 return x
@@ -1134,23 +1158,23 @@ class Syncer:
         return "downloading"
 
     @staticmethod
-    def _poster(obj):
-        for img in obj.get("images") or []:
-            if img.get("coverType") == "poster":
-                return img.get("remoteUrl") or ""
+    def _image(obj, kind):
+        for im in dicts(obj.get("images")):
+            if im.get("coverType") == kind:
+                return im.get("remoteUrl") or ""
         return ""
+
+    @classmethod
+    def _poster(cls, obj):
+        return cls._image(obj, "poster")
 
     def _queue_of(self, arr, kind):
         """Group one Sonarr/Radarr queue by movie/series."""
         rank = {"downloading": 0, "importing": 1, "stalled": 2, "paused": 3, "queued": 4, "failed": 5}
         groups = {}
         params = {"includeEpisode": "true"} if kind == "show" else {}
-        for rec in arr.queue_records(**params):
-            if not isinstance(rec, dict):
-                continue
-            obj = rec.get("movie" if kind == "movie" else "series") or {}
-            if not isinstance(obj, dict):
-                obj = {}
+        for rec in dicts(arr.queue_records(**params)):
+            obj = rec.get("movie" if kind == "movie" else "series") if isinstance(rec.get("movie" if kind == "movie" else "series"), dict) else {}
             key = rec.get("movieId" if kind == "movie" else "seriesId")
             if key is None:
                 continue
@@ -1168,8 +1192,8 @@ class Syncer:
                 g["timeleft"] = max(g["timeleft"] or 0, t)
             if rank.get(st, 99) < rank.get(g["status"], 99):
                 g["status"] = st
-            ep = rec.get("episode") or {}
-            if isinstance(ep, dict) and ep.get("episodeNumber") is not None:
+            ep = rec.get("episode") if isinstance(rec.get("episode"), dict) else {}
+            if ep.get("episodeNumber") is not None:
                 g["episodes"].append("S%02dE%02d" % (ep.get("seasonNumber") or 0, ep["episodeNumber"]))
         out = []
         for g in groups.values():
@@ -1201,13 +1225,7 @@ class Syncer:
         r = request(arr.s, "GET", arr.base + ("/movie" if kind == "movie" else "/series"), retries=0, timeout=10)
         r.raise_for_status()
         out = []
-        try:
-            items = r.json()
-        except Exception:
-            items = []
-        for obj in (items if isinstance(items, list) else []):
-            if not isinstance(obj, dict):
-                continue
+        for obj in dicts(json_or(r, [])):
             ext = obj.get("tmdbId" if kind == "movie" else "tvdbId")
             verified = ext in observed and obj.get("id") in commands
             if (ext not in legacy and not verified) or ext in queued_ids:
@@ -1242,37 +1260,24 @@ class Syncer:
         get = lambda path, **params: request(arr.s, "GET", arr.base + path, retries=0, params=params, timeout=10)
         r = get("/movie", tmdbId=tmdb)
         r.raise_for_status()
-        try:
-            movies = r.json()
-        except Exception:
-            movies = []
-        movie = movies[0] if isinstance(movies, list) and movies and isinstance(movies[0], dict) else None
+        movie = next(iter(dicts(json_or(r, []))), None)
         coll = (movie or {}).get("collection") or {}
         if not coll.get("tmdbId"):
             # Not in Radarr: its lookup still names the collection.
             r = get("/movie/lookup/tmdb", tmdbId=tmdb)
             if r.status_code == 200:
-                try:
-                    coll = (r.json() or {}).get("collection") or {}
-                except Exception:
-                    coll = {}
+                coll = json_or(r, {}).get("collection") or {}
         if not coll.get("tmdbId"):
             result = {"collection": None}
         else:
             r = get("/collection", tmdbId=coll["tmdbId"])
             r.raise_for_status()
-            try:
-                found = r.json() or []
-            except Exception:
-                found = []
-            c = found[0] if isinstance(found, list) and found and isinstance(found[0], dict) else None
+            c = next(iter(dicts(json_or(r, []))), None)
             if not c:
                 result = {"collection": None, "title": coll.get("title")}
             else:
                 parts = []
-                for m in (c.get("movies") or []):
-                    if not isinstance(m, dict):
-                        continue
+                for m in dicts(c.get("movies")):
                     tid = m.get("tmdbId")
                     have = m.get("isExisting")
                     entry = {"tmdb": tid, "title": m.get("title") or "?", "year": m.get("year"),
@@ -1281,13 +1286,9 @@ class Syncer:
                     if have is None or have:
                         rr = get("/movie", tmdbId=tid)
                         if rr.status_code == 200:
-                            try:
-                                rm_list = rr.json()
-                                if isinstance(rm_list, list) and rm_list and isinstance(rm_list[0], dict):
-                                    rm = rm_list[0]
-                                    entry.update(inRadarr=True, hasFile=bool(rm.get("hasFile")), monitored=bool(rm.get("monitored")))
-                            except Exception:
-                                pass
+                            rm = next(iter(dicts(json_or(rr, []))), None)
+                            if rm:
+                                entry.update(inRadarr=True, hasFile=bool(rm.get("hasFile")), monitored=bool(rm.get("monitored")))
                     parts.append(entry)
                 parts.sort(key=lambda x: (x["year"] or 9999, x["title"]))
                 result = {"collection": {"title": c.get("title") or coll.get("title"), "tmdb": coll["tmdbId"], "movies": parts}}
@@ -1307,15 +1308,11 @@ class Syncer:
                 return hit[1]
         out = {}
         if kind == "movie":
-            for m in (arr.get("/movie") or []):
-                if not isinstance(m, dict):
-                    continue
+            for m in dicts(arr.get("/movie")):
                 have = bool(m.get("hasFile"))
                 out[m.get("tmdbId")] = ("have" if have else "requested", not have)
         else:
-            for x in (arr.get("/series") or []):
-                if not isinstance(x, dict):
-                    continue
+            for x in dicts(arr.get("/series")):
                 stats = x.get("statistics") or {}
                 files = stats.get("episodeFileCount") or 0
                 out[x.get("tvdbId")] = ("have" if files else "requested", not files or files < (stats.get("episodeCount") or 0))
@@ -1350,16 +1347,12 @@ class Syncer:
             raise LookupError(("Radarr" if kind == "movie" else "Sonarr") + " isn't set up in watchlist-sync")
         arr = Arr("Radarr" if kind == "movie" else "Sonarr", arr_cfg)
         if ext_id:
-            if kind == "movie":
-                found = arr.get("/movie/lookup/tmdb", tmdbId=ext_id)
-                found = found if isinstance(found, list) else [found] if found else []
-            else:
-                found = arr.get("/series/lookup", term=f"tvdb:{ext_id}")
+            found = arr.get("/movie/lookup/tmdb", tmdbId=ext_id) if kind == "movie" else arr.get("/series/lookup", term=f"tvdb:{ext_id}")
         else:
             found = arr.get("/movie/lookup" if kind == "movie" else "/series/lookup", term=q)
         library = self._library(arr, kind, fresh=fresh)
         key = "tmdbId" if kind == "movie" else "tvdbId"
-        return {"items": [self._lookup_item(kind, x, library) for x in (found or [])[:30] if isinstance(x, dict) and x.get(key)]}
+        return {"items": [self._lookup_item(kind, x, library) for x in dicts(found)[:30] if x.get(key)]}
 
     # -- what to watch next, for Orama's Discover rows (GET /api/tv/discover)
     DISCOVER_TTL = 3 * 3600
@@ -1380,18 +1373,16 @@ class Syncer:
         """This week's trending shows from TMDB, with their TVDB ids (Sonarr's)."""
         out = []
         try:
-            genres_resp = self._tmdb(key, "/genre/tv/list")
-            genres = {g["id"]: g["name"] for g in genres_resp.get("genres", []) if isinstance(g, dict) and "id" in g and "name" in g} if isinstance(genres_resp, dict) else {}
+            resp = self._tmdb(key, "/genre/tv/list")
+            genres = {g["id"]: g["name"] for g in dicts((resp or {}).get("genres") if isinstance(resp, dict) else []) if "id" in g and "name" in g}
         except (requests.RequestException, ValueError, TypeError):
             genres = {}
         try:
-            trending_resp = self._tmdb(key, "/trending/tv/week")
-            results = trending_resp.get("results") if isinstance(trending_resp, dict) else []
+            resp = self._tmdb(key, "/trending/tv/week")
+            results = dicts((resp or {}).get("results") if isinstance(resp, dict) else [])
         except (requests.RequestException, ValueError, TypeError):
             results = []
-        for x in (results if isinstance(results, list) else [])[:20]:
-            if not isinstance(x, dict):
-                continue
+        for x in results[:20]:
             try:
                 ext_resp = self._tmdb(key, f"/tv/{x['id']}/external_ids") if x.get("id") else {}
                 tvdb = ext_resp.get("tvdb_id") if isinstance(ext_resp, dict) else None
@@ -1428,12 +1419,9 @@ class Syncer:
             try:
                 raw = arr.get("/importlist/movie", includeRecommendations="true", includeTrending="true", includePopular="true")
             except requests.RequestException as e:
-                err_msg = redact_secrets(e, self.all_secrets())
-                notes.append("Radarr: " + str(err_msg)[:120])
+                notes.append(safe_err(e, self.all_secrets(), limit=120, prefix="Radarr: "))
                 raw = []
-            for x in (raw if isinstance(raw, list) else []):
-                if not isinstance(x, dict):
-                    continue
+            for x in dicts(raw):
                 if x.get("isExisting") or x.get("isExcluded") or not x.get("tmdbId") or x.get("tmdbId") in lib:
                     continue
                 it = self._lookup_item("movie", x, lib)
@@ -1451,9 +1439,9 @@ class Syncer:
             try:
                 shows = self._trending_shows(cfg.tmdb_key, self._library(Arr("Sonarr", cfg.sonarr), "show"))
             except requests.RequestException as e:
-                err_msg = redact_secrets(e, [cfg.tmdb_key])
+                err_msg = safe_err(e, [cfg.tmdb_key], limit=120)
                 log.warning("TMDB trending shows failed: %s", err_msg)
-                notes.append("TMDB: " + str(err_msg)[:120])
+                notes.append("TMDB: " + err_msg)
         trending = []
         for i in range(max(len(trending_m), len(shows))):     # movies and shows, alternating
             trending += [x for x in (trending_m[i:i + 1] + shows[i:i + 1])]
@@ -1602,7 +1590,7 @@ class Syncer:
                 root = arr.root_folder(folders=folders)
             except RuntimeError:
                 return {"status": "space-unavailable"}
-            folder = next((f for f in folders if isinstance(f, dict) and f.get("path") == root), None)
+            folder = next((f for f in dicts(folders) if f.get("path") == root), None)
             if not folder:
                 return {"status": "space-unavailable"}
             free = folder.get("freeSpace")
@@ -1715,18 +1703,12 @@ class Syncer:
             raise LookupError("Bazarr rejected the API key")
         if r.status_code >= 400:
             raise LookupError("Bazarr: " + (r.text.strip().strip('"')[:200] or f"HTTP {r.status_code}"))
-        try:
-            payload = r.json() or {}
-        except Exception:
+        payload = json_or(r)
+        if not isinstance(payload, dict):
             raise LookupError("Bazarr returned invalid JSON")
-        found = payload.get("data") if isinstance(payload, dict) else []
-        if not isinstance(found, list):
-            found = []
         want = (lang or "").lower()
         results = []
-        for x in found:
-            if not isinstance(x, dict):
-                continue
+        for x in dicts(payload.get("data")):
             code = str(x.get("language") or "").split(":")[0].lower()
             if want and code != want:
                 continue
@@ -1789,12 +1771,8 @@ class Syncer:
         end = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + days * 86400))
         eps = arr.get("/calendar", start=start, end=end, includeSeries="true", unmonitored="false")
         items = []
-        for e in (eps if isinstance(eps, list) else []):
-            if not isinstance(e, dict):
-                continue
-            se = e.get("series") or {}
-            if not isinstance(se, dict):
-                se = {}
+        for e in dicts(eps):
+            se = e.get("series") if isinstance(e.get("series"), dict) else {}
             if e.get("hasFile"):
                 continue  # already here: it's in Plex
             items.append({
@@ -1808,13 +1786,6 @@ class Syncer:
         with self.cache_lock:
             self._upcoming_cache = (days, time.time(), res)
         return res
-
-    @staticmethod
-    def _image(obj, kind):
-        for im in obj.get("images") or []:
-            if im.get("coverType") == kind:
-                return im.get("remoteUrl") or ""
-        return ""
 
     def tv_queue(self):
         now = time.time()
@@ -1837,7 +1808,7 @@ class Syncer:
                 except Exception as e:
                     log.debug("searching check failed for %s: %s", name, e)
             except Exception as e:
-                errors[name] = str(redact_secrets(e, self.all_secrets()))[:200]
+                errors[name] = safe_err(e, self.all_secrets())
         order = {"downloading": 0, "importing": 1, "stalled": 2, "paused": 3, "queued": 4, "searching": 5, "failed": 6}
         items.sort(key=lambda x: (order.get(x["status"], 9), -(x["progress"] or 0)))
         result = {"items": items, "errors": errors}
@@ -2134,7 +2105,7 @@ def make_handler(syncer, ui_password):
                 try:
                     return self._send(200, syncer.tv_collection(tmdb))
                 except requests.RequestException as e:
-                    return self._send(502, {"error": "Radarr: " + str(redact_secrets(e, syncer.all_secrets()))[:200]})
+                    return self._send(502, {"error": safe_err(e, syncer.all_secrets(), prefix="Radarr: ")})
             if p == "/api/tv/upcoming":
                 qs = parse_qs(urlparse(self.path).query)
                 try:
@@ -2145,7 +2116,7 @@ def make_handler(syncer, ui_password):
                 except ValueError:
                     return self._send(400, {"error": "bad days"})
                 except requests.RequestException as e:
-                    return self._send(502, {"error": "Sonarr: " + str(redact_secrets(e, syncer.all_secrets()))[:200]})
+                    return self._send(502, {"error": safe_err(e, syncer.all_secrets(), prefix="Sonarr: ")})
             if p == "/api/tv/lookup":
                 qs = parse_qs(urlparse(self.path).query)
                 q = lambda k, d="": (qs.get(k) or [d])[0]
@@ -2166,12 +2137,12 @@ def make_handler(syncer, ui_password):
                 except LookupError as e:
                     return self._send(409, {"error": str(e)})
                 except requests.RequestException as e:
-                    return self._send(502, {"error": ("Radarr: " if kind == "movie" else "Sonarr: ") + str(redact_secrets(e, syncer.all_secrets()))[:200]})
+                    return self._send(502, {"error": safe_err(e, syncer.all_secrets(), prefix="Radarr: " if kind == "movie" else "Sonarr: ")})
             if p == "/api/tv/discover":
                 try:
                     return self._send(200, syncer.tv_discover())
                 except requests.RequestException as e:
-                    return self._send(502, {"error": "Radarr: " + str(redact_secrets(e, syncer.all_secrets()))[:200]})
+                    return self._send(502, {"error": safe_err(e, syncer.all_secrets(), prefix="Radarr: ")})
             if p == "/api/tv/subtitles":
                 qs = parse_qs(urlparse(self.path).query)
                 q = lambda k, d="": (qs.get(k) or [d])[0]
@@ -2193,7 +2164,7 @@ def make_handler(syncer, ui_password):
                 except LookupError as e:
                     return self._send(409, {"error": str(e)})
                 except requests.RequestException as e:
-                    return self._send(502, {"error": "Couldn't reach Bazarr/Sonarr/Radarr: " + str(redact_secrets(e, syncer.all_secrets()))[:150]})
+                    return self._send(502, {"error": safe_err(e, syncer.all_secrets(), limit=150, prefix="Couldn't reach Bazarr/Sonarr/Radarr: ")})
                 return self._send(200, res)
             m = re.fullmatch(r"/api/users/([^/]+)/plan", p)
             if m:
@@ -2203,13 +2174,13 @@ def make_handler(syncer, ui_password):
                 try:
                     token = plex_check_pin(syncer.client_id, m.group(1))
                 except Exception as e:
-                    return self._send(502, {"error": str(redact_secrets(e, syncer.all_secrets()))[:200]})
+                    return self._send(502, {"error": safe_err(e, syncer.all_secrets())})
                 if not token:
                     return self._send(200, {"done": False})
                 try:
                     acct = plex_account(syncer.client_id, token)
                 except Exception as e:
-                    return self._send(502, {"error": str(redact_secrets(e, syncer.all_secrets()))[:200]})
+                    return self._send(502, {"error": safe_err(e, syncer.all_secrets())})
                 syncer.settings.update({"plex_token": token})
                 syncer.state.set("plex_account", json.dumps(acct))
                 log.info("Signed in to Plex as %s", acct.get("username", "?"))
@@ -2257,7 +2228,7 @@ def make_handler(syncer, ui_password):
                     return self._send(200, syncer.tv_delete(kind, ext_id, imdb, str(body.get("title") or "").strip()[:200]))
                 except (requests.RequestException, ArrError) as e:
                     svc = "Radarr" if kind == "movie" else "Sonarr"
-                    return self._send(502, {"error": f"{svc}: {str(redact_secrets(e, syncer.all_secrets()))[:200]}"})
+                    return self._send(502, {"error": safe_err(e, syncer.all_secrets(), prefix=f"{svc}: ")})
             if p == "/api/tv/auto-fetch":
                 return self._auto_fetch(body.get("tmdb"), body.get("triggerId"))
             if p in ("/api/tv/request", "/api/tv/search-again"):
@@ -2282,7 +2253,7 @@ def make_handler(syncer, ui_password):
                     return self._send(409, {"error": str(e)})
                 except (requests.RequestException, ArrError, RuntimeError) as e:
                     svc = "Radarr" if kind == "movie" else "Sonarr"
-                    return self._send(502, {"error": f"{svc}: {str(redact_secrets(e, syncer.all_secrets()))[:200]}"})
+                    return self._send(502, {"error": safe_err(e, syncer.all_secrets(), prefix=f"{svc}: ")})
             if p == "/api/tv/subtitles/download":
                 token = str(body.get("token") or "").strip()[:64]
                 try:
@@ -2296,12 +2267,12 @@ def make_handler(syncer, ui_password):
                 except LookupError as e:
                     return self._send(409, {"error": str(e)})
                 except requests.RequestException as e:
-                    return self._send(502, {"error": "Couldn't reach Bazarr: " + str(redact_secrets(e, syncer.all_secrets()))[:150]})
+                    return self._send(502, {"error": safe_err(e, syncer.all_secrets(), limit=150, prefix="Couldn't reach Bazarr: ")})
             if p == "/api/plex/pin":
                 try:
                     return self._send(200, plex_create_pin(syncer.client_id))
                 except Exception as e:
-                    return self._send(502, {"error": f"Could not reach plex.tv: {redact_secrets(e, syncer.all_secrets())}"})
+                    return self._send(502, {"error": safe_err(e, syncer.all_secrets(), prefix="Could not reach plex.tv: ")})
             if p == "/api/plex/logout":
                 syncer.settings.update({"plex_token": ""})
                 syncer.state.set("plex_account", "null")
@@ -2341,7 +2312,7 @@ def make_handler(syncer, ui_password):
                         info = Arr(svc.title(), fake).probe()
                     return self._send(200, {"ok": True, **info})
                 except Exception as e:
-                    return self._send(200, {"ok": False, "error": str(redact_secrets(e, syncer.all_secrets() + [key]))[:200]})
+                    return self._send(200, {"ok": False, "error": safe_err(e, syncer.all_secrets() + [key])})
             self._send(404, {"error": "not found"})
 
         def _auto_fetch(self, tid, trigger, *, status_only=False):
@@ -2356,7 +2327,7 @@ def make_handler(syncer, ui_password):
                 fn = syncer.tv_auto_status if status_only else syncer.tv_auto_fetch
                 return self._send(200, fn(tid, trigger))
             except Exception as e:
-                return self._send(502, {"error": "Could not verify Radarr availability: " + str(redact_secrets(e, syncer.all_secrets()))[:150]})
+                return self._send(502, {"error": safe_err(e, syncer.all_secrets(), limit=150, prefix="Could not verify Radarr availability: ")})
 
         def _recommend(self):
             url = os.environ.get("RECOMMEND_URL", "").strip()
