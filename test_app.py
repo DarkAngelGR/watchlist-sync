@@ -779,5 +779,174 @@ for route in ("/api/tv/search-again", "/api/tv/auto-fetch"):
 
 call("/api/plex/logout", {})
 assert call("/api/status")["account"] is None and not s.settings.all()["plex_token"]
+
+# ===========================================================================
+# Hardening Regression Tests
+# ===========================================================================
+from unittest.mock import patch
+import base64 as b64
+import time
+
+# 1. Path traversal / Auth bypass & Security Headers
+with ThreadingHTTPServer(("127.0.0.1", 0), app.make_handler(s, "sec-pw")) as srv_auth:
+    threading.Thread(target=srv_auth.serve_forever, daemon=True).start()
+    b_auth = f"http://127.0.0.1:{srv_auth.server_port}"
+
+    # Path traversal attempting to bypass auth via /health/..
+    c, _ = raw("/health/../api/settings", server=b_auth)
+    assert c == 401, f"Expected 401 on /health/../api/settings, got {c}"
+
+    # Genuine /health endpoint remains unauthenticated
+    c, _ = raw("/health", server=b_auth)
+    assert c == 200, f"Expected 200 on /health, got {c}"
+
+    # Authenticated access succeeds
+    auth_hdr = {"Authorization": "Basic " + b64.b64encode(b"admin:sec-pw").decode()}
+    c, _ = raw("/api/settings", headers=auth_hdr, server=b_auth)
+    assert c == 200, f"Expected 200 with auth, got {c}"
+
+    # Security headers on HTML and JSON responses
+    c, h_html = raw("/", headers=auth_hdr, server=b_auth)
+    assert c == 200, f"Expected 200 on /, got {c}"
+    assert h_html.get("X-Content-Type-Options") == "nosniff"
+    assert h_html.get("X-Frame-Options") == "SAMEORIGIN"
+    assert "Content-Security-Policy" in h_html
+
+    c, h_json = raw("/api/settings", headers=auth_hdr, server=b_auth)
+    assert h_json.get("X-Content-Type-Options") == "nosniff"
+    assert h_json.get("X-Frame-Options") == "SAMEORIGIN"
+    srv_auth.shutdown()
+
+# 2. Secret Redaction
+test_url = "https://api.themoviedb.org/3/trending?api_key=secret_tmdb_key_12345&language=en"
+redacted = app.redact_secrets(test_url)
+assert "secret_tmdb_key_12345" not in redacted
+assert "api_key=[REDACTED]" in redacted
+
+bearer_text = "Failed with Authorization: Bearer my_super_secret_token_abc123"
+redacted_bearer = app.redact_secrets(bearer_text)
+assert "my_super_secret_token_abc123" not in redacted_bearer
+assert "Bearer [REDACTED]" in redacted_bearer
+
+# Known secret redaction
+custom_redacted = app.redact_secrets("Error connecting to radarr with key k_custom_999", secrets=["k_custom_999"])
+assert "k_custom_999" not in custom_redacted
+assert "[REDACTED]" in custom_redacted
+
+# 3. Payload size limit (MAX_BODY)
+def send_custom_post(server_url, path, data, headers=None):
+    req = urllib.request.Request(server_url + path, method="POST", data=data,
+                                 headers={"Content-Type": "application/json", **(headers or {})})
+    try:
+        with urllib.request.urlopen(req) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+# Payload > 1MB returns 413
+huge_payload = json.dumps({"test": "x" * (1_048_576 + 10)}).encode()
+c_huge, b_huge = send_custom_post(base, "/api/settings", huge_payload)
+assert c_huge == 413, f"Expected 413 for oversized body, got {c_huge}"
+
+# Bad JSON returns 400
+c_bad_json, _ = send_custom_post(base, "/api/settings", b"not-json{{{")
+assert c_bad_json == 400, f"Expected 400 for bad JSON, got {c_bad_json}"
+
+# 4. Settings invalid types and resilience
+call("/api/settings", {"interval_min": "invalid-int-value"})
+assert s.settings.all()["interval_min"] >= 1
+
+# Corrupted settings file recovery
+with tempfile.TemporaryDirectory() as td:
+    corrupt_file = os.path.join(td, "settings.json")
+    with open(corrupt_file, "w") as f:
+        f.write("{corrupt json!")
+    sett = app.Settings(corrupt_file)
+    assert sett.all() == {} or isinstance(sett.all(), dict)
+
+# 5. SQLite reliability and recovery
+with tempfile.TemporaryDirectory() as td:
+    state_inst = app.State(os.path.join(td, "state.db"))
+    mode = state_inst.db.execute("PRAGMA journal_mode").fetchone()[0]
+    assert mode.lower() in ("wal", "memory"), f"Expected WAL mode, got {mode}"
+
+    state_inst.db.execute("INSERT OR REPLACE INTO guid_cache (rating_key, guids) VALUES ('test', '{bad-json')")
+    assert state_inst.cached_guids("test") is None
+    state_inst.db.close()
+
+# 6. Auto-fetch string tmdb in POST & stale pending recovery
+with tempfile.TemporaryDirectory() as td:
+    af_syncer = app.Syncer(td)
+    af_syncer.settings.update({"auto_fetch": True, "auto_fetch_free_gib": 50})
+    with ThreadingHTTPServer(("127.0.0.1", 0), app.make_handler(af_syncer, "pw")) as srv_af:
+        threading.Thread(target=srv_af.serve_forever, daemon=True).start()
+        b_af = f"http://127.0.0.1:{srv_af.server_port}"
+        auth_af = {"Authorization": "Basic " + b64.b64encode(b"admin:pw").decode()}
+
+        with patch.object(af_syncer, "tv_auto_fetch", return_value={"status": "added"}):
+            c_af, b_resp = send_custom_post(b_af, "/api/tv/auto-fetch",
+                                            json.dumps({"tmdb": "12345", "triggerId": "trig_1"}).encode(),
+                                            headers=auth_af)
+            assert c_af == 200, f"Expected 200 for string tmdb, got {c_af}: {b_resp}"
+
+        c_bad_trig, _ = send_custom_post(b_af, "/api/tv/auto-fetch",
+                                         json.dumps({"tmdb": 12345, "triggerId": "bad/trigger/!@"}).encode(),
+                                         headers=auth_af)
+        assert c_bad_trig == 400
+        srv_af.shutdown()
+
+    now_ts = int(time.time())
+    af_syncer.state.db.execute("INSERT INTO auto_fetch VALUES (?, ?, ?, 'pending')",
+                              ("stale-trig", 8888, now_ts - 200))
+    assert af_syncer.state.reserve_auto("new-trig", 9999) == "reserved"
+    af_syncer.state.db.close()
+
+# 7. Endpoint Bounds and Input Validation
+for bad_path in [
+    "/api/tv/collection?tmdb=-1",
+    "/api/tv/collection?tmdb=abc",
+    "/api/tv/upcoming?days=-1",
+    "/api/tv/upcoming?days=abc",
+    "/api/tv/lookup?kind=movie&id=-5",
+    "/api/tv/lookup?kind=invalid_kind&id=1",
+    "/api/tv/subtitles?kind=invalid&tmdb=1",
+    "/api/tv/subtitles?kind=movie&tmdb=-1",
+]:
+    c_bad, _ = raw(bad_path)
+    assert c_bad == 400, f"Expected 400 for {bad_path}, got {c_bad}"
+
+# 8. Thread-Safety / Concurrency Locks
+assert isinstance(s.tv_write_lock, type(threading.RLock()))
+with s.tv_write_lock:
+    acquired = s.tv_write_lock.acquire(timeout=1.0)
+    assert acquired
+    s.tv_write_lock.release()
+
+with s.action_lock:
+    s.action = {"state": "done", "user": "test", "deleted": ["A", "B"], "untagged": [], "errors": [], "total": 2}
+act_copy = s.get_action()
+assert act_copy == s.action
+assert act_copy["deleted"] is not s.action["deleted"]
+
+# 9. Upstream malformed response handling
+def bz_test_get(url, params=None, headers=None, timeout=None):
+    if "/api/providers/movies" in url:
+        return Resp(body={"data": [{"language": "en", "score": "not_a_num", "provider": "p1"}]})
+    return Resp(body=[])
+
+with patch.object(app.requests, "get", side_effect=bz_test_get), \
+     patch.object(requests.Session, "request", return_value=Resp(body=[{"id": 31, "tmdbId": 27205}])):
+    res = s.tv_subtitle_search("movie", tmdb=27205)
+    assert len(res["results"]) == 1
+    assert res["results"][0]["score"] == 0.0
+
+# 10. UI XSS Escaping Verification
+with open(os.path.join(app.HERE, "ui.html"), "r", encoding="utf-8") as f:
+    ui_content = f.read()
+assert "${esc(u.role)}" in ui_content
+assert "${esc(u.status)}" in ui_content
+assert "${esc(u.items ?? \"—\")}" in ui_content
+assert "${esc(placeholder)}" in ui_content
+
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])
 print("ALL OK")
