@@ -948,5 +948,305 @@ assert "${esc(u.status)}" in ui_content
 assert "${esc(u.items ?? \"—\")}" in ui_content
 assert "${esc(placeholder)}" in ui_content
 
+# 11. Comprehensive Error-Path Tests for auto-fetch, request tracking, tv_request and tv_search_again
+def error_path_tests():
+    with tempfile.TemporaryDirectory() as td:
+        err_syncer = app.Syncer(td)
+        try:
+            err_syncer.settings.update({
+                "auto_fetch": True,
+                "auto_fetch_free_gib": 50,
+                "dry_run": False,
+                "radarr_url": "http://radarr:7878",
+                "radarr_api_key": "k_rad",
+                "radarr_search": True,
+                "sonarr_url": "http://sonarr:8989",
+                "sonarr_api_key": "k_son",
+                "sonarr_search": True,
+            })
+
+            with ThreadingHTTPServer(("127.0.0.1", 0), app.make_handler(err_syncer, "testpw")) as err_srv:
+                threading.Thread(target=err_srv.serve_forever, daemon=True).start()
+                err_base = f"http://127.0.0.1:{err_srv.server_port}"
+                err_auth = {"Authorization": "Basic " + b64.b64encode(b"admin:testpw").decode()}
+
+                try:
+                    # 1. tv_request and tv_search_again with Sonarr/Radarr returning errors
+                    # 1a. Services disabled -> 409
+                    err_syncer.settings.update({
+                        "radarr_url": "",
+                        "radarr_api_key": "",
+                        "sonarr_url": "",
+                        "sonarr_api_key": "",
+                    })
+                    c, b = send_custom_post(err_base, "/api/tv/request", json.dumps({"kind": "movie", "tmdb": 1001}).encode(), headers=err_auth)
+                    assert c == 409 and b"isn't set up" in b, f"Got {c}: {b}"
+                    c, b = send_custom_post(err_base, "/api/tv/request", json.dumps({"kind": "show", "tvdb": 2001}).encode(), headers=err_auth)
+                    assert c == 409 and b"isn't set up" in b, f"Got {c}: {b}"
+                    c, b = send_custom_post(err_base, "/api/tv/search-again", json.dumps({"kind": "movie", "tmdb": 1001}).encode(), headers=err_auth)
+                    assert c == 409 and b"isn't set up" in b, f"Got {c}: {b}"
+
+                    err_syncer.settings.update({
+                        "radarr_url": "http://radarr:7878",
+                        "radarr_api_key": "k_rad",
+                        "sonarr_url": "http://sonarr:8989",
+                        "sonarr_api_key": "k_son",
+                    })
+
+                    # 1b. Item lookup not found -> 409
+                    def mock_not_found(self, method, url, **kw):
+                        if "/movie/lookup/tmdb" in url or "/series/lookup" in url:
+                            return Resp(body=[])
+                        if url.endswith("/movie") or url.endswith("/series"):
+                            return Resp(body=[])
+                        return Resp(200, {})
+
+                    with patch.object(requests.Session, "request", mock_not_found):
+                        c, b = send_custom_post(err_base, "/api/tv/request", json.dumps({"kind": "movie", "tmdb": 99999}).encode(), headers=err_auth)
+                        assert c == 409 and b"couldn't find that movie" in b, f"Got {c}: {b}"
+                        c, b = send_custom_post(err_base, "/api/tv/request", json.dumps({"kind": "show", "tvdb": 99999}).encode(), headers=err_auth)
+                        assert c == 409 and b"couldn't find that show" in b, f"Got {c}: {b}"
+
+                    # 1c. Upstream errors (500 / timeout) during tv_request -> 502 with redacted error
+                    def mock_500(self, method, url, **kw):
+                        if url.endswith("/movie") or url.endswith("/series"):
+                            if method == "GET":
+                                return Resp(body=[])
+                            if method == "POST":
+                                return Resp(500, content=b"Internal error with secret key k_rad")
+                        if "/movie/lookup/tmdb" in url:
+                            return Resp(body=[{"title": "Test Movie", "tmdbId": 1001}])
+                        if url.endswith("/qualityprofile"):
+                            return Resp(body=[{"id": 1, "name": "HD"}])
+                        if url.endswith("/rootfolder"):
+                            return Resp(body=[{"path": "/movies", "accessible": True, "freeSpace": 100 * 1024**3}])
+                        return Resp(500, content=b"Server Error")
+
+                    with patch.object(requests.Session, "request", mock_500):
+                        c, b = send_custom_post(err_base, "/api/tv/request", json.dumps({"kind": "movie", "tmdb": 1001}).encode(), headers=err_auth)
+                        assert c == 502, f"Got {c}: {b}"
+                        assert b"k_rad" not in b, "Secret leaked in error response"
+                        assert b"Radarr:" in b
+
+                    # 1d. tv_search_again error handling and bugfix check
+                    def mock_search_err(self, method, url, **kw):
+                        if url.endswith("/movie"):
+                            return Resp(body=[{"id": 50, "tmdbId": 1001, "monitored": True, "hasFile": False}])
+                        if url.endswith("/queue"):
+                            return Resp(body={"records": [], "totalRecords": 0})
+                        if url.endswith("/command"):
+                            if method == "GET":
+                                return Resp(body=[])
+                            if method == "POST":
+                                return Resp(500, content=b"Command failure with secret k_rad")
+                        return Resp(200, {})
+
+                    with patch.object(requests.Session, "request", mock_search_err):
+                        c, b = send_custom_post(err_base, "/api/tv/search-again", json.dumps({"kind": "movie", "tmdb": 1001}).encode(), headers=err_auth)
+                        assert c == 502, f"Got {c}: {b}"
+                        assert b"k_rad" not in b, "Secret leaked in error response"
+                        # Key bug check: ('movie', 1001) must NOT be cached in tv_searches!
+                        assert ("movie", 1001) not in err_syncer.tv_searches, "Failed search command was erroneously cached in tv_searches"
+                finally:
+                    err_srv.shutdown()
+
+            # 2. Auto-fetch failure cases
+            # 2a. Radarr timeout during add -> stays pending, then reconciles to added
+            radarr_db = []
+            def mock_af_timeout_then_added(self, method, url, json=None, **kw):
+                if url.endswith("/rootfolder"):
+                    return Resp(body=[{"path": "/movies", "accessible": True, "freeSpace": 100 * 1024**3}])
+                if url.endswith("/qualityprofile"):
+                    return Resp(body=[{"id": 1, "name": "HD"}])
+                if url.endswith("/tag"):
+                    return Resp(body={"id": 1, "label": "plex-orama-auto-fetch"} if method == "POST" else [{"id": 1, "label": "plex-orama-auto-fetch"}])
+                if "/movie/lookup/tmdb" in url:
+                    return Resp(body=[{"title": "Pending Movie", "tmdbId": 8001}])
+                if url.endswith("/queue"):
+                    return Resp(body={"records": [], "totalRecords": 0})
+                if url.endswith("/movie"):
+                    if method == "GET":
+                        return Resp(body=radarr_db)
+                    if method == "POST":
+                        radarr_db.append({"id": 801, "tmdbId": 8001, "title": "Pending Movie"})
+                        raise requests.Timeout("Gateway Timeout")
+                return Resp(200, {})
+
+            with patch.object(requests.Session, "request", mock_af_timeout_then_added):
+                res = err_syncer.tv_auto_fetch(8001, "trig_timeout_add")
+                assert res["status"] == "pending", f"Expected pending, got {res}"
+                attempts = err_syncer.state.auto_attempts("trig_timeout_add")
+                assert len(attempts) == 1 and attempts[0][3] == "pending"
+
+                st = err_syncer.tv_auto_status(8001, "trig_timeout_add")
+                assert st["status"] == "added", f"Expected added, got {st}"
+                assert err_syncer.state.auto_attempts("trig_timeout_add")[0][3] == "added"
+                assert err_syncer.state.is_handled("radarr", 8001)
+
+            # 2b. Radarr 5xx during add -> stays pending, then reconciles to unconfirmed after 120s
+            err_syncer.state.db.execute("UPDATE auto_fetch SET ts = ? WHERE trigger = 'trig_timeout_add'",
+                                       (int(time.time()) - (8 * 86400),))
+            def mock_af_500_then_unconfirmed(self, method, url, json=None, **kw):
+                if url.endswith("/rootfolder"):
+                    return Resp(body=[{"path": "/movies", "accessible": True, "freeSpace": 100 * 1024**3}])
+                if url.endswith("/qualityprofile"):
+                    return Resp(body=[{"id": 1, "name": "HD"}])
+                if url.endswith("/tag"):
+                    return Resp(body={"id": 1, "label": "plex-orama-auto-fetch"} if method == "POST" else [{"id": 1, "label": "plex-orama-auto-fetch"}])
+                if "/movie/lookup/tmdb" in url:
+                    return Resp(body=[{"title": "Failing 500 Movie", "tmdbId": 8002}])
+                if url.endswith("/queue"):
+                    return Resp(body={"records": [], "totalRecords": 0})
+                if url.endswith("/movie"):
+                    if method == "GET":
+                        return Resp(body=[])
+                    if method == "POST":
+                        return Resp(500, content=b"Server Error")
+                return Resp(200, {})
+
+            with patch.object(requests.Session, "request", mock_af_500_then_unconfirmed):
+                res = err_syncer.tv_auto_fetch(8002, "trig_500_add")
+                assert res["status"] == "pending", f"Expected pending, got {res}"
+                # While < 120s, reconcile stays pending
+                st_early = err_syncer.tv_auto_status(8002, "trig_500_add")
+                assert st_early["status"] == "pending"
+
+                # Age attempt past 120s threshold
+                err_syncer.state.db.execute("UPDATE auto_fetch SET ts = ? WHERE trigger = 'trig_500_add'",
+                                           (int(time.time()) - 130,))
+                st_late = err_syncer.tv_auto_status(8002, "trig_500_add")
+                assert st_late["status"] == "unconfirmed", f"Expected unconfirmed, got {st_late}"
+                assert err_syncer.state.auto_attempts("trig_500_add")[0][3] == "unconfirmed"
+
+            # 2c. 4xx during add -> unavailable
+            def mock_af_400(self, method, url, **kw):
+                if url.endswith("/rootfolder"):
+                    return Resp(body=[{"path": "/movies", "accessible": True, "freeSpace": 100 * 1024**3}])
+                if url.endswith("/qualityprofile"):
+                    return Resp(body=[{"id": 1, "name": "HD"}])
+                if url.endswith("/tag"):
+                    return Resp(body={"id": 1, "label": "plex-orama-auto-fetch"} if method == "POST" else [{"id": 1, "label": "plex-orama-auto-fetch"}])
+                if "/movie/lookup/tmdb" in url:
+                    return Resp(body=[{"title": "Bad 400 Movie", "tmdbId": 8003}])
+                if url.endswith("/queue"):
+                    return Resp(body={"records": [], "totalRecords": 0})
+                if url.endswith("/movie"):
+                    if method == "GET":
+                        return Resp(body=[])
+                    if method == "POST":
+                        return Resp(400, content=b"Invalid Root Folder")
+                return Resp(200, {})
+
+            with patch.object(requests.Session, "request", mock_af_400):
+                res = err_syncer.tv_auto_fetch(8003, "trig_400")
+                assert res["status"] == "unavailable", f"Expected unavailable, got {res}"
+                assert err_syncer.state.auto_attempts("trig_400")[0][3] == "unavailable"
+
+            # Also 404 during add -> unavailable
+            def mock_af_404(self, method, url, **kw):
+                if url.endswith("/rootfolder"):
+                    return Resp(body=[{"path": "/movies", "accessible": True, "freeSpace": 100 * 1024**3}])
+                if url.endswith("/qualityprofile"):
+                    return Resp(body=[{"id": 1, "name": "HD"}])
+                if url.endswith("/tag"):
+                    return Resp(body={"id": 1, "label": "plex-orama-auto-fetch"} if method == "POST" else [{"id": 1, "label": "plex-orama-auto-fetch"}])
+                if "/movie/lookup/tmdb" in url:
+                    return Resp(body=[{"title": "404 Movie", "tmdbId": 8004}])
+                if url.endswith("/queue"):
+                    return Resp(body={"records": [], "totalRecords": 0})
+                if url.endswith("/movie"):
+                    if method == "GET":
+                        return Resp(body=[])
+                    if method == "POST":
+                        return Resp(404, content=b"Not found")
+                return Resp(200, {})
+
+            with patch.object(requests.Session, "request", mock_af_404):
+                res = err_syncer.tv_auto_fetch(8004, "trig_404")
+                assert res["status"] == "unavailable", f"Expected unavailable, got {res}"
+
+            # 2d. Quota after an added fetch within 7 days
+            def mock_af_generic(self, method, url, **kw):
+                if url.endswith("/rootfolder"):
+                    return Resp(body=[{"path": "/movies", "accessible": True, "freeSpace": 100 * 1024**3}])
+                if url.endswith("/movie") or url.endswith("/queue"):
+                    return Resp(body=[] if url.endswith("/movie") else {"records": [], "totalRecords": 0})
+                return Resp(200, {})
+
+            # Re-activate 8001 as recently added (e.g. 1 hour ago)
+            err_syncer.state.db.execute("UPDATE auto_fetch SET ts = ? WHERE trigger = 'trig_timeout_add'",
+                                       (int(time.time()) - 3600,))
+            with patch.object(requests.Session, "request", mock_af_generic):
+                # 8001 is added within 7 days -> returns quota-reached
+                res = err_syncer.tv_auto_fetch(8005, "trig_quota_test")
+                assert res["status"] == "quota-reached", f"Expected quota-reached, got {res}"
+
+                # If added > 7 days ago, quota is not blocked
+                err_syncer.state.db.execute("UPDATE auto_fetch SET ts = ? WHERE trigger = 'trig_timeout_add'",
+                                           (int(time.time()) - (8 * 86400),))
+                assert err_syncer.state.reserve_auto("trig_allowed_after_7d", 8006) == "reserved"
+                err_syncer.state.finish_auto("trig_allowed_after_7d", "unconfirmed")
+
+            # 2e. Trigger-conflict
+            err_syncer.state.reserve_auto("trig_conflict_test", 8007)
+            with patch.object(requests.Session, "request", mock_af_generic):
+                res = err_syncer.tv_auto_fetch(8008, "trig_conflict_test")
+                assert res["status"] == "trigger-conflict", f"Expected trigger-conflict, got {res}"
+                res = err_syncer.tv_auto_status(8008, "trig_conflict_test")
+                assert res["status"] == "trigger-conflict", f"Expected trigger-conflict, got {res}"
+            err_syncer.state.finish_auto("trig_conflict_test", "unconfirmed")
+
+            # 2f. Low-space and space-unavailable
+            def mock_low_space(self, method, url, **kw):
+                if url.endswith("/rootfolder"):
+                    return Resp(body=[{"path": "/movies", "accessible": True, "freeSpace": 20 * 1024**3}])
+                return Resp(body=[] if url.endswith("/movie") else {"records": [], "totalRecords": 0})
+
+            with patch.object(requests.Session, "request", mock_low_space):
+                res = err_syncer.tv_auto_fetch(8010, "trig_low_space")
+                assert res["status"] == "low-space", f"Expected low-space, got {res}"
+
+            def mock_inaccessible_space(self, method, url, **kw):
+                if url.endswith("/rootfolder"):
+                    return Resp(body=[{"path": "/movies", "accessible": False, "freeSpace": 100 * 1024**3}])
+                return Resp(body=[] if url.endswith("/movie") else {"records": [], "totalRecords": 0})
+
+            with patch.object(requests.Session, "request", mock_inaccessible_space):
+                res = err_syncer.tv_auto_fetch(8011, "trig_inaccessible")
+                assert res["status"] == "space-unavailable", f"Expected space-unavailable, got {res}"
+
+            def mock_none_space(self, method, url, **kw):
+                if url.endswith("/rootfolder"):
+                    return Resp(body=[{"path": "/movies", "accessible": True, "freeSpace": None}])
+                return Resp(body=[] if url.endswith("/movie") else {"records": [], "totalRecords": 0})
+
+            with patch.object(requests.Session, "request", mock_none_space):
+                res = err_syncer.tv_auto_fetch(8012, "trig_none_space")
+                assert res["status"] == "space-unavailable", f"Expected space-unavailable, got {res}"
+
+            def mock_empty_folders(self, method, url, **kw):
+                if url.endswith("/rootfolder"):
+                    return Resp(body=[])
+                return Resp(body=[] if url.endswith("/movie") else {"records": [], "totalRecords": 0})
+
+            with patch.object(requests.Session, "request", mock_empty_folders):
+                res = err_syncer.tv_auto_fetch(8013, "trig_empty_folders")
+                assert res["status"] == "space-unavailable", f"Expected space-unavailable, got {res}"
+
+            # 2g. Settings changed mid-flight
+            def mock_midflight_change(self, method, url, **kw):
+                if url.endswith("/rootfolder"):
+                    err_syncer.settings.update({"auto_fetch_free_gib": 99})
+                    return Resp(body=[{"path": "/movies", "accessible": True, "freeSpace": 200 * 1024**3}])
+                return Resp(body=[] if url.endswith("/movie") else {"records": [], "totalRecords": 0})
+
+            with patch.object(requests.Session, "request", mock_midflight_change):
+                res = err_syncer.tv_auto_fetch(8014, "trig_midflight")
+                assert res["status"] == "unavailable", f"Expected unavailable, got {res}"
+        finally:
+            err_syncer.state.db.close()
+
+error_path_tests()
+
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])
 print("ALL OK")

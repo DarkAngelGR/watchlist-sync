@@ -1544,8 +1544,8 @@ class Syncer:
             body = {"name": "MoviesSearch", "movieIds": [item["id"]]} if is_movie else {
                 "name": "MissingEpisodeSearch", "seriesId": item["id"], "monitored": True,
             }
-            self.tv_searches[key] = now + 120
             arr.post("/command", body, retries=0)
+            self.tv_searches[key] = now + 120
             self.__dict__.pop("_queue_cache", None)
             return {"status": "searching"}
 
@@ -1555,7 +1555,7 @@ class Syncer:
             return status
         try:
             movie = arr.find(ext_id)
-        except requests.RequestException:
+        except (requests.RequestException, ArrError):
             return "pending"
         if movie:
             status = "added"
