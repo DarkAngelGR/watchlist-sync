@@ -1251,5 +1251,187 @@ def error_path_tests():
 
 error_path_tests()
 
+# 12. TV error log tests: validation, auth, rate limit, bounding, redaction, escaping, and auto-fetch history
+def tv_log_tests():
+    with tempfile.TemporaryDirectory() as td:
+        log_syncer = app.Syncer(td)
+        try:
+            log_syncer.settings.update({
+                "radarr_url": "http://radarr:7878",
+                "radarr_api_key": "rad_secret_12345",
+                "tmdb_api_key": "tmdb_secret_9999",
+                "auto_fetch": True,
+                "auto_fetch_free_gib": 50,
+            })
+            pw = "log_test_pw"
+            with ThreadingHTTPServer(("127.0.0.1", 0), app.make_handler(log_syncer, pw)) as log_srv:
+                threading.Thread(target=log_srv.serve_forever, daemon=True).start()
+                base_url = f"http://127.0.0.1:{log_srv.server_port}"
+                auth_hdr = {"Authorization": "Basic " + b64.b64encode(f"admin:{pw}".encode()).decode()}
+
+                def post_log(data, headers=None):
+                    h = dict(auth_hdr)
+                    if headers:
+                        h.update(headers)
+                    body = json.dumps(data).encode()
+                    req = urllib.request.Request(base_url + "/api/tv/log", method="POST", data=body,
+                                                 headers={"Content-Type": "application/json", **h})
+                    try:
+                        with urllib.request.urlopen(req) as r:
+                            return r.status, r.read()
+                    except urllib.error.HTTPError as e:
+                        try:
+                            return e.code, e.read()
+                        except Exception:
+                            return e.code, b""
+
+                def get_errors(headers=None):
+                    h = dict(auth_hdr)
+                    if headers is not None:
+                        h = headers
+                    req = urllib.request.Request(base_url + "/api/tv-errors", headers=h)
+                    try:
+                        with urllib.request.urlopen(req) as r:
+                            return r.status, json.loads(r.read() or b"{}")
+                    except urllib.error.HTTPError as e:
+                        try:
+                            return e.code, json.loads(e.read() or b"{}")
+                        except Exception:
+                            return e.code, {}
+
+                try:
+                    # 1. Auth tests
+                    # POST without auth -> 401
+                    c, _ = post_log({"level": "error", "message": "unauthed"}, headers={"Authorization": ""})
+                    assert c == 401, f"Expected 401 without auth, got {c}"
+                    # GET /api/tv-errors without auth -> 401
+                    c, _ = get_errors(headers={})
+                    assert c == 401, f"Expected 401 without auth on /api/tv-errors, got {c}"
+
+                    # 2. Validation tests
+                    # Invalid levels -> 400
+                    for bad_lvl in ("info", "debug", "fatal", "", None, 123):
+                        c, b = post_log({"level": bad_lvl, "message": "msg"})
+                        assert c == 400, f"Expected 400 for level {bad_lvl}, got {c}: {b}"
+
+                    # Valid error & warn levels -> 204
+                    c, _ = post_log({"level": "warn", "message": "warning message"})
+                    assert c == 204, f"Expected 204, got {c}"
+                    c, _ = post_log({"level": "error", "message": "error message"})
+                    assert c == 204, f"Expected 204, got {c}"
+
+                    # Truncation of oversized fields
+                    long_msg = "m" * 600
+                    long_where = "w" * 100
+                    long_ver = "v" * 30
+                    long_dev = "d" * 50
+                    c, _ = post_log({
+                        "level": "error",
+                        "message": long_msg,
+                        "where": long_where,
+                        "version": long_ver,
+                        "device": long_dev,
+                    }, headers={"X-Forwarded-For": "10.0.0.1"})
+                    assert c == 204
+
+                    c, err_data = get_errors()
+                    assert c == 200
+                    latest = err_data["logs"][0]
+                    assert len(latest["message"]) == 500
+                    assert len(latest["where"]) == 80
+                    assert len(latest["version"]) == 20
+                    assert len(latest["device"]) == 40
+                    assert latest["ip"] == "10.0.0.1"
+
+                    # 3. Secret Redaction
+                    c, _ = post_log({
+                        "level": "error",
+                        "message": "Failed calling rad_secret_12345 and tmdb_secret_9999 with Bearer eyJmytoken123",
+                        "where": "test_redact",
+                    }, headers={"X-Forwarded-For": "10.0.0.2"})
+                    assert c == 204
+
+                    c, err_data = get_errors()
+                    redacted_entry = err_data["logs"][0]
+                    assert "rad_secret_12345" not in redacted_entry["message"]
+                    assert "tmdb_secret_9999" not in redacted_entry["message"]
+                    assert "eyJmytoken123" not in redacted_entry["message"]
+                    assert "[REDACTED]" in redacted_entry["message"]
+                    assert "Bearer [REDACTED]" in redacted_entry["message"]
+
+                    # 4. Rate Limiting (30/min per IP, excess drops with 204)
+                    rate_ip = "192.168.100.1"
+                    with log_syncer.tv_log_lock:
+                        log_syncer.tv_logs.clear()
+                        log_syncer.tv_log_rates.clear()
+
+                    for i in range(30):
+                        c, _ = post_log({"level": "warn", "message": f"msg {i}"}, headers={"X-Forwarded-For": rate_ip})
+                        assert c == 204, f"Request {i} failed: {c}"
+
+                    assert len(log_syncer.tv_logs) == 30
+
+                    # 31st request from same IP is dropped with 204
+                    c, _ = post_log({"level": "warn", "message": "msg 31 dropped"}, headers={"X-Forwarded-For": rate_ip})
+                    assert c == 204
+                    assert len(log_syncer.tv_logs) == 30, "Excess log should not be stored"
+
+                    # Request from different IP succeeds and is stored
+                    diff_ip = "192.168.100.2"
+                    c, _ = post_log({"level": "error", "message": "other ip"}, headers={"X-Forwarded-For": diff_ip})
+                    assert c == 204
+                    assert len(log_syncer.tv_logs) == 31
+                    assert log_syncer.tv_logs[-1]["ip"] == diff_ip
+
+                    # 5. Bounded Deque (max 200 items)
+                    with log_syncer.tv_log_lock:
+                        log_syncer.tv_logs.clear()
+                        log_syncer.tv_log_rates.clear()
+
+                    for i in range(250):
+                        log_syncer.record_tv_log(f"10.1.{i//250}.{i%250}", "error", f"entry {i}", where="bound_test")
+
+                    assert len(log_syncer.tv_logs) == 200, f"Expected 200 items in deque, got {len(log_syncer.tv_logs)}"
+                    messages = [entry["message"] for entry in log_syncer.get_tv_logs()]
+                    assert messages[0] == "entry 249"  # newest first
+                    assert messages[-1] == "entry 50"  # oldest remaining
+
+                    # 6. Escaping in UI HTML
+                    with open(os.path.join(app.HERE, "ui.html"), "r", encoding="utf-8") as f:
+                        ui_text = f.read()
+
+                    assert "renderTvErrors" in ui_text
+                    assert 'id="tvErrBox"' in ui_text
+                    assert 'id="autoFetchBox"' in ui_text
+                    assert "${esc(x.message)}" in ui_text
+                    assert "${esc(x.where || \"—\")}" in ui_text
+                    assert "${esc(x.device || \"—\")}" in ui_text
+                    assert "${esc(x.level)}" in ui_text
+                    assert "${esc(x.ip || \"—\")}" in ui_text
+                    assert "${esc(x.status)}" in ui_text
+                    assert "${esc(x.trigger)}" in ui_text
+                    assert "${esc(x.tmdb)}" in ui_text
+
+                    # 7. Auto-fetch decisions surfaced in GET /api/tv-errors
+                    log_syncer.state.record_auto("trig_low", 9001, "low-space")
+                    log_syncer.state.record_auto("trig_quota", 9002, "quota-reached")
+                    log_syncer.state.record_auto("trig_unavailable", 9003, "space-unavailable")
+
+                    c, err_resp = get_errors()
+                    assert c == 200
+                    af_rows = err_resp.get("auto_fetches", [])
+                    assert len(af_rows) >= 3
+                    af_by_trig = {r["trigger"]: r for r in af_rows}
+                    assert af_by_trig["trig_low"]["status"] == "low-space"
+                    assert af_by_trig["trig_quota"]["status"] == "quota-reached"
+                    assert af_by_trig["trig_unavailable"]["status"] == "space-unavailable"
+                    assert all("ts" in r and "time" in r and "tmdb" in r for r in af_rows)
+                finally:
+                    log_srv.shutdown()
+        finally:
+            log_syncer.state.db.close()
+
+tv_log_tests()
+
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])
 print("ALL OK")

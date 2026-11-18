@@ -107,6 +107,13 @@ dialog li{margin:2px 0}
   </section>
 
   <section class="card">
+    <h2>TV errors</h2>
+    <div class="scroll" id="tvErrBox"><span class="mute small">No TV errors recorded.</span></div>
+    <h2 style="margin-top:16px">Auto-fetch decisions</h2>
+    <div class="scroll" id="autoFetchBox"><span class="mute small">No auto-fetch decisions recorded.</span></div>
+  </section>
+
+  <section class="card">
     <h2>Settings</h2>
     <form id="settings" autocomplete="off">
       <fieldset>
@@ -291,7 +298,35 @@ function renderRequests(){
     : `<span class="mute small">Nothing yet.</span>`;
 }
 
-async function refresh(){ try { renderStatus(await api("/api/status")); } catch(e){} }
+function renderTvErrors(data){
+  if (!data) return;
+  const logs = data.logs || [];
+  $("#tvErrBox").innerHTML = logs.length
+    ? `<table><tr><th>When</th><th>Level</th><th>Where</th><th>Device</th><th>Message</th><th>IP</th></tr>${
+        logs.map(x => `<tr>
+          <td class="mute small">${ago(x.ts)}</td>
+          <td><span class="tag ${x.level === "error" ? "failed" : "warn"}">${esc(x.level)}</span></td>
+          <td class="small">${esc(x.where || "—")}</td>
+          <td class="mute small">${esc(x.device || "—")}${x.version ? ` <span class="mute">(${esc(x.version)})</span>` : ""}</td>
+          <td class="small" style="word-break:break-word">${esc(x.message)}</td>
+          <td class="mute small">${esc(x.ip || "—")}</td></tr>`).join("")}</table>`
+    : `<span class="mute small">No TV errors recorded.</span>`;
+
+  const af = data.auto_fetches || [];
+  $("#autoFetchBox").innerHTML = af.length
+    ? `<table><tr><th>When</th><th>TMDB</th><th>Trigger</th><th>Status</th></tr>${
+        af.map(x => `<tr>
+          <td class="mute small">${ago(x.ts || x.time)}</td>
+          <td>${esc(x.tmdb)}</td>
+          <td class="mute small" style="font-family:monospace">${esc(x.trigger)}</td>
+          <td><span class="tag ${x.status === "added" ? "added" : (["low-space", "quota-reached", "unavailable", "space-unavailable", "trigger-conflict"].includes(x.status) ? "failed" : "")}">${esc(x.status)}</span></td></tr>`).join("")}</table>`
+    : `<span class="mute small">No auto-fetch decisions recorded.</span>`;
+}
+
+async function refresh(){
+  try { renderStatus(await api("/api/status")); } catch(e){}
+  try { renderTvErrors(await api("/api/tv-errors")); } catch(e){}
+}
 
 async function login(){
   const win = window.open("about:blank", "plexauth", "width=600,height=720");

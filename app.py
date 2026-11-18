@@ -14,6 +14,7 @@ owner's token; each friend's Plex privacy setting for "Watchlist" must be
 "Friends only" (or wider).
 """
 import base64
+import collections
 import hmac
 import ipaddress
 import json
@@ -240,10 +241,24 @@ class State:
                 "SELECT 1 FROM auto_fetch WHERE (status='pending' AND ts > ?) OR (status='added' AND ts > ?) LIMIT 1",
                 (now - 120, now - 7 * 86400),
             ).fetchone():
+                with self.db:
+                    self.db.execute("INSERT OR REPLACE INTO auto_fetch VALUES (?, ?, ?, 'quota-reached')", (trigger, tmdb, now))
                 return "quota-reached"
             with self.db:
                 self.db.execute("INSERT INTO auto_fetch VALUES (?, ?, ?, 'pending')", (trigger, tmdb, now))
             return "reserved"
+
+    def record_auto(self, trigger, tmdb, status):
+        now = int(time.time())
+        with self.lock, self.db:
+            self.db.execute("INSERT OR REPLACE INTO auto_fetch VALUES (?, ?, ?, ?)", (trigger, tmdb, now, status))
+
+    def recent_auto(self, limit=20):
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT trigger, tmdb, ts, status FROM auto_fetch ORDER BY ts DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [{"trigger": r[0], "tmdb": r[1], "ts": r[2], "time": r[2], "status": r[3]} for r in rows]
 
     def finish_auto(self, trigger, status):
         with self.lock, self.db:
@@ -713,6 +728,46 @@ class Syncer:
         self.action_lock = threading.Lock()
         self.tv_searches = {}
         self.action = None                # progress/result of the last exclude, shown in the UI
+        self.tv_logs = collections.deque(maxlen=200)
+        self.tv_log_lock = threading.Lock()
+        self.tv_log_rates = collections.defaultdict(list)
+
+    def record_tv_log(self, ip, level, message, where="", version="", device=""):
+        if level not in ("error", "warn"):
+            return False
+        msg = str(message or "")[:500]
+        where = str(where or "")[:80]
+        version = str(version or "")[:20]
+        device = str(device or "")[:40]
+        now = time.time()
+        with self.tv_log_lock:
+            window = now - 60
+            times = [t for t in self.tv_log_rates[ip] if t > window]
+            if len(times) >= 30:
+                self.tv_log_rates[ip] = times
+                return False
+            times.append(now)
+            self.tv_log_rates[ip] = times
+            if len(self.tv_log_rates) > 200:
+                for k in list(self.tv_log_rates.keys()):
+                    self.tv_log_rates[k] = [t for t in self.tv_log_rates[k] if t > window]
+                    if not self.tv_log_rates[k]:
+                        del self.tv_log_rates[k]
+            redacted = redact_secrets(msg, self.all_secrets())
+            self.tv_logs.append({
+                "ts": int(now),
+                "ip": ip,
+                "level": level,
+                "message": redacted,
+                "where": where,
+                "version": version,
+                "device": device,
+            })
+            return True
+
+    def get_tv_logs(self):
+        with self.tv_log_lock:
+            return list(reversed(self.tv_logs))
 
     def get_action(self):
         with self.action_lock:
@@ -1589,14 +1644,18 @@ class Syncer:
             try:
                 root = arr.root_folder(folders=folders)
             except RuntimeError:
+                self.state.record_auto(trigger, tmdb, "space-unavailable")
                 return {"status": "space-unavailable"}
             folder = next((f for f in dicts(folders) if f.get("path") == root), None)
             if not folder:
+                self.state.record_auto(trigger, tmdb, "space-unavailable")
                 return {"status": "space-unavailable"}
             free = folder.get("freeSpace")
             if folder.get("accessible") is not True or type(free) is not int:
+                self.state.record_auto(trigger, tmdb, "space-unavailable")
                 return {"status": "space-unavailable"}
             if free < cfg.auto_fetch_free_gib * 1024**3:
+                self.state.record_auto(trigger, tmdb, "low-space")
                 return {"status": "low-space"}
             if self.settings.all() != settings:
                 return {"status": "unavailable"}
@@ -1989,6 +2048,13 @@ def make_handler(syncer, ui_password):
                 self.send_header("Access-Control-Max-Age", "600")
 
         def _send(self, code, obj=None, raw=None, ctype="application/json"):
+            if code == 204:
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.send_header("Cache-Control", "no-store")
+                self._cors()
+                self.end_headers()
+                return
             body = raw if raw is not None else json.dumps(obj).encode()
             self.send_response(code)
             self.send_header("Content-Type", ctype)
@@ -2083,6 +2149,11 @@ def make_handler(syncer, ui_password):
                 })
             if p == "/api/settings":
                 return self._send(200, syncer.settings.public())
+            if p == "/api/tv-errors":
+                return self._send(200, {
+                    "logs": syncer.get_tv_logs(),
+                    "auto_fetches": syncer.state.recent_auto(20),
+                })
             if p == "/api/tv":
                 info = syncer.tv_info()
                 info["search_again"] = bool(ui_password)
@@ -2204,6 +2275,17 @@ def make_handler(syncer, ui_password):
                 return self._send(400, {"error": "bad json"})
             if not isinstance(body, dict):
                 return self._send(400, {"error": "expected a JSON object"})
+            if p == "/api/tv/log":
+                level = body.get("level")
+                if level not in ("error", "warn"):
+                    return self._send(400, {"error": "level must be error or warn"})
+                msg = str(body.get("message") or "")[:500]
+                where = str(body.get("where") or "")[:80]
+                ver = str(body.get("version") or "")[:20]
+                dev = str(body.get("device") or "")[:40]
+                ip = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip() or (getattr(self, "client_address", None) or ("127.0.0.1", 0))[0]
+                syncer.record_tv_log(ip, level, msg, where, ver, dev)
+                return self._send(204)
             if p in ("/sync", "/api/sync"):
                 syncer.wake.set()
                 return self._send(202, {"queued": True})
