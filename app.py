@@ -15,6 +15,7 @@ owner's token; each friend's Plex privacy setting for "Watchlist" must be
 """
 import base64
 import collections
+import gzip
 import hmac
 import ipaddress
 import json
@@ -2063,16 +2064,26 @@ def make_handler(syncer, ui_password):
                 self.send_header("Access-Control-Max-Age", "600")
 
         def _send(self, code, obj=None, raw=None, ctype="application/json"):
-            if code == 204:
-                self.send_response(204)
+            if code in (204, 304):
+                self.send_response(code)
                 self.send_header("Content-Length", "0")
                 self.send_header("Cache-Control", "no-store")
                 self._cors()
                 self.end_headers()
                 return
             body = raw if raw is not None else json.dumps(obj).encode()
+            is_head = getattr(self, "command", "") == "HEAD"
+            accept_enc = self.headers.get("Accept-Encoding", "") if hasattr(self, "headers") and self.headers else ""
+            should_gzip = not is_head and len(body) > 1024 and "gzip" in accept_enc.lower()
+
+            if should_gzip:
+                body = gzip.compress(body, compresslevel=5)
+
             self.send_response(code)
             self.send_header("Content-Type", ctype)
+            if should_gzip:
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Vary", "Accept-Encoding")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
@@ -2081,7 +2092,11 @@ def make_handler(syncer, ui_password):
                 self.send_header("Content-Security-Policy", "default-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'")
             self._cors()
             self.end_headers()
-            self.wfile.write(body)
+            if not is_head:
+                self.wfile.write(body)
+
+        def do_HEAD(self):
+            self.do_GET()
 
         def _guard(self, command=False):
             """Refuse requests a foreign website could have made through your browser."""

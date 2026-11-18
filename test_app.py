@@ -1556,5 +1556,65 @@ def shared_library_tests():
 
 shared_library_tests()
 
+def gzip_tests():
+    import http.client, gzip
+    conn = http.client.HTTPConnection("127.0.0.1", srv.server_port)
+
+    # 1. GET / with Accept-Encoding: gzip (ui.html is ~27KB > 1KB)
+    conn.request("GET", "/", headers={"Accept-Encoding": "gzip"})
+    r = conn.getresponse()
+    headers = dict(r.getheaders())
+    body = r.read()
+    assert r.status == 200
+    assert headers.get("Content-Encoding") == "gzip"
+    assert "Accept-Encoding" in headers.get("Vary", "")
+    assert headers.get("Content-Length") == str(len(body))
+    decompressed = gzip.decompress(body)
+    assert decompressed.startswith(b"<!doctype html>")
+    assert len(body) < len(decompressed)
+
+    # 2. GET / without Accept-Encoding
+    conn.request("GET", "/")
+    r = conn.getresponse()
+    headers = dict(r.getheaders())
+    body = r.read()
+    assert r.status == 200
+    assert "Content-Encoding" not in headers
+    assert headers.get("Content-Length") == str(len(body))
+    assert body.startswith(b"<!doctype html>")
+
+    # 3. Small body (e.g. GET /health ~ 13 bytes) with Accept-Encoding: gzip -> not gzipped (< 1KB)
+    conn.request("GET", "/health", headers={"Accept-Encoding": "gzip"})
+    r = conn.getresponse()
+    headers = dict(r.getheaders())
+    body = r.read()
+    assert r.status == 200
+    assert "Content-Encoding" not in headers
+    assert body == b'{"ok": true}'
+
+    # 4. HEAD request on / with Accept-Encoding: gzip -> never gzipped, no body
+    conn.request("HEAD", "/", headers={"Accept-Encoding": "gzip"})
+    r = conn.getresponse()
+    headers = dict(r.getheaders())
+    body = r.read()
+    assert r.status == 200
+    assert "Content-Encoding" not in headers
+    assert len(body) == 0
+
+    # 5. 204 response (OPTIONS) with Accept-Encoding: gzip -> never gzipped
+    conn.request("OPTIONS", "/api/tv/sync", headers={"Accept-Encoding": "gzip"})
+    r = conn.getresponse()
+    headers = dict(r.getheaders())
+    body = r.read()
+    assert r.status == 204
+    assert "Content-Encoding" not in headers
+    assert headers.get("Content-Length") == "0"
+    assert len(body) == 0
+
+    conn.close()
+    print("gzip tests OK")
+
+gzip_tests()
+
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])
 print("ALL OK")
