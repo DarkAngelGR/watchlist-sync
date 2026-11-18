@@ -2283,7 +2283,10 @@ def make_handler(syncer, ui_password):
                 where = str(body.get("where") or "")[:80]
                 ver = str(body.get("version") or "")[:20]
                 dev = str(body.get("device") or "")[:40]
-                ip = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip() or (getattr(self, "client_address", None) or ("127.0.0.1", 0))[0]
+                ip = (getattr(self, "client_address", None) or ("127.0.0.1", 0))[0]
+                # X-Forwarded-For only from a proxy on this host; anyone else could spoof it past the rate limit.
+                if ip in ("127.0.0.1", "::1"):
+                    ip = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip() or ip
                 syncer.record_tv_log(ip, level, msg, where, ver, dev)
                 return self._send(204)
             if p in ("/sync", "/api/sync"):
