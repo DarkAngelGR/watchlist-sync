@@ -1456,6 +1456,70 @@ def tv_log_tests():
                     assert af_by_trig["trig_quota"]["status"] == "quota-reached"
                     assert af_by_trig["trig_unavailable"]["status"] == "space-unavailable"
                     assert all("ts" in r and "time" in r and "tmdb" in r for r in af_rows)
+
+                    # 8. Perf entries in TV log
+                    c, _ = post_log({
+                        "level": "perf",
+                        "message": "start 1180ms",
+                        "where": "app_init",
+                        "version": "1.0",
+                        "device": "Samsung TV",
+                    }, headers={"X-Forwarded-For": "10.0.0.99"})
+                    assert c == 204, f"Expected 204 for perf level, got {c}"
+
+                    c, err_data = get_errors()
+                    assert c == 200
+                    assert "perf" in err_data, "Missing 'perf' key in /api/tv-errors"
+                    assert len(err_data["perf"]) >= 1
+                    p_entry = err_data["perf"][0]
+                    assert p_entry["level"] == "perf"
+                    assert p_entry["message"] == "start 1180ms"
+                    assert p_entry["where"] == "app_init"
+                    assert p_entry["device"] == "Samsung TV"
+                    assert p_entry["version"] == "1.0"
+                    assert p_entry["ip"] == "10.0.0.99"
+                    assert "ts" in p_entry
+
+                    # Perf entries do not evict errors (separate bounded deques of 200)
+                    with log_syncer.tv_log_lock:
+                        log_syncer.tv_logs.clear()
+                        log_syncer.tv_perf.clear()
+                        log_syncer.tv_log_rates.clear()
+
+                    for i in range(200):
+                        log_syncer.record_tv_log(f"10.2.{i//200}.{i%200}", "error", f"err {i}")
+                    assert len(log_syncer.tv_logs) == 200
+
+                    for i in range(250):
+                        log_syncer.record_tv_log(f"10.3.{i//200}.{i%200}", "perf", f"play {i}ms")
+                    # Errors still 200 (not evicted by perf)
+                    assert len(log_syncer.tv_logs) == 200
+                    # Perf bounded to 200
+                    assert len(log_syncer.tv_perf) == 200
+                    perf_messages = [x["message"] for x in log_syncer.get_tv_perf()]
+                    assert perf_messages[0] == "play 249ms"  # newest first
+                    assert perf_messages[-1] == "play 50ms"  # oldest remaining
+
+                    # Shares per-IP rate limit with error/warn
+                    with log_syncer.tv_log_lock:
+                        log_syncer.tv_logs.clear()
+                        log_syncer.tv_perf.clear()
+                        log_syncer.tv_log_rates.clear()
+                    shared_ip = "192.168.200.5"
+                    for i in range(15):
+                        post_log({"level": "error", "message": f"err {i}"}, headers={"X-Forwarded-For": shared_ip})
+                    for i in range(15):
+                        post_log({"level": "perf", "message": f"home {i}ms"}, headers={"X-Forwarded-For": shared_ip})
+                    assert len(log_syncer.tv_logs) == 15
+                    assert len(log_syncer.tv_perf) == 15
+                    # 31st request from same IP is dropped by rate limit
+                    c, _ = post_log({"level": "perf", "message": "dropped perf"}, headers={"X-Forwarded-For": shared_ip})
+                    assert c == 204
+                    assert len(log_syncer.tv_perf) == 15, "Rate-limited perf entry should not be stored"
+
+                    # UI HTML checks for TV performance section
+                    assert 'id="tvPerfBox"' in ui_text
+                    assert "TV performance" in ui_text
                 finally:
                     log_srv.shutdown()
         finally:

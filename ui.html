@@ -109,6 +109,8 @@ dialog li{margin:2px 0}
   <section class="card">
     <h2>TV errors</h2>
     <div class="scroll" id="tvErrBox"><span class="mute small">No TV errors recorded.</span></div>
+    <h2 style="margin-top:16px">TV performance</h2>
+    <div class="scroll" id="tvPerfBox"><span class="mute small">No TV performance entries recorded.</span></div>
     <h2 style="margin-top:16px">Auto-fetch decisions</h2>
     <div class="scroll" id="autoFetchBox"><span class="mute small">No auto-fetch decisions recorded.</span></div>
   </section>
@@ -311,6 +313,17 @@ function renderTvErrors(data){
           <td class="small" style="word-break:break-word">${esc(x.message)}</td>
           <td class="mute small">${esc(x.ip || "—")}</td></tr>`).join("")}</table>`
     : `<span class="mute small">No TV errors recorded.</span>`;
+
+  const perf = data.perf || [];
+  $("#tvPerfBox").innerHTML = perf.length
+    ? `<table><tr><th>When</th><th>Where</th><th>Device</th><th>Message</th><th>IP</th></tr>${
+        perf.map(x => `<tr>
+          <td class="mute small">${ago(x.ts)}</td>
+          <td class="small">${esc(x.where || "—")}</td>
+          <td class="mute small">${esc(x.device || "—")}${x.version ? ` <span class="mute">(${esc(x.version)})</span>` : ""}</td>
+          <td class="small" style="word-break:break-word">${esc(x.message)}</td>
+          <td class="mute small">${esc(x.ip || "—")}</td></tr>`).join("")}</table>`
+    : `<span class="mute small">No TV performance entries recorded.</span>`;
 
   const af = data.auto_fetches || [];
   $("#autoFetchBox").innerHTML = af.length

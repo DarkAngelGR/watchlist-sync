@@ -730,11 +730,12 @@ class Syncer:
         self.tv_searches = {}
         self.action = None                # progress/result of the last exclude, shown in the UI
         self.tv_logs = collections.deque(maxlen=200)
+        self.tv_perf = collections.deque(maxlen=200)
         self.tv_log_lock = threading.Lock()
         self.tv_log_rates = collections.defaultdict(list)
 
     def record_tv_log(self, ip, level, message, where="", version="", device=""):
-        if level not in ("error", "warn"):
+        if level not in ("error", "warn", "perf"):
             return False
         msg = str(message or "")[:500]
         where = str(where or "")[:80]
@@ -755,7 +756,7 @@ class Syncer:
                     if not self.tv_log_rates[k]:
                         del self.tv_log_rates[k]
             redacted = redact_secrets(msg, self.all_secrets())
-            self.tv_logs.append({
+            entry = {
                 "ts": int(now),
                 "ip": ip,
                 "level": level,
@@ -763,12 +764,20 @@ class Syncer:
                 "where": where,
                 "version": version,
                 "device": device,
-            })
+            }
+            if level == "perf":
+                self.tv_perf.append(entry)
+            else:
+                self.tv_logs.append(entry)
             return True
 
     def get_tv_logs(self):
         with self.tv_log_lock:
             return list(reversed(self.tv_logs))
+
+    def get_tv_perf(self):
+        with self.tv_log_lock:
+            return list(reversed(self.tv_perf))
 
     def get_action(self):
         with self.action_lock:
@@ -2182,6 +2191,7 @@ def make_handler(syncer, ui_password):
             if p == "/api/tv-errors":
                 return self._send(200, {
                     "logs": syncer.get_tv_logs(),
+                    "perf": syncer.get_tv_perf(),
                     "auto_fetches": syncer.state.recent_auto(20),
                 })
             if p == "/api/tv":
@@ -2307,8 +2317,8 @@ def make_handler(syncer, ui_password):
                 return self._send(400, {"error": "expected a JSON object"})
             if p == "/api/tv/log":
                 level = body.get("level")
-                if level not in ("error", "warn"):
-                    return self._send(400, {"error": "level must be error or warn"})
+                if level not in ("error", "warn", "perf"):
+                    return self._send(400, {"error": "level must be error, warn, or perf"})
                 msg = str(body.get("message") or "")[:500]
                 where = str(body.get("where") or "")[:80]
                 ver = str(body.get("version") or "")[:20]

@@ -156,7 +156,7 @@ These are the only endpoints that allow cross-origin calls. They need `UI_PASSWO
 | `POST /api/tv/search-again` | Search for missing files on a tracked title using its TMDB or TVDB ID. Requires `UI_PASSWORD` |
 | `POST /api/tv/auto-fetch` | Request one missing movie using `{tmdb, triggerId}` and the household’s auto-fetch policy |
 | `GET /api/tv/auto-fetch` | Check the outcome for an automatic request using `tmdb` and `triggerId` |
-| `POST /api/tv/log` | Report TV app errors and warnings (`{"level": "error"\|"warn", "message", "where", "version", "device"}`). Bounded and rate limited (30/min per IP, excess dropped with 204), secrets redacted, displayed in admin UI |
+| `POST /api/tv/log` | Report TV app errors, warnings, and performance entries (`{"level": "error"\|"warn"\|"perf", "message", "where", "version", "device"}`). Bounded (last 200 per category) and rate limited (30/min per IP, excess dropped with 204), secrets redacted, displayed in admin UI |
 | `POST /api/tv/delete` | `{kind: "movie"\|"show", tmdb\|tvdb, imdb}`: delete from Radarr/Sonarr with files (nothing in dry run). It isn't re-added while it stays on the same Watchlists; adding it to a Watchlist again later brings it back |
 </details>
 
