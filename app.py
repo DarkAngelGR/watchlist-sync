@@ -38,7 +38,7 @@ log = logging.getLogger("watchlist-sync")
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLEXTV = "https://plex.tv"
 PRODUCT = "watchlist-sync"
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 
 # --------------------------------------------------------------------------- settings
