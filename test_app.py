@@ -2750,5 +2750,186 @@ def notify_tests():
 
 notify_tests()
 
+def health_tests():
+    with tempfile.TemporaryDirectory() as td:
+        sy = app.Syncer(td)
+        try:
+            sy.settings.update({
+                "plex_token": "plex-secret-token",
+                "sonarr_url": "http://sonarr.internal:8989",
+                "sonarr_api_key": "sonarr-secret",
+                "radarr_url": "http://radarr.internal:7878",
+                "radarr_api_key": "radarr-secret",
+                "bazarr_url": "http://bazarr.internal:6767",
+                "bazarr_api_key": "bazarr-secret",
+                "interval_min": 15,
+                "health_stale_factor": 3,
+            })
+            seen = []
+
+            def get(url, headers=None, timeout=None, **kw):
+                seen.append((url, headers or {}, timeout))
+                if url.endswith("/ping"):
+                    return Resp(200, {})
+                if ":8989" in url:
+                    return Resp(200, {"version": "4"})
+                if ":7878" in url:
+                    raise requests.ConnectTimeout("timed out talking to radarr.internal")
+                if ":6767" in url:
+                    return Resp(503, {"error": "nope"})
+                raise AssertionError(url)
+
+            now = 1_700_000_000
+            with patch("app.requests.get", get):
+                body = sy.health_report(now=now)
+            blob = json.dumps(body)
+            for secret in ("plex-secret-token", "sonarr-secret", "radarr-secret", "bazarr-secret",
+                           "internal", "http", "8989", "7878", "6767"):
+                assert secret not in blob, secret
+            assert set(body["services"]) == {"plex", "sonarr", "radarr", "bazarr"}
+            assert body["services"]["plex"]["status"] == "up"
+            assert body["services"]["sonarr"]["status"] == "up"
+            assert type(body["services"]["sonarr"]["latency_ms"]) is int
+            assert body["services"]["radarr"] == {"status": "down", "latency_ms": None}
+            assert body["services"]["bazarr"]["status"] == "down"
+            assert type(body["services"]["bazarr"]["latency_ms"]) is int
+            assert body["status"] == "degraded"
+            assert body["version"] == app.VERSION
+            assert body["last_sync"] is None and body["last_sync_age_s"] is None and body["last_sync_errors"] == 0
+            ping = next(x for x in seen if x[0].endswith("/ping"))
+            assert ping[0] == "https://plex.tv/api/v2/ping"
+            assert ping[1].get("X-Plex-Token") == "plex-secret-token" and "plex-secret-token" not in ping[0]
+            assert ping[2] == 3
+            n = len(seen)
+            with patch("app.requests.get", get):
+                again = sy.health_report(now=now + 10)
+            assert len(seen) == n and again["services"]["plex"]["status"] == "up"
+            with patch("app.requests.get", get):
+                sy.health_report(now=now + app.HEALTH_CACHE_S)
+            assert len(seen) == n * 2
+
+            def up(url, headers=None, timeout=None, **kw):
+                return Resp(200, {"version": "1"})
+
+            sy._health_cache = None
+            sy.state.set("last_sync_ok", str(now - 60))
+            sy.state.set("last_sync_errors", "0")
+            with patch("app.requests.get", up):
+                ok = sy.health_report(now=now)
+            assert ok["status"] == "ok" and ok["last_sync_age_s"] == 60 and ok["last_sync_errors"] == 0
+
+            max_age = 3 * 15 * 60
+            sy._health_cache = None
+            sy.state.set("last_sync_ok", str(now - max_age))
+            with patch("app.requests.get", up):
+                assert sy.health_report(now=now)["status"] == "ok"
+            sy._health_cache = None
+            sy.state.set("last_sync_ok", str(now - max_age - 1))
+            with patch("app.requests.get", up):
+                stale = sy.health_report(now=now)
+            assert stale["status"] == "degraded" and stale["last_sync_age_s"] == max_age + 1
+
+            sy._health_cache = None
+            sy.state.set("last_sync_ok", str(now - 10))
+            sy.state.set("last_sync_errors", "2")
+            with patch("app.requests.get", up):
+                bad = sy.health_report(now=now)
+            assert bad["status"] == "degraded" and bad["last_sync_errors"] == 2
+
+            sy._health_cache = None
+            sy.state.set("last_sync_errors", "0")
+
+            def down(url, headers=None, timeout=None, **kw):
+                raise requests.ConnectionError("nope http://secret.internal")
+
+            with patch("app.requests.get", down):
+                dead = sy.health_report(now=now)
+            assert dead["status"] == "down"
+            dead_blob = json.dumps(dead)
+            assert "secret" not in dead_blob and "internal" not in dead_blob and "http" not in dead_blob
+
+            sy.settings.update({"bazarr_url": ""})
+            sy._health_cache = None
+            with patch("app.requests.get", up):
+                no_bz = sy.health_report(now=now)
+            assert set(no_bz["services"]) == {"plex", "sonarr", "radarr"}
+
+            bare = app.Syncer(os.path.join(td, "bare"))
+            try:
+                bare.settings.update({
+                    "sonarr_url": "", "radarr_url": "", "bazarr_url": "", "plex_token": "",
+                })
+                with patch("app.requests.get", lambda *a, **k: (_ for _ in ()).throw(AssertionError("probed"))):
+                    empty = bare.health_report(now=now)
+                assert empty["status"] == "ok" and empty["services"] == {}
+                assert empty["last_sync"] is None and empty["last_sync_errors"] == 0
+                assert empty["version"] == app.VERSION
+            finally:
+                bare.state.db.close()
+
+            sy._record_sync_health({"skipped": "Sign in"})
+            assert sy.state.get("last_sync_ok") == str(now - 10)
+            sy._record_sync_health({"errors": ["a", "b"]}, now=50)
+            assert sy.state.get("last_sync_errors") == "2" and sy.state.get("last_sync_ok") == str(now - 10)
+            sy._record_sync_health({"errors": []}, now=80)
+            assert sy.state.get("last_sync_ok") == "80" and sy.state.get("last_sync_errors") == "0"
+            sy.settings.update({"health_stale_factor": 99999})
+            assert sy.settings.all()["health_stale_factor"] == 48
+
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), app.make_handler(sy, "pw"))
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            base_h = f"http://127.0.0.1:{srv.server_port}"
+            try:
+                sy._health_cache = None
+                sy._health_rates.clear()
+                sy.state.set("last_sync_ok", str(int(time.time())))
+                sy.state.set("last_sync_errors", "0")
+                with patch("app.requests.get", up):
+                    assert raw("/health", headers={"Host": "evil.example"}, server=base_h)[0] == 200
+                    with urllib.request.urlopen(base_h + "/health") as r:
+                        assert json.loads(r.read()) == {"ok": True}
+                    assert raw("/health/full", headers={"Host": "evil.example"}, server=base_h)[0] == 200
+                    with urllib.request.urlopen(base_h + "/health/full") as r:
+                        full = json.loads(r.read())
+                    assert full["status"] == "ok" and full["version"] == app.VERSION
+                    dumped = json.dumps(full)
+                    assert "http" not in dumped and "secret" not in dumped and "internal" not in dumped
+                    assert raw("/api/settings", server=base_h)[0] == 401
+                    sy._health_cache = None
+                    sy.state.set("last_sync_errors", "4")
+                    try:
+                        urllib.request.urlopen(base_h + "/health/full")
+                        raise AssertionError("expected 503")
+                    except urllib.error.HTTPError as e:
+                        degraded = json.loads(e.read())
+                        assert e.code == 503 and degraded["status"] == "degraded"
+                    sy._health_cache = (time.time(), {
+                        "plex": {"status": "down", "latency_ms": None},
+                        "sonarr": {"status": "down", "latency_ms": None},
+                        "radarr": {"status": "down", "latency_ms": None},
+                    })
+                    try:
+                        urllib.request.urlopen(base_h + "/health/full")
+                        raise AssertionError("expected 503")
+                    except urllib.error.HTTPError as e:
+                        down_body = json.loads(e.read())
+                        assert e.code == 503 and down_body["status"] == "down"
+                    codes = [raw("/health/full", server=base_h)[0] for _ in range(app.HEALTH_RATE + 2)]
+                    assert codes[-1] == 429
+                    try:
+                        urllib.request.urlopen(base_h + "/health/full")
+                        raise AssertionError("expected 429")
+                    except urllib.error.HTTPError as e:
+                        err = json.loads(e.read())
+                        assert e.code == 429 and err == {"error": "rate limited"}
+                    assert raw("/health", server=base_h)[0] == 200
+            finally:
+                srv.shutdown()
+        finally:
+            sy.state.db.close()
+    print("health tests OK")
+
+health_tests()
+
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])
 print("ALL OK")

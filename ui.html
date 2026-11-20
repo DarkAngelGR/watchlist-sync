@@ -177,6 +177,7 @@ dialog li{margin:2px 0}
           <label><input type="checkbox" name="dry_run"> Dry run (don't add anything)</label>
           <label><input type="checkbox" name="auto_fetch"> Allow movie auto-fetch from opted-in Orama viewers</label>
           <label>Free space required for auto-fetch (GiB) <input type="number" min="1" name="auto_fetch_free_gib"></label>
+          <label>Stale sync after <input type="number" min="1" max="48" name="health_stale_factor" style="max-width:70px"> intervals</label>
         </div></div>
         <div class="row"><label>Only these users</label><input type="text" name="user_allow" placeholder="comma-separated, blank = everyone"></div>
         <div class="row"><label>Ignore these users</label><input type="text" name="user_block" placeholder="comma-separated"></div>

@@ -29,6 +29,7 @@ import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlencode, urlparse, parse_qs
 
@@ -49,6 +50,10 @@ MAINTAIN_INTERVAL = 86400
 VACUUM_INTERVAL = 7 * 86400
 # Ignore wants that a broken sync hasn't refreshed. An empty table is not "everyone left".
 WANTS_FRESH_SECONDS = 2 * 86400
+# Uptime checks must not stampede Plex or the Arr apps.
+HEALTH_CACHE_S = 30
+HEALTH_RATE = 30
+HEALTH_WINDOW = 60
 
 
 # --------------------------------------------------------------------------- settings
@@ -95,6 +100,8 @@ FIELDS = {
     "notify_added": ("NOTIFY_ADDED", True, bool),
     "notify_downloaded": ("NOTIFY_DOWNLOADED", True, bool),
     "notify_failed": ("NOTIFY_FAILED", True, bool),
+    # How many sync intervals before /health/full calls the last success stale.
+    "health_stale_factor": ("HEALTH_STALE_FACTOR", 3, int),
 }
 SECRETS = ("plex_token", "sonarr_api_key", "radarr_api_key", "bazarr_api_key", "tmdb_api_key",
            "ntfy_token", "discord_webhook")
@@ -136,6 +143,8 @@ class Settings:
         # the process. Docker restarts and crashes the same way.
         if "interval_min" in d:
             d["interval_min"] = cast(int, d["interval_min"], FIELDS["interval_min"][1], 10080)
+        if "health_stale_factor" in d:
+            d["health_stale_factor"] = cast(int, d["health_stale_factor"], FIELDS["health_stale_factor"][1], 48)
         return d
 
     def update(self, changes):
@@ -145,7 +154,7 @@ class Settings:
                 continue
             if k in SECRETS and v in (None, "") and k != "plex_token":
                 continue  # blank secret in the form = keep the existing one
-            hi = 10080 if k == "interval_min" else None  # one week
+            hi = {"interval_min": 10080, "health_stale_factor": 48}.get(k)
             saved[k] = cast(FIELDS[k][2], v, FIELDS[k][1], hi)
         self.state.set("settings", json.dumps(saved))
 
@@ -196,6 +205,7 @@ class Config:
         self.notify_added = s["notify_added"]
         self.notify_downloaded = s["notify_downloaded"]
         self.notify_failed = s["notify_failed"]
+        self.health_stale_factor = s["health_stale_factor"]
 
 
 # --------------------------------------------------------------------------- state
@@ -961,6 +971,9 @@ class Syncer:
         self.tv_perf = collections.deque(maxlen=200)
         self.tv_log_lock = threading.Lock()
         self.tv_log_rates = collections.defaultdict(list)
+        self._health_lock = threading.Lock()
+        self._health_rates = {}
+        self._health_cache = None
 
     def record_tv_log(self, ip, level, message, where="", version="", device=""):
         if level not in ("error", "warn", "perf"):
@@ -1226,9 +1239,124 @@ class Syncer:
 
         summary["duration_s"] = round(time.time() - t0, 1)
         self.last_run = summary
+        self._record_sync_health(summary)
         log.info("Cycle done in %ss: +%d series, +%d movies, %d errors", summary["duration_s"],
                  len(summary["added_series"]), len(summary["added_movies"]), len(summary["errors"]))
         return summary
+
+    def _record_sync_health(self, summary, now=None):
+        """Remember the last finished cycle for /health/full. A skipped setup is not a cycle."""
+        if not isinstance(summary, dict) or summary.get("skipped"):
+            return
+        now = int(time.time() if now is None else now)
+        errors = summary.get("errors") or []
+        n = len(errors) if isinstance(errors, list) else 1
+        self.state.set("last_sync_errors", str(n))
+        if n == 0:
+            self.state.set("last_sync_ok", str(now))
+
+    def health_limited(self, ip, now=None):
+        """True when this address has used its /health/full budget for the window."""
+        now = time.time() if now is None else now
+        ip = ip or "?"
+        with self._health_lock:
+            window = now - HEALTH_WINDOW
+            times = [t for t in self._health_rates.get(ip, []) if t > window]
+            if len(self._health_rates) > 200:
+                for key in list(self._health_rates):
+                    kept = [t for t in self._health_rates[key] if t > window]
+                    if kept:
+                        self._health_rates[key] = kept
+                    else:
+                        del self._health_rates[key]
+                times = [t for t in self._health_rates.get(ip, []) if t > window]
+            if len(times) >= HEALTH_RATE:
+                self._health_rates[ip] = times
+                return True
+            times.append(now)
+            self._health_rates[ip] = times
+            return False
+
+    def _probe_service(self, url, headers):
+        started = time.perf_counter()
+        try:
+            res = requests.get(url, headers=headers or {}, timeout=3)
+        except requests.RequestException:
+            return {"status": "down", "latency_ms": None}
+        latency = int((time.perf_counter() - started) * 1000)
+        if res.status_code >= 400:
+            return {"status": "down", "latency_ms": latency}
+        return {"status": "up", "latency_ms": latency}
+
+    def _probe_services(self, cfg):
+        jobs = []
+        if cfg.plex_token:
+            jobs.append(("plex", f"{PLEXTV}/api/v2/ping", {"X-Plex-Token": cfg.plex_token, "Accept": "application/json"}))
+        if cfg.sonarr.enabled:
+            jobs.append(("sonarr", cfg.sonarr.url.rstrip("/") + "/api/v3/system/status", {"X-Api-Key": cfg.sonarr.api_key}))
+        if cfg.radarr.enabled:
+            jobs.append(("radarr", cfg.radarr.url.rstrip("/") + "/api/v3/system/status", {"X-Api-Key": cfg.radarr.api_key}))
+        if cfg.bazarr_url and cfg.bazarr_key:
+            jobs.append(("bazarr", cfg.bazarr_url.rstrip("/") + "/api/system/status", {"X-API-KEY": cfg.bazarr_key}))
+        if not jobs:
+            return {}
+        out = {}
+        with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+            futures = {pool.submit(self._probe_service, url, headers): name for name, url, headers in jobs}
+            for fut, name in ((f, futures[f]) for f in futures):
+                try:
+                    out[name] = fut.result()
+                except Exception:
+                    out[name] = {"status": "down", "latency_ms": None}
+        return out
+
+    def health_report(self, now=None):
+        """Status for an uptime monitor. Service probes are cached. No secrets or hosts."""
+        now = time.time() if now is None else now
+        cfg = Config(self.settings.all())
+        with self._health_lock:
+            cached = self._health_cache
+            if cached and now - cached[0] < HEALTH_CACHE_S:
+                services = cached[1]
+            else:
+                services = None
+        if services is None:
+            services = self._probe_services(cfg)
+            with self._health_lock:
+                self._health_cache = (now, services)
+        ok_raw = self.state.get("last_sync_ok")
+        err_raw = self.state.get("last_sync_errors")
+        try:
+            ok_at = int(ok_raw) if ok_raw is not None else None
+        except (TypeError, ValueError):
+            ok_at = None
+        try:
+            errors = int(err_raw or 0)
+        except (TypeError, ValueError):
+            errors = 0
+        age = None if ok_at is None else max(0, int(now - ok_at))
+        max_age = cfg.health_stale_factor * cfg.interval_min * 60
+        configured = bool(services)
+        stale = configured and (age is None or age > max_age)
+        states = [s.get("status") for s in services.values()]
+        all_down = bool(states) and all(s == "down" for s in states)
+        any_down = any(s == "down" for s in states)
+        if all_down:
+            status = "down"
+        elif not configured:
+            status = "ok"
+        elif any_down or stale or errors:
+            status = "degraded"
+        else:
+            status = "ok"
+        return {
+            "status": status,
+            "version": VERSION,
+            "services": services,
+            "last_sync": ok_at,
+            "last_sync_age_s": age,
+            "last_sync_errors": errors,
+        }
 
     # -- excluding a user
     def deletion_plan(self, username):
@@ -2811,7 +2939,7 @@ def make_handler(syncer, ui_password):
 
         def _authed(self):
             p = self._clean_path()
-            if not ui_password or p == "/health":
+            if not ui_password or p in ("/health", "/health/full"):
                 return True
             hdr = self.headers.get("Authorization", "")
             if hdr.startswith("Basic "):
@@ -2866,12 +2994,18 @@ def make_handler(syncer, ui_password):
 
         def do_GET(self):
             p = self._clean_path()
-            if p != "/health" and not self._guard():
+            if p not in ("/health", "/health/full") and not self._guard():
                 return
             if not self._authed():
                 return
             if p == "/health":
                 return self._send(200, {"ok": True})
+            if p == "/health/full":
+                ip = (getattr(self, "client_address", None) or ("?", 0))[0]
+                if syncer.health_limited(ip):
+                    return self._send(429, {"error": "rate limited"})
+                body = syncer.health_report()
+                return self._send(200 if body.get("status") == "ok" else 503, body)
             if p == "/":
                 return self._send(200, raw=page, ctype="text/html; charset=utf-8")
             if p == "/api/status":

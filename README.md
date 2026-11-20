@@ -209,6 +209,32 @@ Dry run writes the message to the log instead of sending it. Messages go out in 
 background with a short timeout and a few retries. A delivery problem does not stop a sync,
 and a restart does not send the same one again.
 
+## Uptime
+
+Docker's healthcheck calls `GET /health`. That stays a fast, unauthenticated
+`{"ok": true}` and does not ask Plex, Sonarr, Radarr, or Bazarr anything.
+
+`GET /health/full` is for an uptime monitor. It is unauthenticated, rate-limited
+(30 requests a minute per address), and caches each service check for about 30
+seconds so a monitor cannot hammer Plex or the Arr apps. The JSON has no secrets,
+URLs, or hostnames. A service is listed only when it is configured. `status` is
+`ok`, `degraded`, or `down`. The HTTP status is 200 for `ok` and 503 otherwise.
+
+- `down`: every configured service failed its check.
+- `degraded`: one configured service failed, the last sync reported errors, or the
+  last successful sync is older than three sync intervals. Change that multiple
+  with **Stale sync after N intervals** in Settings, or `HEALTH_STALE_FACTOR`.
+
+In [Uptime Kuma](https://github.com/louislam/uptime-kuma), add an **HTTP(s)** monitor:
+
+1. URL: `http://<server-ip>:8789/health/full`
+2. Heartbeat interval: 60 seconds (a shorter interval just hits the cache).
+3. Accepted status codes: `200`. A 503 marks the check down.
+4. Leave the monitor on your own network. The endpoint has no password.
+
+Use `/health` for Docker. Use `/health/full` when you want to know that a sync
+actually succeeded.
+
 ## For developers
 
 `app.py` is the whole service (Python standard library plus `requests`); `ui.html` is the
