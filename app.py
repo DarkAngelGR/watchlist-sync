@@ -1140,6 +1140,13 @@ class Syncer:
                             with self.action_lock:
                                 if self.action:
                                     self.action["errors"].append(f"{it['title']} (tag): {e}")
+            except Exception as e:
+                # Otherwise the thread dies, the UI is told the job finished, and
+                # nothing explains why nobody was deleted.
+                log.error("Excluding %s failed: %s", username, safe_err(e, self.all_secrets()))
+                with self.action_lock:
+                    if self.action:
+                        self.action["errors"].append(safe_err(e, self.all_secrets()))
             finally:
                 with self.action_lock:
                     if self.action:

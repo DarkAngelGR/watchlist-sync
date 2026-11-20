@@ -1909,5 +1909,22 @@ def auto_fetch_order_tests():
 
 auto_fetch_order_tests()
 
+def exclude_thread_tests():
+    with tempfile.TemporaryDirectory() as td:
+        sy = app.Syncer(td)
+        try:
+            sy.settings.update({"plex_token": "secret-plex-zzz"})
+            sy.action = {"user": "a", "state": "running", "deleted": [], "untagged": [], "errors": [], "total": 1}
+            sy.build = lambda: (_ for _ in ()).throw(RuntimeError("boom secret-plex-zzz"))
+            sy._do_exclude("a", {"delete": [{"service": "sonarr", "id": 1, "title": "Show"}], "keep": []}, True)
+            assert sy.action["state"] == "done"
+            assert sy.action["errors"] and "secret-plex-zzz" not in sy.action["errors"][0]
+            assert "boom" in sy.action["errors"][0]
+        finally:
+            sy.state.db.close()
+    print("exclude thread tests OK")
+
+exclude_thread_tests()
+
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])
 print("ALL OK")
