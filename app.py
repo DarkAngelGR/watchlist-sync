@@ -355,6 +355,28 @@ def safe_err(e, secrets=None, limit=200, prefix=""):
     return prefix + str(redact_secrets(e, secrets))[:limit]
 
 
+def external_num(value):
+    """Positive TVDB/TMDB id, or None.
+
+    Plex guids are not always a bare integer: `81189?lang=en` and `81189/1`
+    both show up. The first number is the series/movie id (`/1` is a season).
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    text = value.strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+    m = re.search(r"\d+", text.split("?", 1)[0])
+    if not m:
+        return None
+    n = int(m.group(0))
+    return n if n > 0 else None
+
+
 # --------------------------------------------------------------------------- http
 def request(session, method, url, retries=4, **kw):
     """HTTP with backoff on 429/5xx and network errors."""
@@ -517,13 +539,32 @@ class Plex:
         cached = self.state.cached_guids(rating_key)
         if cached is not None:
             return cached
-        mc = self._get_json(f"{self.DISCOVER}/library/metadata/{rating_key}", includeGuids=1)
-        meta = (mc.get("MediaContainer", {}).get("Metadata") or [{}])[0]
+        data = self._get_json(f"{self.DISCOVER}/library/metadata/{rating_key}", includeGuids=1)
+        mc = data.get("MediaContainer") if isinstance(data, dict) else None
+        meta = mc.get("Metadata") if isinstance(mc, dict) else None
+        if isinstance(meta, dict):
+            meta = [meta]
+        first = meta[0] if isinstance(meta, list) and meta and isinstance(meta[0], dict) else {}
+        raw = first.get("Guid") or []
+        if isinstance(raw, dict):
+            raw = [raw]
         guids = {}
-        for g in meta.get("Guid", []) or []:
-            m = re.match(r"(tvdb|tmdb|imdb)://(.+)", g.get("id", ""))
-            if m:
-                guids[m.group(1)] = m.group(2)
+        if isinstance(raw, list):
+            for g in raw:
+                if not isinstance(g, dict) or not isinstance(g.get("id"), str):
+                    continue
+                m = re.match(r"(tvdb|tmdb|imdb)://([^?#]+)", g["id"].strip())
+                if not m:
+                    continue
+                kind, value = m.group(1), m.group(2).strip().strip("/")
+                if kind in ("tvdb", "tmdb"):
+                    num = external_num(value)
+                    if not num:
+                        continue
+                    value = str(num)
+                elif not value:
+                    continue
+                guids[kind] = value
         if guids:
             self.state.cache_guids(rating_key, guids)
         return guids
@@ -1023,10 +1064,11 @@ class Syncer:
                 log.error("Plex metadata lookup failed for '%s': %s", it["title"], e)
                 summary["errors"].append(f"plex:{it['title']}: {e}")
                 continue
-            if not ext:
-                log.debug("No %s id for '%s', skipping", id_type.upper(), it["title"])
+            ext_id = external_num(ext)
+            if not ext_id:
+                log.debug("No numeric %s id for '%s', skipping", id_type.upper(), it["title"])
                 continue
-            g = grouped.setdefault(int(ext), {"title": it["title"], "users": set()})
+            g = grouped.setdefault(ext_id, {"title": it["title"], "users": set()})
             g["users"] |= it["users"]
         return grouped
 

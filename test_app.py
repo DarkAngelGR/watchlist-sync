@@ -1680,5 +1680,57 @@ def gzip_tests():
 
 gzip_tests()
 
+def guid_grouping_tests():
+    assert app.external_num("81189") == 81189
+    assert app.external_num("81189?lang=en") == 81189
+    assert app.external_num("81189/1") == 81189
+    assert app.external_num("movie/27205") == 27205
+    assert app.external_num("  42 ") == 42
+    assert app.external_num("nope") is None
+    assert app.external_num(True) is None
+    assert app.external_num(False) is None
+    assert app.external_num(0) is None
+    assert app.external_num(-3) is None
+    assert app.external_num(None) is None
+    assert app.external_num(12.5) is None
+
+    with tempfile.TemporaryDirectory() as td:
+        sy = app.Syncer(td)
+        try:
+            plex = app.Plex("tok", sy.client_id, sy.state)
+            plex._get_json = lambda url, **params: {"MediaContainer": {"Metadata": [{"Guid": [
+                {"id": "tvdb://81189?lang=en"},
+                {"id": "imdb://tt0903747"},
+                {"id": "tmdb://movie/1396"},
+                "nope",
+                {"id": None},
+                {"id": "tvdb://not-a-number"},
+            ]}]}}
+            assert plex.guids("rk1") == {"tvdb": "81189", "imdb": "tt0903747", "tmdb": "1396"}
+
+            class P:
+                def guids(self, rk):
+                    return {
+                        "good": {"tvdb": "81189"},
+                        "dirty": {"tvdb": "305288?lang=en"},
+                        "bad": {"tvdb": "nope"},
+                    }[rk]
+            sy.plex = P()
+            summary = {"errors": []}
+            grouped = sy._group_by({
+                "good": {"title": "Breaking Bad", "users": {"a"}},
+                "dirty": {"title": "Stranger Things", "users": {"b"}},
+                "bad": {"title": "Mystery", "users": {"c"}},
+            }, "tvdb", summary)
+            assert set(grouped) == {81189, 305288}, grouped
+            assert grouped[305288]["users"] == {"b"}
+            assert summary["errors"] == []
+            assert "Mystery" not in {v["title"] for v in grouped.values()}
+        finally:
+            sy.state.db.close()
+    print("guid grouping tests OK")
+
+guid_grouping_tests()
+
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])
 print("ALL OK")
