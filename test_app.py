@@ -2186,5 +2186,20 @@ def lookup_shape_tests():
 
 lookup_shape_tests()
 
+def profile_shape_tests():
+    cfg = type("C", (), {"url": "http://localhost:7878", "api_key": "k",
+                         "quality_profile": "", "root_folder": ""})()
+    arr = app.Arr("Radarr", cfg)
+    with patch.object(arr, "get", return_value=[{"id": 1}, {"id": 2, "name": "HD"}]):
+        assert arr.quality_profile_id() == 1
+        assert arr.quality_profile_id("hd") == 2
+    with patch.object(arr, "get", return_value={"id": 3, "name": "Any"}):
+        assert arr.quality_profile_id() == 3
+    with patch.object(arr, "get", return_value=[{"id": 9}, {"path": "/tv"}, {"path": None}, "nope"]):
+        assert arr.root_folder() == "/tv"
+    print("profile shape tests OK")
+
+profile_shape_tests()
+
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])
 print("ALL OK")

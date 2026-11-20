@@ -675,20 +675,22 @@ class Arr:
         return r.json()
 
     def quality_profile_id(self, want=None):
-        profiles = self.get("/qualityprofile")
+        profiles = [p for p in dicts(self.get("/qualityprofile")) if p.get("id") is not None]
         want = self.cfg.quality_profile if want is None else want
         if not profiles:
             raise RuntimeError(f"{self.name}: no quality profiles found")
         if want:
             for p in profiles:
-                if str(p["id"]) == want or p["name"].lower() == want.lower():
+                name = p.get("name")
+                if str(p["id"]) == want or (isinstance(name, str) and name.lower() == want.lower()):
                     return p["id"]
-            raise RuntimeError(f"{self.name}: quality profile '{want}' not found "
-                               f"(have: {', '.join(p['name'] for p in profiles)})")
+            have = ", ".join(p["name"] for p in profiles if isinstance(p.get("name"), str))
+            raise RuntimeError(f"{self.name}: quality profile '{want}' not found (have: {have})")
         return profiles[0]["id"]
 
     def root_folder(self, want=None, *, folders=None):
-        paths = [f["path"] for f in (self.get("/rootfolder") if folders is None else folders)]
+        raw = self.get("/rootfolder") if folders is None else folders
+        paths = [f["path"] for f in dicts(raw) if isinstance(f.get("path"), str) and f["path"]]
         if not paths:
             raise RuntimeError(f"{self.name}: no root folders configured")
         want = self.cfg.root_folder if want is None else want
