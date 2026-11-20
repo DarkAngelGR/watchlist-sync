@@ -89,8 +89,15 @@ FIELDS = {
     "bazarr_api_key": ("BAZARR_API_KEY", "", str),
     # Optional: trending TV shows for Orama's Discover row (Radarr covers movies)
     "tmdb_api_key": ("TMDB_API_KEY", "", str),
+    "ntfy_url": ("NTFY_URL", "", str),
+    "ntfy_token": ("NTFY_TOKEN", "", str),
+    "discord_webhook": ("DISCORD_WEBHOOK", "", str),
+    "notify_added": ("NOTIFY_ADDED", True, bool),
+    "notify_downloaded": ("NOTIFY_DOWNLOADED", True, bool),
+    "notify_failed": ("NOTIFY_FAILED", True, bool),
 }
-SECRETS = ("plex_token", "sonarr_api_key", "radarr_api_key", "bazarr_api_key", "tmdb_api_key")
+SECRETS = ("plex_token", "sonarr_api_key", "radarr_api_key", "bazarr_api_key", "tmdb_api_key",
+           "ntfy_token", "discord_webhook")
 
 
 def cast(typ, v, default=None, hi=None):
@@ -183,6 +190,12 @@ class Config:
         self.bazarr_url = s["bazarr_url"]
         self.bazarr_key = s["bazarr_api_key"]
         self.tmdb_key = s["tmdb_api_key"]
+        self.ntfy_url = s["ntfy_url"]
+        self.ntfy_token = s["ntfy_token"]
+        self.discord_webhook = s["discord_webhook"]
+        self.notify_added = s["notify_added"]
+        self.notify_downloaded = s["notify_downloaded"]
+        self.notify_failed = s["notify_failed"]
 
 
 # --------------------------------------------------------------------------- state
@@ -221,6 +234,7 @@ class State:
                     "CREATE TABLE IF NOT EXISTS wants (service TEXT, ext_id INTEGER, user TEXT, "
                     "PRIMARY KEY (service, ext_id, user))"
                 )
+                self.db.execute("CREATE TABLE IF NOT EXISTS notify_sent (k TEXT PRIMARY KEY, ts INTEGER NOT NULL)")
 
     def get(self, k, default=None):
         with self.lock:
@@ -403,6 +417,16 @@ class State:
             else:
                 self.db.execute("VACUUM")
 
+    def notify_seen(self, key):
+        with self.lock:
+            return self.db.execute("SELECT 1 FROM notify_sent WHERE k=?", (key,)).fetchone() is not None
+
+    def notify_mark(self, key, now=None):
+        now = int(time.time() if now is None else now)
+        with self.lock, self.db:
+            self.db.execute("INSERT OR REPLACE INTO notify_sent VALUES (?,?)", (key, now))
+            self.db.execute("DELETE FROM notify_sent WHERE ts < ?", (now - HANDLED_KEEP_DAYS * 86400,))
+
 
 def redact_secrets(text, secrets=None):
     if not text:
@@ -410,6 +434,9 @@ def redact_secrets(text, secrets=None):
     s = str(text)
     s = re.sub(r"([?&](?:api_?key|token|password)=)[^& \'\"]+", r"\1[REDACTED]", s, flags=re.IGNORECASE)
     s = re.sub(r"(Bearer\s+)[A-Za-z0-9._~+/-]+", r"\1[REDACTED]", s)
+    s = re.sub(
+        r"(https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/\d+/)[\w.-]+",
+        r"\1[REDACTED]", s, flags=re.IGNORECASE)
     if secrets:
         for sec in secrets:
             if sec and len(str(sec)) >= 4:
@@ -1182,6 +1209,7 @@ class Syncer:
             elif self.radarr and self._watchlists_trusted():
                 self.state.set_wants("radarr", {})
             self._nudge_bazarr(summary)
+            self._notify_followups()
         except Exception as e:
             # log.exception would write the raw message, and last_run is shown
             # in the admin UI. A Plex or API error can include a token.
@@ -1400,6 +1428,8 @@ class Syncer:
                 if self.cfg.dry_run:
                     log.info("[dry-run] would add %s '%s' (tvdb:%s) for %s", kind, title, tvdb, who)
                     summary["added_series"].append(title)
+                    self.notify("added", title, year=found.get("year"), who=who, poster=self._poster(found),
+                                dedupe=f"added:sonarr:{tvdb}")
                     continue
                 try:
                     s.post("/series", body)
@@ -1412,10 +1442,13 @@ class Syncer:
                 existing.add(tvdb)
                 summary["added_series"].append(title)
                 log.info("Added %s '%s' (tvdb:%s) requested by %s", kind, title, tvdb, who)
+                self.notify("added", title, year=found.get("year"), who=who, poster=self._poster(found),
+                            dedupe=f"added:sonarr:{tvdb}")
             except Exception as e:
                 err = safe_err(e, self.all_secrets())
                 log.error("Sonarr: failed on '%s': %s", title, err)
                 summary["errors"].append(f"sonarr:{title}: {err}")
+                self.notify("failed", title, detail=err, dedupe=f"addfail:sonarr:{tvdb}")
         if summary["added_series"]:
             self._invalidate_library("show")
 
@@ -1447,6 +1480,8 @@ class Syncer:
                 if self.cfg.dry_run:
                     log.info("[dry-run] would add movie '%s' (tmdb:%s) for %s", title, tmdb, who)
                     summary["added_movies"].append(title)
+                    self.notify("added", title, year=movie.get("year"), who=who, poster=self._poster(movie),
+                                dedupe=f"added:radarr:{tmdb}")
                     continue
                 try:
                     r.post("/movie", body)
@@ -1459,10 +1494,13 @@ class Syncer:
                 existing.add(tmdb)
                 summary["added_movies"].append(title)
                 log.info("Added movie '%s' (tmdb:%s) requested by %s", title, tmdb, who)
+                self.notify("added", title, year=movie.get("year"), who=who, poster=self._poster(movie),
+                            dedupe=f"added:radarr:{tmdb}")
             except Exception as e:
                 err = safe_err(e, self.all_secrets())
                 log.error("Radarr: failed on '%s': %s", title, err)
                 summary["errors"].append(f"radarr:{title}: {err}")
+                self.notify("failed", title, detail=err, dedupe=f"addfail:radarr:{tmdb}")
         if summary["added_movies"]:
             self._invalidate_library("movie")
 
@@ -1883,19 +1921,30 @@ class Syncer:
             users = {user} if user else {"tv"}
             if arr.find(ext_id):
                 return {"ok": True, "status": "already-there", "service": svc}
+            who = ", ".join(sorted(users))
             if kind == "movie":
                 movie = next(iter(dicts(arr.get("/movie/lookup/tmdb", tmdbId=ext_id))), None)
                 if not movie:
+                    self.notify("failed", f"TMDB {ext_id}", detail=f"{svc} couldn't find that movie",
+                                dedupe=f"addfail:{service}:{ext_id}")
                     raise LookupError(f"{svc} couldn't find that movie")
+                source = movie
                 if cfg.dry_run:
+                    self.notify("added", source.get("title") or "?", year=source.get("year"), who=who,
+                                poster=self._poster(source), dedupe=f"added:{service}:{ext_id}")
                     return {"ok": True, "status": "dry-run", "service": svc}
                 body = self._radarr_body(arr, cfg, movie, users, arr.quality_profile_id(), root or arr.root_folder())
                 title, anime = movie.get("title") or "?", False
             else:
                 found = next(iter(dicts(arr.get("/series/lookup", term=f"tvdb:{ext_id}"))), None)
                 if not found:
+                    self.notify("failed", f"TVDB {ext_id}", detail=f"{svc} couldn't find that show",
+                                dedupe=f"addfail:{service}:{ext_id}")
                     raise LookupError(f"{svc} couldn't find that show")
+                source = found
                 if cfg.dry_run:
+                    self.notify("added", source.get("title") or "?", year=source.get("year"), who=who,
+                                poster=self._poster(source), dedupe=f"added:{service}:{ext_id}")
                     return {"ok": True, "status": "dry-run", "service": svc}
                 body, anime = self._sonarr_body(arr, cfg, self._sonarr_ctx(arr, cfg), found, users)
                 title = found.get("title") or "?"
@@ -1904,13 +1953,17 @@ class Syncer:
             except ArrError as e:
                 if e.already_exists:
                     return {"ok": True, "status": "already-there", "service": svc}
+                self.notify("failed", title, detail=safe_err(e, self.all_secrets()),
+                            dedupe=f"addfail:{service}:{ext_id}")
                 raise
             self.state.mark(service, ext_id, title, users, "auto-requested" if auto else "requested")
             self._invalidate_library(kind)
             with self.cache_lock:
                 self.__dict__.pop("_discover_cache", None)
                 self.__dict__.pop("_queue_cache", None)
-            log.info("Added %s '%s' requested from a TV by %s", "anime" if anime else kind, title, ", ".join(users))
+            log.info("Added %s '%s' requested from a TV by %s", "anime" if anime else kind, title, who)
+            self.notify("added", title, year=source.get("year"), who=who, poster=self._poster(source),
+                        dedupe=f"added:{service}:{ext_id}")
             return {"ok": True, "status": "added", "service": svc, "title": title}
 
     def tv_search_again(self, kind, ext_id):
@@ -2257,6 +2310,171 @@ class Syncer:
             self._queue_cache = (now, result)
         return result
 
+    def notify(self, event, title, year=None, who="", detail="", poster="", dedupe=None):
+        """Queue one notification. Dry run logs it. A delivery problem never escapes."""
+        try:
+            cfg = Config(self.settings.all())
+            enabled = {"added": cfg.notify_added, "downloaded": cfg.notify_downloaded,
+                       "failed": cfg.notify_failed}.get(event)
+            if not enabled or not (cfg.ntfy_url or cfg.discord_webhook):
+                return
+            # Dry-run remembers its own key, so turning dry run off still sends the real event.
+            key = f"dry:{dedupe}" if cfg.dry_run and dedupe else dedupe
+            if key and self.state.notify_seen(key):
+                return
+            head, body = notification_text(event, title, year=year, who=who, detail=detail)
+            if key:
+                self.state.notify_mark(key)
+            if cfg.dry_run:
+                log.info("[dry-run] notify %s", head)
+                return
+            self._spawn_notify({
+                "ntfy_url": cfg.ntfy_url, "ntfy_token": cfg.ntfy_token,
+                "discord_webhook": cfg.discord_webhook, "title": head, "body": body,
+                "poster": public_http_url(poster),
+            })
+        except Exception as e:
+            log.warning("Notify skipped: %s", safe_err(e, self.all_secrets()))
+
+    def _spawn_notify(self, job):
+        threading.Thread(target=self._deliver, args=(job,), daemon=True).start()
+
+    def _deliver(self, job, retries=3):
+        secrets = [x for x in list(self.all_secrets()) + [job.get("ntfy_token"), job.get("discord_webhook")] if x]
+        poster = job.get("poster") or ""
+
+        def one(label, fn):
+            last = None
+            for i in range(max(1, retries)):
+                try:
+                    response = fn()
+                    code = getattr(response, "status_code", 200)
+                    if code >= 400:
+                        raise RuntimeError(f"{label} HTTP {code}")
+                    return None
+                except Exception as e:
+                    last = safe_err(e, secrets)
+                    if i + 1 < retries:
+                        time.sleep(0.5 * (i + 1))
+            log.warning("Notify %s failed: %s", label, last)
+            return last
+
+        err = None
+        if job.get("ntfy_url"):
+            err = one("ntfy", lambda: post_ntfy(
+                job["ntfy_url"], job.get("ntfy_token") or "", job["title"], job.get("body") or "", poster)) or err
+        if job.get("discord_webhook"):
+            err = one("discord", lambda: post_discord(
+                job["discord_webhook"], job["title"], job.get("body") or "", poster)) or err
+        if err is None and (job.get("ntfy_url") or job.get("discord_webhook")):
+            log.info("Notified: %s", job.get("title"))
+        return err
+
+    def send_test(self, channel, body):
+        if not isinstance(body, dict):
+            body = {}
+        cfg = Config(self.settings.all())
+        job = {"ntfy_url": "", "ntfy_token": "", "discord_webhook": "", "title": "watchlist-sync",
+               "body": "Test notification from watchlist-sync.", "poster": ""}
+        if channel == "ntfy":
+            job["ntfy_url"] = str(body.get("ntfy_url") or cfg.ntfy_url).strip()[:500]
+            token = str(body.get("ntfy_token") or "").strip()
+            job["ntfy_token"] = (token or cfg.ntfy_token or "")[:200]
+            if not job["ntfy_url"]:
+                return "ntfy URL is required"
+        elif channel == "discord":
+            hook = str(body.get("discord_webhook") or "").strip()
+            job["discord_webhook"] = (hook or cfg.discord_webhook or "")[:500]
+            if not job["discord_webhook"]:
+                return "Discord webhook is required"
+        else:
+            return "channel must be ntfy or discord"
+        return self._deliver(job, retries=1)
+
+    def _notify_followups(self):
+        try:
+            cfg = Config(self.settings.all())
+            if not (cfg.ntfy_url or cfg.discord_webhook):
+                return
+            if cfg.notify_failed:
+                self._notify_queue()
+            if cfg.notify_downloaded:
+                self._notify_imports()
+        except Exception as e:
+            log.warning("Notify follow-up failed: %s", safe_err(e, self.all_secrets()))
+
+    def _notify_queue(self):
+        for arr, kind, service in ((self.radarr, "movie", "radarr"), (self.sonarr, "show", "sonarr")):
+            if not arr:
+                continue
+            try:
+                items = self._queue_of(arr, kind)
+            except Exception as e:
+                log.warning("Notify queue check failed for %s: %s", service, safe_err(e, self.all_secrets()))
+                continue
+            for it in items:
+                status = it.get("status")
+                if status not in ("failed", "stalled"):
+                    continue
+                ext = it.get("tmdb") if kind == "movie" else it.get("tvdb")
+                if not ext:
+                    continue
+                detail = "Download stalled" if status == "stalled" else "Download failed"
+                self.notify("failed", it.get("title") or "?", year=it.get("year"), poster=it.get("poster") or "",
+                            detail=detail, dedupe=f"queue:{service}:{ext}:{status}")
+
+    def _history_since(self, arr, service):
+        """Imports newer than the stored cursor. The first call only stores the cursor."""
+        key = f"history_cursor_{service}"
+        raw = self.state.get(key)
+        cursor = int(raw) if raw is not None else None
+        found = []
+        highest = cursor or 0
+        # shortcut: three pages (150 imports) per cycle, raise the cap if a library imports faster than that
+        for page in range(1, 4):
+            payload = arr.get("/history", page=page, pageSize=50, sortKey="id",
+                              sortDirection="descending", eventType="downloadFolderImported")
+            if isinstance(payload, dict):
+                recs = [r for r in (payload.get("records") or []) if isinstance(r, dict)]
+            else:
+                recs = dicts(payload)
+            if not recs:
+                break
+            stop = False
+            for rec in recs:
+                rid = rec.get("id")
+                if isinstance(rid, bool) or not isinstance(rid, int):
+                    continue
+                if rid > highest:
+                    highest = rid
+                if cursor is not None and rid > cursor:
+                    found.append(rec)
+                elif cursor is not None and rid <= cursor:
+                    stop = True
+            if stop or len(recs) < 50:
+                break
+        if cursor is None:
+            self.state.set(key, str(highest))
+            return []
+        if highest > cursor:
+            self.state.set(key, str(highest))
+        return found
+
+    def _notify_imports(self):
+        for arr, service, kind in ((self.radarr, "radarr", "movie"), (self.sonarr, "sonarr", "show")):
+            if not arr:
+                continue
+            try:
+                records = self._history_since(arr, service)
+            except Exception as e:
+                log.warning("Notify history failed for %s: %s", service, safe_err(e, self.all_secrets()))
+                continue
+            cursor = self.state.get(f"history_cursor_{service}")
+            for item in group_imports(records, kind):
+                self.notify("downloaded", item["title"], year=item.get("year"), detail=item["detail"],
+                            poster=item.get("poster") or "",
+                            dedupe=f"import:{service}:{item['ident']}:{cursor}")
+
     def _nudge_bazarr(self, summary, cfg=None):
         """Make Bazarr pick up the new series/movies now instead of on its next sync."""
         cfg = cfg or self.cfg
@@ -2278,6 +2496,105 @@ class Syncer:
                 err = safe_err(e, self.all_secrets())
                 log.warning("Bazarr: could not trigger %s: %s", task, err)
                 summary["errors"].append(f"bazarr:{task}: {err}")
+
+
+def notification_text(event, title, year=None, who="", detail=""):
+    labels = {"added": "Added", "downloaded": "Downloaded", "failed": "Failed"}
+    name = str(title or "Untitled").strip()[:180] or "Untitled"
+    if isinstance(year, str) and year.isdigit():
+        year = int(year)
+    if isinstance(year, int) and not isinstance(year, bool):
+        name = f"{name} ({year})"
+    lines = []
+    if who:
+        lines.append("Requested by " + str(who).strip()[:200])
+    if detail:
+        lines.append(str(detail).strip()[:300])
+    return f"{labels.get(event, 'Notice')}: {name}", "\n".join(lines)
+
+
+def public_http_url(url):
+    if not isinstance(url, str):
+        return ""
+    parts = urlparse(url.strip())
+    if parts.scheme in ("http", "https") and parts.netloc:
+        return url.strip()
+    return ""
+
+
+def post_ntfy(url, token, title, message, poster):
+    parts = urlparse((url or "").strip())
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise ValueError("bad ntfy url")
+    topic = [p for p in parts.path.split("/") if p]
+    if not topic:
+        raise ValueError("bad ntfy url")
+    payload = {"topic": topic[-1], "title": title[:200], "message": (message or title)[:1800]}
+    if poster:
+        payload["attach"] = poster
+        payload["icon"] = poster
+    headers = {"Authorization": "Bearer " + token} if token else {}
+    return requests.post(f"{parts.scheme}://{parts.netloc}", json=payload, headers=headers, timeout=10)
+
+
+def post_discord(url, title, message, poster):
+    parts = urlparse((url or "").strip())
+    if parts.scheme != "https" or not parts.netloc:
+        raise ValueError("bad discord webhook")
+    embed = {"title": title[:256]}
+    if message:
+        embed["description"] = message[:2000]
+    if poster and poster.startswith("https://"):
+        embed["thumbnail"] = {"url": poster}
+    return requests.post(url.strip(), json={"embeds": [embed]}, timeout=10)
+
+
+def _episode_label(rec):
+    ep = rec.get("episode") if isinstance(rec, dict) and isinstance(rec.get("episode"), dict) else {}
+    if ep.get("episodeNumber") is None:
+        return ""
+    try:
+        return "S%02dE%02d" % (int(ep.get("seasonNumber") or 0), int(ep["episodeNumber"]))
+    except (TypeError, ValueError):
+        return ""
+
+
+def group_imports(records, kind):
+    """One entry per movie or series. Episodes of a series in this batch share it."""
+    groups = {}
+    order = []
+    for rec in records or []:
+        if not isinstance(rec, dict) or rec.get("eventType") not in (None, "downloadFolderImported"):
+            continue
+        if kind == "movie":
+            obj = rec.get("movie") if isinstance(rec.get("movie"), dict) else {}
+            ident = obj.get("tmdbId") or rec.get("movieId")
+            title = obj.get("title") or "Movie"
+        else:
+            obj = rec.get("series") if isinstance(rec.get("series"), dict) else {}
+            ident = obj.get("tvdbId") or rec.get("seriesId")
+            title = obj.get("title") or "Series"
+        if ident is None:
+            continue
+        if ident not in groups:
+            order.append(ident)
+            groups[ident] = {"title": title, "year": obj.get("year"), "poster": Syncer._poster(obj),
+                             "eps": [], "ident": ident}
+        label = "" if kind == "movie" else _episode_label(rec)
+        if label:
+            groups[ident]["eps"].append(label)
+    out = []
+    for ident in order:
+        g = groups[ident]
+        eps = sorted(set(g["eps"]))
+        if len(eps) == 1:
+            detail = eps[0]
+        elif eps:
+            detail = f"{len(eps)} episodes"
+        else:
+            detail = ""
+        out.append({**g, "detail": detail})
+    return out
 
 
 # --------------------------------------------------------------------------- request origin
@@ -2798,6 +3115,14 @@ def make_handler(syncer, ui_password):
                 if plan is None:
                     return self._send(409, {"error": "Another exclusion is still running"})
                 return self._send(200, {"ok": True, "plan": plan})
+            if p == "/api/test/notify":
+                channel = str(body.get("channel") or "")
+                if channel not in ("ntfy", "discord"):
+                    return self._send(400, {"error": "channel must be ntfy or discord"})
+                err = syncer.send_test(channel, body)
+                if err:
+                    return self._send(200, {"ok": False, "error": err})
+                return self._send(200, {"ok": True})
             m = re.fullmatch(r"/api/test/(sonarr|radarr|bazarr)", p)
             if m:
                 svc = m.group(1)

@@ -184,6 +184,31 @@ Auto-fetch uses the configured Radarr quality profile and search-on-add policy. 
 **Allow movie auto-fetch** to disable automatic requests across the household. Dry run also
 prevents automatic writes. Manual movie and series requests are available from the TV.
 
+## Notifications
+
+Optional. When a title is added, a download fails or stalls, or Sonarr/Radarr imports a
+file, watchlist-sync can post to [ntfy](https://ntfy.sh) and a Discord webhook. Set them
+under **Settings › Notifications**, or with `NTFY_URL`, `NTFY_TOKEN`, `DISCORD_WEBHOOK`,
+`NOTIFY_ADDED`, `NOTIFY_DOWNLOADED` and `NOTIFY_FAILED` (see `.env.example`). Values saved
+on the page win. Each channel has a **Send test** button.
+
+`NTFY_URL` is the topic URL, for example `https://ntfy.sh/mytopic` or a self-hosted topic.
+`NTFY_TOKEN` is the optional bearer token for a protected topic. `DISCORD_WEBHOOK` is the
+webhook URL Discord gives you. Both secrets are stored like the Sonarr API key: the page
+only shows that one is set, and a blank field keeps the saved value.
+
+- **Added** is a sync or a TV request that put a title in Sonarr/Radarr, including who
+  requested it. A poster is attached when the channel can show one.
+- **Downloaded** is read from Sonarr and Radarr history (`downloadFolderImported`) each
+  sync. The first run remembers the current history and does not replay it. Episodes of
+  one series in the same sync are a single message.
+- **Failed** is a title that could not be added, or a download that is failed or stalled
+  in the queue. Each title is reported once for that failure, not on every sync.
+
+Dry run writes the message to the log instead of sending it. Messages go out in the
+background with a short timeout and a few retries. A delivery problem does not stop a sync,
+and a restart does not send the same one again.
+
 ## For developers
 
 `app.py` is the whole service (Python standard library plus `requests`); `ui.html` is the

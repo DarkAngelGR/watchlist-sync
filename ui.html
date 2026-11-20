@@ -182,6 +182,23 @@ dialog li{margin:2px 0}
         <div class="row"><label>Ignore these users</label><input type="text" name="user_block" placeholder="comma-separated"></div>
       </fieldset>
 
+      <fieldset>
+        <legend>Notifications <span class="mute small">(optional)</span></legend>
+        <div class="row"><label>ntfy URL</label><input type="text" name="ntfy_url" placeholder="https://ntfy.sh/mytopic"></div>
+        <div class="row"><label>ntfy token</label><input type="password" name="ntfy_token" placeholder="optional, for a protected topic"></div>
+        <div class="row"><label></label><div><button type="button" data-test="ntfy">Send test</button></div></div>
+        <div class="testline" id="test-ntfy"></div>
+        <div class="row"><label>Discord webhook</label><input type="password" name="discord_webhook" placeholder="https://discord.com/api/webhooks/…"></div>
+        <div class="row"><label></label><div><button type="button" data-test="discord">Send test</button></div></div>
+        <div class="testline" id="test-discord"></div>
+        <div class="row"><label>Events</label><div class="checks">
+          <label><input type="checkbox" name="notify_added"> Added</label>
+          <label><input type="checkbox" name="notify_downloaded"> Downloaded</label>
+          <label><input type="checkbox" name="notify_failed"> Failed</label>
+        </div></div>
+        <div class="row"><label></label><div class="mute small">Added includes who requested it. Downloaded is a movie or episode Sonarr/Radarr imported. Failed is an add that didn't go through, or a download that fails or stalls, once per title.</div></div>
+      </fieldset>
+
       <div class="actions"><button class="primary" type="submit">Save settings</button><span id="saveMsg" class="small mute"></span></div>
     </form>
   </section>
@@ -431,6 +448,17 @@ async function loadSettings(){
 form.querySelectorAll("[data-test]").forEach(btn => btn.onclick = async () => {
   const svc = btn.dataset.test, out = $("#test-" + svc);
   out.className = "testline mute"; out.textContent = "Testing…";
+  if (svc === "ntfy" || svc === "discord") {
+    const res = await api("/api/test/notify", {method:"POST", body: JSON.stringify({
+      channel: svc,
+      ntfy_url: form.elements.ntfy_url.value,
+      ntfy_token: form.elements.ntfy_token.value,
+      discord_webhook: form.elements.discord_webhook.value,
+    })});
+    out.className = "testline " + (res.ok ? "ok" : "bad");
+    out.textContent = res.ok ? "Sent" : (res.error || "Failed");
+    return;
+  }
   const res = await api("/api/test/" + svc, {method:"POST", body: JSON.stringify({
     url: form.elements[svc + "_url"].value, api_key: form.elements[svc + "_api_key"].value})});
   if (!res.ok){ out.className = "testline bad"; out.textContent = res.error || "Failed"; return; }

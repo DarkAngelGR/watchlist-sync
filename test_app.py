@@ -2487,5 +2487,255 @@ def library_generation_tests():
 
 library_generation_tests()
 
+def notify_tests():
+    head, body = app.notification_text("added", "Inception", 2010, who="aggelos")
+    assert head == "Added: Inception (2010)" and body == "Requested by aggelos"
+    head, body = app.notification_text("downloaded", "Breaking Bad", "2008", detail="2 episodes")
+    assert head == "Downloaded: Breaking Bad (2008)" and body == "2 episodes"
+    head, body = app.notification_text("failed", "Nope", detail="Download stalled")
+    assert head == "Failed: Nope" and body == "Download stalled"
+    one = app.group_imports([{
+        "eventType": "downloadFolderImported", "seriesId": 1,
+        "series": {"title": "Breaking Bad", "year": 2008, "tvdbId": 81189},
+        "episode": {"seasonNumber": 1, "episodeNumber": 4},
+    }], "show")
+    assert one[0]["detail"] == "S01E04"
+    assert app.group_imports([{"eventType": "grab", "seriesId": 1, "series": {"title": "X", "tvdbId": 1}}], "show") == []
+
+    with tempfile.TemporaryDirectory() as td:
+        sy = app.Syncer(td)
+        try:
+            hook = "https://discord.com/api/webhooks/9/supersecret"
+            sy.settings.update({
+                "ntfy_url": "https://ntfy.sh/house",
+                "ntfy_token": "tk_secret",
+                "discord_webhook": hook,
+                "dry_run": False,
+                "notify_added": True,
+                "notify_downloaded": True,
+                "notify_failed": True,
+                "tag_by_user": False,
+                "radarr_url": "http://localhost:7878",
+                "radarr_api_key": "k",
+                "plex_token": "t",
+            })
+            pub = sy.settings.public()
+            blob = json.dumps(pub)
+            assert "supersecret" not in blob and "tk_secret" not in blob
+            assert pub["discord_webhook_set"] and pub["ntfy_token_set"]
+            assert "discord_webhook" not in pub and "ntfy_token" not in pub
+            sy.settings.update({"discord_webhook": ""})
+            assert sy.settings.all()["discord_webhook"] == hook
+
+            jobs = []
+            sy._spawn_notify = jobs.append
+            sy.notify("added", "Inception", year=2010, who="aggelos", poster="https://img.example/p.jpg",
+                      dedupe="added:radarr:1")
+            sy.notify("added", "Inception", year=2010, who="aggelos", dedupe="added:radarr:1")
+            assert len(jobs) == 1
+            assert jobs[0]["title"] == "Added: Inception (2010)"
+            assert jobs[0]["body"] == "Requested by aggelos"
+            assert jobs[0]["poster"] == "https://img.example/p.jpg"
+
+            sy.settings.update({"dry_run": True})
+            with patch.object(app.log, "info") as info:
+                sy.notify("added", "Heat", year=1995, who="maria", dedupe="added:radarr:2")
+                sy.notify("added", "Heat", year=1995, who="maria", dedupe="added:radarr:2")
+            assert len(jobs) == 1
+            assert sum("[dry-run] notify" in str(c.args[0]) for c in info.call_args_list) == 1
+            sy.settings.update({"dry_run": False})
+            sy.notify("added", "Heat", year=1995, who="maria", dedupe="added:radarr:2")
+            assert len(jobs) == 2 and jobs[1]["title"] == "Added: Heat (1995)"
+
+            sent = []
+
+            class Ok:
+                status_code = 200
+
+            def post(url, json=None, headers=None, timeout=None, **kw):
+                sent.append({"url": url, "json": json, "headers": headers or {}, "timeout": timeout})
+                return Ok()
+
+            with patch("app.requests.post", post):
+                assert sy._deliver(jobs[0], retries=1) is None
+            ntfy = next(x for x in sent if (x["json"] or {}).get("topic") == "house")
+            assert ntfy["json"]["title"] == "Added: Inception (2010)"
+            assert ntfy["json"]["attach"] == ntfy["json"]["icon"] == "https://img.example/p.jpg"
+            assert ntfy["headers"]["Authorization"] == "Bearer tk_secret" and ntfy["timeout"] == 10
+            disc = next(x for x in sent if x["url"] == hook)
+            assert disc["json"]["embeds"][0]["thumbnail"]["url"] == "https://img.example/p.jpg"
+            assert disc["json"]["embeds"][0]["description"] == "Requested by aggelos"
+
+            def boom(url, json=None, headers=None, timeout=None, **kw):
+                raise requests.ConnectionError("POST " + hook)
+
+            with patch("app.requests.post", boom), patch("app.time.sleep", lambda _s: None), \
+                 patch.object(app.log, "warning") as warn:
+                err = sy._deliver({"ntfy_url": "", "ntfy_token": "", "discord_webhook": hook,
+                                   "title": "Failed: Inception", "body": "Download stalled", "poster": ""}, retries=3)
+            assert isinstance(err, str) and "supersecret" not in err
+            logged = " ".join(str(c.args) for c in warn.call_args_list)
+            assert "supersecret" not in logged and "[REDACTED]" in logged
+
+            class Hist:
+                def __init__(self):
+                    self.records = []
+
+                def get(self, path, **params):
+                    assert path == "/history" and params["sortKey"] == "id"
+                    return {"records": list(self.records)}
+
+            def ep(i, n):
+                return {"id": i, "eventType": "downloadFolderImported", "seriesId": 1,
+                        "series": {"title": "Breaking Bad", "year": 2008, "tvdbId": 81189,
+                                   "images": [{"coverType": "poster", "remoteUrl": "https://img.example/bb.jpg"}]},
+                        "episode": {"seasonNumber": 1, "episodeNumber": n}}
+
+            hist = Hist()
+            hist.records = [ep(10, 3), ep(9, 2)]
+            sy.sonarr = hist
+            sy.radarr = None
+            before = len(jobs)
+            sy._notify_imports()
+            assert len(jobs) == before and sy.state.get("history_cursor_sonarr") == "10"
+            hist.records = [
+                {"id": 13, "eventType": "grab", "seriesId": 1,
+                 "series": {"title": "Breaking Bad", "year": 2008, "tvdbId": 81189}},
+                ep(12, 2), ep(11, 1), ep(10, 3),
+            ]
+            sy._notify_imports()
+            assert len(jobs) == before + 1
+            assert jobs[-1]["title"] == "Downloaded: Breaking Bad (2008)"
+            assert jobs[-1]["body"] == "2 episodes" and jobs[-1]["poster"] == "https://img.example/bb.jpg"
+            assert sy.state.get("history_cursor_sonarr") == "13"
+            sy._notify_imports()
+            assert len(jobs) == before + 1
+
+            class Movies:
+                def __init__(self):
+                    self.records = []
+
+                def get(self, path, **params):
+                    return {"records": list(self.records)}
+
+            movies = Movies()
+            movies.records = [{"id": 4, "eventType": "downloadFolderImported", "movieId": 2,
+                               "movie": {"title": "Inception", "year": 2010, "tmdbId": 27205}}]
+            sy.radarr = movies
+            sy._notify_imports()
+            assert len(jobs) == before + 1 and sy.state.get("history_cursor_radarr") == "4"
+            movies.records = [{"id": 5, "eventType": "downloadFolderImported", "movieId": 2,
+                               "movie": {"title": "Inception", "year": 2010, "tmdbId": 27205,
+                                         "images": [{"coverType": "poster", "remoteUrl": "https://img.example/i.jpg"}]}}]
+            sy._notify_imports()
+            assert jobs[-1]["title"] == "Downloaded: Inception (2010)"
+            assert jobs[-1]["poster"] == "https://img.example/i.jpg" and len(jobs) == before + 2
+            sy._notify_imports()
+            assert len(jobs) == before + 2
+
+            sy.sonarr = None
+            sy.radarr = object()
+
+            def queued(arr, kind):
+                assert kind == "movie"
+                return [{"title": "Inception", "year": 2010, "tmdb": 27205, "status": "stalled",
+                         "poster": "https://img.example/i.jpg"}]
+
+            with patch.object(sy, "_queue_of", queued):
+                sy._notify_queue()
+                sy._notify_queue()
+            stalled = [j for j in jobs if j["body"] == "Download stalled"]
+            assert len(stalled) == 1 and stalled[0]["title"] == "Failed: Inception (2010)"
+
+            class P:
+                def guids(self, rk):
+                    return {"tmdb": "77"}
+
+            sy.plex = P()
+            sy.cfg = app.Config(sy.settings.all())
+            sy.radarr = app.Arr("Radarr", sy.cfg.radarr)
+
+            def lookup(self, path, **params):
+                return {"title": "Inception", "year": 2010, "tmdbId": 77,
+                        "images": [{"coverType": "poster", "remoteUrl": "https://img.example/p.jpg"}]}
+
+            def fail_post(self, path, body, retries=4):
+                raise app.ArrError(400, "nope")
+
+            summary = {"added_movies": [], "errors": []}
+            with patch.object(sy, "_library", return_value={}), \
+                 patch.object(app.Arr, "quality_profile_id", return_value=1), \
+                 patch.object(app.Arr, "root_folder", return_value="/movies"), \
+                 patch.object(app.Arr, "get", lookup), \
+                 patch.object(app.Arr, "post", fail_post):
+                sy._sync_radarr({"rk": {"title": "Inception", "type": "movie", "users": {"maria"}}}, summary)
+                sy._sync_radarr({"rk": {"title": "Inception", "type": "movie", "users": {"maria"}}}, summary)
+            add_fails = [j for j in jobs if "nope" in (j["body"] or "")]
+            assert len(add_fails) == 1 and len(summary["errors"]) == 2
+            assert not sy.state.is_handled("radarr", 77)
+
+            def ok_post(self, path, body, retries=4):
+                return {"id": 1}
+
+            summary2 = {"added_movies": [], "errors": []}
+            with patch.object(sy, "_library", return_value={}), \
+                 patch.object(app.Arr, "quality_profile_id", return_value=1), \
+                 patch.object(app.Arr, "root_folder", return_value="/movies"), \
+                 patch.object(app.Arr, "get", lookup), \
+                 patch.object(app.Arr, "post", ok_post):
+                sy._sync_radarr({"rk": {"title": "Inception", "type": "movie", "users": {"maria"}}}, summary2)
+            added = [j for j in jobs if j["title"] == "Added: Inception (2010)" and "maria" in j["body"]]
+            assert added and added[-1]["poster"] == "https://img.example/p.jpg"
+            assert summary2["added_movies"] == ["Inception"]
+
+            notes = []
+            real_notify = sy.notify
+
+            def watch_notify(*a, **k):
+                notes.append((a, k))
+                return real_notify(*a, **k)
+
+            sy.notify = watch_notify
+            with patch.object(app.Arr, "find", return_value=None), \
+                 patch.object(app.Arr, "get", lookup), \
+                 patch.object(app.Arr, "quality_profile_id", return_value=1), \
+                 patch.object(app.Arr, "root_folder", return_value="/movies"), \
+                 patch.object(app.Arr, "post", ok_post):
+                res = sy.tv_request("movie", 88, "nikos")
+            assert res["status"] == "added" and res["title"]
+            assert notes[-1][0][0] == "added" and notes[-1][1]["who"] == "nikos"
+
+            sy.settings.update({"notify_failed": False})
+            n = len(jobs)
+            sy.notify("failed", "Inception", detail="Download failed", dedupe="queue:radarr:1:failed")
+            assert len(jobs) == n
+        finally:
+            sy.state.db.close()
+
+    page = urllib.request.urlopen(base + "/").read().decode()
+    assert 'name="ntfy_url"' in page and 'name="discord_webhook"' in page and 'name="notify_downloaded"' in page
+
+    class Ok:
+        status_code = 200
+
+    seen = []
+
+    def post(url, json=None, headers=None, timeout=None, **kw):
+        seen.append((url, json, headers, timeout))
+        return Ok()
+
+    with patch("app.requests.post", post):
+        res = call("/api/test/notify", {"channel": "ntfy", "ntfy_url": "https://ntfy.example/demo", "ntfy_token": "tk_test"})
+    assert res["ok"] is True, res
+    assert seen[0][1]["topic"] == "demo" and seen[0][1]["message"].startswith("Test notification")
+    assert seen[0][2]["Authorization"] == "Bearer tk_test" and seen[0][3] == 10
+    missing = call("/api/test/notify", {"channel": "discord"})
+    assert missing["ok"] is False and "required" in missing["error"]
+    code, _raw = send_custom_post(base, "/api/test/notify", json.dumps({"channel": "sms"}).encode())
+    assert code == 400
+    print("notify tests OK")
+
+notify_tests()
+
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])
 print("ALL OK")
