@@ -1943,7 +1943,7 @@ class Syncer:
         if not series:
             raise LookupError("This show isn't in Sonarr, so Bazarr doesn't know it")
         eps = arr.get("/episode", seriesId=series["id"])
-        ep = next((e for e in eps if e.get("seasonNumber") == season and e.get("episodeNumber") == episode), None)
+        ep = next((e for e in dicts(eps) if e.get("seasonNumber") == season and e.get("episodeNumber") == episode), None)
         if not ep:
             raise LookupError(f"Sonarr has no S{season:02d}E{episode:02d} for this show")
         return {"seriesid": series["id"], "episodeid": ep["id"]}
@@ -1971,11 +1971,16 @@ class Syncer:
                 score = float(x.get("score") or 0)
             except (ValueError, TypeError):
                 score = 0.0
+            rel = x.get("release_info")
+            if isinstance(rel, (list, tuple)):
+                rel = rel[0] if rel else ""
+            elif rel is None:
+                rel = ""
             results.append({
                 "provider": x.get("provider") or "", "language": code,
                 "hi": str(x.get("hearing_impaired")).lower() == "true",
                 "forced": str(x.get("forced")).lower() == "true",
-                "score": score, "release": (x.get("release_info") or [""])[0] or "",
+                "score": score, "release": str(rel),
                 "uploader": x.get("uploader") or "",
                 "_post": {"hi": str(x.get("hearing_impaired") or "False"), "forced": str(x.get("forced") or "False"),
                           "original_format": str(x.get("original_format") or "False"),

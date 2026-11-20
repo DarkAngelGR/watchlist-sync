@@ -2068,5 +2068,43 @@ def collection_lookup_tests():
 
 collection_lookup_tests()
 
+def subtitle_shape_tests():
+    with tempfile.TemporaryDirectory() as td:
+        sy = app.Syncer(td)
+        try:
+            sy.settings.update({
+                "radarr_url": "http://localhost:7878", "radarr_api_key": "k",
+                "sonarr_url": "http://localhost:8989", "sonarr_api_key": "k",
+                "bazarr_url": "http://localhost:6767", "bazarr_api_key": "bz",
+            })
+            release = "Movie.2020.1080p.BluRay"
+
+            def fake_get(url, params=None, headers=None, timeout=None):
+                return Resp(body={"data": [{
+                    "provider": "opensubtitles", "language": "en", "score": 10,
+                    "release_info": release, "subtitle": "P",
+                }]})
+
+            def fake_req(self, method, url, params=None, **kw):
+                if url.endswith("/movie"):
+                    return Resp(body=[{"id": 7, "tmdbId": 5, "title": "M"}])
+                if url.endswith("/series"):
+                    return Resp(body=[{"id": 8, "tvdbId": 9, "title": "S"}])
+                if url.endswith("/episode"):
+                    return Resp(body={"id": 3, "seasonNumber": 1, "episodeNumber": 2})
+                return Resp(body=[])
+
+            with patch.object(requests.Session, "request", fake_req), \
+                 patch.object(app.requests, "get", fake_get):
+                movie = sy.tv_subtitle_search("movie", tmdb=5)
+                assert movie["results"][0]["release"] == release, movie
+                ep = sy.tv_subtitle_search("episode", tvdb=9, season=1, episode=2)
+                assert ep["results"][0]["release"] == release
+        finally:
+            sy.state.db.close()
+    print("subtitle shape tests OK")
+
+subtitle_shape_tests()
+
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])
 print("ALL OK")
