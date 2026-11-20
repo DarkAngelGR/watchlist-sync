@@ -1235,11 +1235,11 @@ class Syncer:
                 if tvdb in existing:
                     self.state.mark("sonarr", tvdb, title, it["users"], "already-present")
                     continue
-                found = s.get("/series/lookup", term=f"tvdb:{tvdb}")
+                found = next(iter(dicts(s.get("/series/lookup", term=f"tvdb:{tvdb}"))), None)
                 if not found:
                     log.warning("Sonarr lookup found nothing for '%s' (tvdb:%s)", title, tvdb)
                     continue
-                body, anime = self._sonarr_body(s, self.cfg, ctx, found[0], it["users"])
+                body, anime = self._sonarr_body(s, self.cfg, ctx, found, it["users"])
                 who = ", ".join(sorted(it["users"]))
                 kind = "anime" if anime else "series"
                 if self.cfg.dry_run:
@@ -1282,9 +1282,7 @@ class Syncer:
                 if tmdb in existing:
                     self.state.mark("radarr", tmdb, title, it["users"], "already-present")
                     continue
-                movie = r.get("/movie/lookup/tmdb", tmdbId=tmdb)
-                if isinstance(movie, list):
-                    movie = movie[0] if movie else None
+                movie = next(iter(dicts(r.get("/movie/lookup/tmdb", tmdbId=tmdb))), None)
                 if not movie:
                     log.warning("Radarr lookup found nothing for '%s' (tmdb:%s)", title, tmdb)
                     continue
@@ -1712,8 +1710,7 @@ class Syncer:
             if arr.find(ext_id):
                 return {"ok": True, "status": "already-there", "service": svc}
             if kind == "movie":
-                movie = arr.get("/movie/lookup/tmdb", tmdbId=ext_id)
-                movie = movie[0] if isinstance(movie, list) and movie else movie
+                movie = next(iter(dicts(arr.get("/movie/lookup/tmdb", tmdbId=ext_id))), None)
                 if not movie:
                     raise LookupError(f"{svc} couldn't find that movie")
                 if cfg.dry_run:
@@ -1721,13 +1718,13 @@ class Syncer:
                 body = self._radarr_body(arr, cfg, movie, users, arr.quality_profile_id(), root or arr.root_folder())
                 title, anime = movie.get("title") or "?", False
             else:
-                found = arr.get("/series/lookup", term=f"tvdb:{ext_id}")
+                found = next(iter(dicts(arr.get("/series/lookup", term=f"tvdb:{ext_id}"))), None)
                 if not found:
                     raise LookupError(f"{svc} couldn't find that show")
                 if cfg.dry_run:
                     return {"ok": True, "status": "dry-run", "service": svc}
-                body, anime = self._sonarr_body(arr, cfg, self._sonarr_ctx(arr, cfg), found[0], users)
-                title = found[0].get("title") or "?"
+                body, anime = self._sonarr_body(arr, cfg, self._sonarr_ctx(arr, cfg), found, users)
+                title = found.get("title") or "?"
             try:
                 arr.post("/movie" if kind == "movie" else "/series", body, retries=0 if auto else 4)
             except ArrError as e:

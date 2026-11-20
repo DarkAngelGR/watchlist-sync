@@ -2138,5 +2138,53 @@ def delete_rollback_tests():
 
 delete_rollback_tests()
 
+def lookup_shape_tests():
+    with tempfile.TemporaryDirectory() as td:
+        sy = app.Syncer(td)
+        try:
+            sy.settings.update({
+                "sonarr_url": "http://localhost:8989", "sonarr_api_key": "k",
+                "radarr_url": "http://localhost:7878", "radarr_api_key": "k",
+                "dry_run": False,
+            })
+            show = {"title": "Odd Show", "tvdbId": 55, "genres": ["Drama"],
+                    "originalLanguage": {"name": "English"}}
+            with patch.object(app.Arr, "find", return_value=None), \
+                 patch.object(app.Arr, "get", return_value=show), \
+                 patch.object(app.Arr, "quality_profile_id", return_value=1), \
+                 patch.object(app.Arr, "root_folder", return_value="/tv"), \
+                 patch.object(app.Arr, "tag_ids", return_value=[]), \
+                 patch.object(app.Arr, "post", return_value={"id": 1}):
+                out = sy.tv_request("show", 55, "ada")
+            assert out["status"] == "added" and out["title"] == "Odd Show", out
+
+            with patch.object(app.Arr, "find", return_value=None), \
+                 patch.object(app.Arr, "get", return_value=["nope"]):
+                try:
+                    sy.tv_request("movie", 1, "ada")
+                    raise AssertionError("expected LookupError")
+                except LookupError as e:
+                    assert "couldn't find" in str(e)
+
+            summary = {"errors": [], "added_series": []}
+            sy.cfg = app.Config(sy.settings.all())
+            sy.sonarr = app.Arr("Sonarr", sy.cfg.sonarr)
+            with patch.object(sy, "_group_by", return_value={56: {"title": "Odd Show", "users": {"ada"}}}), \
+                 patch.object(sy, "_library", return_value={}), \
+                 patch.object(sy, "_sonarr_ctx", return_value={
+                     "profile": 1, "root": "/tv", "anime_root": None,
+                     "anime_profile": 1, "lang_profile": None}), \
+                 patch.object(app.Arr, "get", return_value=show), \
+                 patch.object(app.Arr, "post", return_value={"id": 1}), \
+                 patch.object(app.Arr, "tag_ids", return_value=[]):
+                sy._sync_sonarr({}, summary)
+            assert summary["added_series"] == ["Odd Show"], summary
+            assert summary["errors"] == []
+        finally:
+            sy.state.db.close()
+    print("lookup shape tests OK")
+
+lookup_shape_tests()
+
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])
 print("ALL OK")
