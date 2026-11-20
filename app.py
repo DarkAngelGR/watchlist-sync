@@ -1510,7 +1510,16 @@ class Syncer:
                 parts.sort(key=lambda x: (x["year"] or 9999, x["title"]))
                 result = {"collection": {"title": c.get("title") or coll.get("title"), "tmdb": coll["tmdbId"], "movies": parts}}
         with self.cache_lock:
-            cache[tmdb] = (time.time(), result)
+            now = time.time()
+            # Expired entries were left in place, so every movie the TV ever
+            # opened stayed in memory. Drop them, and cap what's left.
+            for k in [k for k, (at, _) in cache.items() if now - at >= self.COLLECTION_TTL]:
+                cache.pop(k, None)
+            cache[tmdb] = (now, result)
+            extra = len(cache) - 200
+            if extra > 0:
+                for k in sorted(cache, key=lambda k: cache[k][0])[:extra]:
+                    cache.pop(k, None)
         return result
 
     def _invalidate_library(self, kind=None):

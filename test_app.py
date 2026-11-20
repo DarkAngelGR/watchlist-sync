@@ -2013,5 +2013,33 @@ def cache_lock_tests():
 
 cache_lock_tests()
 
+def collection_cache_tests():
+    with tempfile.TemporaryDirectory() as td:
+        sy = app.Syncer(td)
+        try:
+            sy.settings.update({"radarr_url": "http://localhost:7878", "radarr_api_key": "k"})
+            now = time.time()
+            cache = {i: (now - 1000, {"collection": None}) for i in range(30)}
+            cache.update({10000 + i: (now, {"collection": i}) for i in range(210)})
+            sy._collection_cache = cache
+
+            def fake_req(self, method, url, params=None, **kw):
+                if "/lookup/" in url:
+                    return Resp(body={})
+                return Resp(body=[])
+
+            with patch.object(requests.Session, "request", fake_req):
+                out = sy.tv_collection(424242)
+            assert out == {"collection": None}
+            stored = sy._collection_cache
+            assert 424242 in stored
+            assert all(k >= 10000 or k == 424242 for k in stored), sorted(stored)[:5]
+            assert len(stored) <= 200, len(stored)
+        finally:
+            sy.state.db.close()
+    print("collection cache tests OK")
+
+collection_cache_tests()
+
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])
 print("ALL OK")
