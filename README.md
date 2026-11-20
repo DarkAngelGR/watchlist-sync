@@ -189,7 +189,7 @@ prevents automatic writes. Manual movie and series requests are available from t
 Optional. When a title is added, a download fails or stalls, or Sonarr/Radarr imports a
 file, watchlist-sync can post to [ntfy](https://ntfy.sh) and a Discord webhook. Set them
 under **Settings › Notifications**, or with `NTFY_URL`, `NTFY_TOKEN`, `DISCORD_WEBHOOK`,
-`NOTIFY_ADDED`, `NOTIFY_DOWNLOADED` and `NOTIFY_FAILED` (see `.env.example`). Values saved
+`NOTIFY_ADDED`, `NOTIFY_DOWNLOADED`, `NOTIFY_FAILED` and `NOTIFY_CLEANUP` (see `.env.example`). Values saved
 on the page win. Each channel has a **Send test** button.
 
 `NTFY_URL` is the topic URL, for example `https://ntfy.sh/mytopic` or a self-hosted topic.
@@ -204,10 +204,38 @@ only shows that one is set, and a blank field keeps the saved value.
   one series in the same sync are a single message.
 - **Failed** is a title that could not be added, or a download that is failed or stalled
   in the queue. Each title is reported once for that failure, not on every sync.
+- **Cleanup** is the disk-cleanup warning (`Will delete in 2 days: …`) and the note of
+  how much space a delete freed. Turn it off with `NOTIFY_CLEANUP`.
 
 Dry run writes the message to the log instead of sending it. Messages go out in the
 background with a short timeout and a few retries. A delivery problem does not stop a sync,
 and a restart does not send the same one again.
+
+## Disk cleanup
+
+Separate from the daily database tidy. Off until you turn a rule on under
+**Settings › Disk cleanup**. Once a day, watchlist-sync builds a list of titles it
+added and shows them on the page (title, size, why, last watched) with a **Keep**
+button. It sends a cleanup notification, waits the grace period (2 days unless you
+change it), then deletes.
+
+- **Watched:** a movie, or an ended show whose every episode has been watched, once
+  that has been true for N days and the title is at least N days old.
+- **Unplayed:** a title nobody has played, N days after it was added.
+- **Seasons:** a season of a show that is still airing, once that season is watched.
+  Sonarr unmonitors the season and deletes its episode files. The rest of the show stays.
+
+Watch state comes from the owner's Plex server: active sessions, and
+`/status/sessions/history/all` matched to accounts. When Plex does not say who
+watched what, a title counts as watched once **you** have watched it, and the page
+says so. Library `viewCount` fills in plays the history feed does not list.
+
+It will not delete anything that is still on a watchlist, playing in Plex, added
+inside the rule's N days, tagged in Sonarr/Radarr with the keep tag (default
+`keep`), or on the Keep list. Titles that were already in your library are left
+alone. A delete is the same Arr delete-with-files path as a TV delete, and the
+title is marked deleted so it is not downloaded again. Dry run only logs it.
+The page shows the space that was freed.
 
 ## Uptime
 

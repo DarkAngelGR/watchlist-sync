@@ -116,6 +116,13 @@ dialog li{margin:2px 0}
   </section>
 
   <section class="card">
+    <h2>Disk cleanup</h2>
+    <p id="cleanupNote" class="small mute" style="margin-top:0">Nothing is queued for deletion.</p>
+    <div class="scroll" id="cleanupBox"><span class="mute small">Nothing is queued for deletion.</span></div>
+    <div id="cleanupKept"></div>
+  </section>
+
+  <section class="card">
     <h2>Settings</h2>
     <form id="settings" autocomplete="off">
       <fieldset>
@@ -184,6 +191,24 @@ dialog li{margin:2px 0}
       </fieldset>
 
       <fieldset>
+        <legend>Disk cleanup <span class="mute small">(optional, off)</span></legend>
+        <div class="row"><label></label><div class="checks">
+          <label><input type="checkbox" name="cleanup_watched"> Delete a movie or ended show after everyone who requested it has watched it</label>
+        </div></div>
+        <div class="row"><label>Wait (days)</label><input type="number" min="1" name="cleanup_watched_days" style="max-width:120px"></div>
+        <div class="row"><label></label><div class="checks">
+          <label><input type="checkbox" name="cleanup_unplayed"> Also delete titles nobody has played</label>
+        </div></div>
+        <div class="row"><label>Unplayed after (days)</label><input type="number" min="1" name="cleanup_unplayed_days" style="max-width:120px"></div>
+        <div class="row"><label>Grace period (days)</label><input type="number" min="1" name="cleanup_grace_days" style="max-width:120px"></div>
+        <div class="row"><label>Keep tag</label><input type="text" name="cleanup_keep_tag" placeholder="keep"></div>
+        <div class="row"><label></label><div class="checks">
+          <label><input type="checkbox" name="cleanup_seasons"> Remove a finished season of a show that is still airing (unmonitor it and delete its files)</label>
+        </div></div>
+        <div class="row"><label></label><div class="mute small">Off unless you tick a rule. Nothing still on a watchlist, playing in Plex, added too recently, tagged with the keep tag in Sonarr/Radarr, or on the Keep list is deleted. A daily pass warns first. Files are removed after the grace period. Dry run deletes nothing. If Plex does not share each friend's watch history, a title counts as watched when you have watched it.</div></div>
+      </fieldset>
+
+      <fieldset>
         <legend>Notifications <span class="mute small">(optional)</span></legend>
         <div class="row"><label>ntfy URL</label><input type="text" name="ntfy_url" placeholder="https://ntfy.sh/mytopic"></div>
         <div class="row"><label>ntfy token</label><input type="password" name="ntfy_token" placeholder="optional, for a protected topic"></div>
@@ -196,6 +221,7 @@ dialog li{margin:2px 0}
           <label><input type="checkbox" name="notify_added"> Added</label>
           <label><input type="checkbox" name="notify_downloaded"> Downloaded</label>
           <label><input type="checkbox" name="notify_failed"> Failed</label>
+          <label><input type="checkbox" name="notify_cleanup"> Cleanup</label>
         </div></div>
         <div class="row"><label></label><div class="mute small">Added includes who requested it. Downloaded is a movie or episode Sonarr/Radarr imported. Failed is an add that didn't go through, or a download that fails or stalls, once per title.</div></div>
       </fieldset>
@@ -313,7 +339,7 @@ function renderRequests(){
     ? `<table><tr><th>Title</th><th>Where</th><th>Requested by</th><th>Result</th><th>When</th></tr>${
         rows.map(x => `<tr><td>${esc(x.title)}</td><td class="mute">${x.service === "sonarr" ? "Sonarr" : "Radarr"}</td>
           <td>${esc((x.users||"").split(",").join(", "))}</td>
-          <td><span class="tag ${x.result === "added" || x.result === "auto-requested" ? "added" : ""}">${({added:"added", requested:"requested", "auto-requested":"auto-requested", deleted:"deleted on a TV"})[x.result] || "already there"}</span></td>
+          <td><span class="tag ${x.result === "added" || x.result === "auto-requested" ? "added" : ""}">${({added:"added", requested:"requested", "auto-requested":"auto-requested", deleted:"deleted"})[x.result] || "already there"}</span></td>
           <td class="mute small">${ago(x.ts)}</td></tr>`).join("")}</table>`
     : `<span class="mute small">Nothing yet.</span>`;
 }
@@ -354,9 +380,53 @@ function renderTvErrors(data){
     : `<span class="mute small">No auto-fetch decisions recorded.</span>`;
 }
 
+function sizeOf(n){
+  n = Number(n) || 0;
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1){ n /= 1024; i++; }
+  return (i ? n.toFixed(1) : Math.round(n)) + " " + units[i];
+}
+
+function renderCleanup(data){
+  if (!data) return;
+  const note = $("#cleanupNote");
+  const bits = [];
+  if (data.watch_note) bits.push(data.watch_note);
+  const sum = data.summary || {};
+  if (sum.at){
+    const verb = sum.dry_run ? "Would free" : "Freed";
+    bits.push(`${verb} ${sizeOf(sum.freed)}` + (sum.deleted && sum.deleted.length ? ": " + sum.deleted.join(", ") : "") + " · " + ago(sum.at));
+  }
+  note.textContent = bits.join(" ") || (data.enabled ? "Nothing is queued for deletion." : "Cleanup is off. Turn a rule on under Settings.");
+  const rows = data.pending || [];
+  $("#cleanupBox").innerHTML = rows.length
+    ? `<table><tr><th>Title</th><th>Size</th><th>Why</th><th>Last watched</th><th></th></tr>${
+        rows.map(x => `<tr><td>${esc(x.title)}</td><td class="mute">${sizeOf(x.size)}</td><td>${esc(x.why)}</td>
+          <td class="mute small">${x.last_watched ? ago(x.last_watched) : "—"}</td>
+          <td style="text-align:right"><button class="link" data-keep="${esc(x.service)}:${esc(x.id)}:${x.season == null ? -1 : esc(x.season)}">Keep</button></td></tr>`).join("")}</table>`
+    : `<span class="mute small">Nothing is queued for deletion.</span>`;
+  $("#cleanupBox").querySelectorAll("[data-keep]").forEach(b => b.onclick = () => keepTitle(b.dataset.keep, true));
+  const kept = data.kept || [];
+  $("#cleanupKept").innerHTML = kept.length
+    ? `<div class="small mute" style="margin-top:10px">Kept</div><table><tr><th>Title</th><th></th></tr>${
+        kept.map(x => `<tr><td>${esc(x.title || (x.service + " " + x.id))}${x.season == null ? "" : " S" + String(x.season).padStart(2, "0")}</td>
+          <td style="text-align:right"><button class="link" data-unkeep="${esc(x.service)}:${esc(x.id)}:${x.season == null ? -1 : esc(x.season)}">Remove</button></td></tr>`).join("")}</table>`
+    : "";
+  $("#cleanupKept").querySelectorAll("[data-unkeep]").forEach(b => b.onclick = () => keepTitle(b.dataset.unkeep, false));
+}
+
+async function keepTitle(key, keep){
+  const [service, id, season] = key.split(":");
+  await api(keep ? "/api/cleanup/keep" : "/api/cleanup/unkeep", {method:"POST", body: JSON.stringify({
+    service, id: Number(id), season: Number(season)})});
+  try { renderCleanup(await api("/api/cleanup")); } catch(e){}
+}
+
 async function refresh(){
   try { renderStatus(await api("/api/status")); } catch(e){}
   try { renderTvErrors(await api("/api/tv-errors")); } catch(e){}
+  try { renderCleanup(await api("/api/cleanup")); } catch(e){}
 }
 
 async function login(){

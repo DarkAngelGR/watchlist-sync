@@ -30,6 +30,7 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlencode, urlparse, parse_qs
 
@@ -100,11 +101,28 @@ FIELDS = {
     "notify_added": ("NOTIFY_ADDED", True, bool),
     "notify_downloaded": ("NOTIFY_DOWNLOADED", True, bool),
     "notify_failed": ("NOTIFY_FAILED", True, bool),
+    "notify_cleanup": ("NOTIFY_CLEANUP", True, bool),
     # How many sync intervals before /health/full calls the last success stale.
     "health_stale_factor": ("HEALTH_STALE_FACTOR", 3, int),
+    # Disk cleanup is separate from the database maintain() job. Every rule starts off.
+    "cleanup_watched": ("CLEANUP_WATCHED", False, bool),
+    "cleanup_watched_days": ("CLEANUP_WATCHED_DAYS", 14, int),
+    "cleanup_unplayed": ("CLEANUP_UNPLAYED", False, bool),
+    "cleanup_unplayed_days": ("CLEANUP_UNPLAYED_DAYS", 90, int),
+    "cleanup_grace_days": ("CLEANUP_GRACE_DAYS", 2, int),
+    "cleanup_keep_tag": ("CLEANUP_KEEP_TAG", "keep", str),
+    "cleanup_seasons": ("CLEANUP_SEASONS", False, bool),
 }
 SECRETS = ("plex_token", "sonarr_api_key", "radarr_api_key", "bazarr_api_key", "tmdb_api_key",
            "ntfy_token", "discord_webhook")
+# Upper bounds for saved integers. A huge interval breaks the main-thread wait.
+_INT_HI = {
+    "interval_min": 10080,
+    "health_stale_factor": 48,
+    "cleanup_watched_days": 3650,
+    "cleanup_unplayed_days": 3650,
+    "cleanup_grace_days": 90,
+}
 
 
 def cast(typ, v, default=None, hi=None):
@@ -141,10 +159,9 @@ class Settings:
         # A multi-hundred-digit interval survives in sqlite and then
         # Event.wait() raises OverflowError on the main thread, which exits
         # the process. Docker restarts and crashes the same way.
-        if "interval_min" in d:
-            d["interval_min"] = cast(int, d["interval_min"], FIELDS["interval_min"][1], 10080)
-        if "health_stale_factor" in d:
-            d["health_stale_factor"] = cast(int, d["health_stale_factor"], FIELDS["health_stale_factor"][1], 48)
+        for key, hi in _INT_HI.items():
+            if key in d:
+                d[key] = cast(int, d[key], FIELDS[key][1], hi)
         return d
 
     def update(self, changes):
@@ -154,8 +171,7 @@ class Settings:
                 continue
             if k in SECRETS and v in (None, "") and k != "plex_token":
                 continue  # blank secret in the form = keep the existing one
-            hi = {"interval_min": 10080, "health_stale_factor": 48}.get(k)
-            saved[k] = cast(FIELDS[k][2], v, FIELDS[k][1], hi)
+            saved[k] = cast(FIELDS[k][2], v, FIELDS[k][1], _INT_HI.get(k))
         self.state.set("settings", json.dumps(saved))
 
     def public(self):
@@ -205,7 +221,15 @@ class Config:
         self.notify_added = s["notify_added"]
         self.notify_downloaded = s["notify_downloaded"]
         self.notify_failed = s["notify_failed"]
+        self.notify_cleanup = s["notify_cleanup"]
         self.health_stale_factor = s["health_stale_factor"]
+        self.cleanup_watched = s["cleanup_watched"]
+        self.cleanup_watched_days = s["cleanup_watched_days"]
+        self.cleanup_unplayed = s["cleanup_unplayed"]
+        self.cleanup_unplayed_days = s["cleanup_unplayed_days"]
+        self.cleanup_grace_days = s["cleanup_grace_days"]
+        self.cleanup_keep_tag = s["cleanup_keep_tag"]
+        self.cleanup_seasons = s["cleanup_seasons"]
 
 
 # --------------------------------------------------------------------------- state
@@ -245,6 +269,16 @@ class State:
                     "PRIMARY KEY (service, ext_id, user))"
                 )
                 self.db.execute("CREATE TABLE IF NOT EXISTS notify_sent (k TEXT PRIMARY KEY, ts INTEGER NOT NULL)")
+                # season -1 is the whole title. Pending rows are the grace-period queue.
+                self.db.execute(
+                    "CREATE TABLE IF NOT EXISTS cleanup_keep (service TEXT, ext_id INTEGER, season INTEGER NOT NULL, "
+                    "PRIMARY KEY (service, ext_id, season))"
+                )
+                self.db.execute(
+                    "CREATE TABLE IF NOT EXISTS cleanup_pending (service TEXT, ext_id INTEGER, season INTEGER NOT NULL, "
+                    "title TEXT, why TEXT, size INTEGER, last_watched INTEGER, warned_at INTEGER, "
+                    "PRIMARY KEY (service, ext_id, season))"
+                )
 
     def get(self, k, default=None):
         with self.lock:
@@ -355,6 +389,86 @@ class State:
                 "SELECT service, ext_id, title, users FROM handled WHERE result='added'").fetchall()
         return [{"service": s, "id": i, "title": t, "users": {x.lower() for x in (u or "").split(",") if x}}
                 for s, i, t, u in rows]
+
+    def tracked_rows(self):
+        """Titles this app added or requested. Library items it only noticed are not included."""
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT service, ext_id, title, users, result FROM handled "
+                "WHERE result IN ('added', 'requested', 'auto-requested')"
+            ).fetchall()
+        return [{"service": s, "id": i, "title": t, "result": result,
+                 "users": {x.lower() for x in (u or "").split(",") if x}}
+                for s, i, t, u, result in rows]
+
+    def wanted_pairs(self):
+        with self.lock:
+            rows = self.db.execute("SELECT service, ext_id FROM wants").fetchall()
+        return {(s, i) for s, i in rows}
+
+    def cleanup_keeps(self):
+        with self.lock:
+            rows = self.db.execute("SELECT service, ext_id, season FROM cleanup_keep").fetchall()
+        return {(s, i, n) for s, i, n in rows}
+
+    def cleanup_keep(self, service, ext_id, season=-1):
+        season = -1 if season is None else int(season)
+        with self.lock, self.db:
+            self.db.execute("INSERT OR REPLACE INTO cleanup_keep VALUES (?,?,?)", (service, int(ext_id), season))
+            if season == -1:
+                self.db.execute("DELETE FROM cleanup_pending WHERE service=? AND ext_id=?", (service, int(ext_id)))
+            else:
+                self.db.execute(
+                    "DELETE FROM cleanup_pending WHERE service=? AND ext_id=? AND season=?",
+                    (service, int(ext_id), season),
+                )
+
+    def cleanup_unkeep(self, service, ext_id, season=-1):
+        season = -1 if season is None else int(season)
+        with self.lock, self.db:
+            self.db.execute(
+                "DELETE FROM cleanup_keep WHERE service=? AND ext_id=? AND season=?",
+                (service, int(ext_id), season),
+            )
+
+    def cleanup_kept_rows(self):
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT k.service, k.ext_id, k.season, h.title FROM cleanup_keep k "
+                "LEFT JOIN handled h ON h.service=k.service AND h.ext_id=k.ext_id "
+                "ORDER BY h.title"
+            ).fetchall()
+        return [{"service": s, "id": i, "season": None if n == -1 else n, "title": t or ""}
+                for s, i, n, t in rows]
+
+    def cleanup_pending_rows(self):
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT service, ext_id, season, title, why, size, last_watched, warned_at "
+                "FROM cleanup_pending ORDER BY title"
+            ).fetchall()
+        return [{"service": s, "id": i, "season": None if n == -1 else n, "title": t, "why": why,
+                 "size": size or 0, "last_watched": seen, "warned_at": warned}
+                for s, i, n, t, why, size, seen, warned in rows]
+
+    def cleanup_set_pending(self, cand, now, season):
+        seen = cand.get("last_watched")
+        with self.lock, self.db:
+            self.db.execute(
+                "INSERT INTO cleanup_pending (service, ext_id, season, title, why, size, last_watched, warned_at) "
+                "VALUES (?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(service, ext_id, season) DO UPDATE SET title=excluded.title, why=excluded.why, "
+                "size=excluded.size, last_watched=excluded.last_watched",
+                (cand["service"], int(cand["id"]), int(season), cand.get("title") or "", cand.get("why") or "",
+                 int(cand.get("size") or 0), seen, int(now)),
+            )
+
+    def cleanup_drop_pending(self, service, ext_id, season):
+        with self.lock, self.db:
+            self.db.execute(
+                "DELETE FROM cleanup_pending WHERE service=? AND ext_id=? AND season=?",
+                (service, int(ext_id), int(season)),
+            )
 
     def deleted_users(self, service, ext_id):
         """For a title deleted from a TV: who still had it on their watchlist
@@ -754,6 +868,466 @@ class Plex:
             self.state.cache_guids(rating_key, guids)
         return guids
 
+    def server_base(self):
+        """Local connection of the owned Plex Media Server, if the token can see one."""
+        data = self._get_json(f"{PLEXTV}/api/v2/resources", includeHttps=1, includeRelay=1)
+        rows = data if isinstance(data, list) else []
+        servers = [r for r in rows if isinstance(r, dict) and r.get("owned") and r.get("provides") == "server"]
+        if not servers:
+            return None
+        conns = [c for c in (servers[0].get("connections") or []) if isinstance(c, dict) and isinstance(c.get("uri"), str)]
+        local = [c for c in conns if c.get("local") and not c.get("relay")]
+        pick = local or [c for c in conns if not c.get("relay")] or conns
+        return pick[0]["uri"].rstrip("/") if pick else None
+
+    def _server_json(self, base, path, **params):
+        return self._get_json(base + path, **params)
+
+    def _paged(self, base, path, **params):
+        """Follow Plex container paging. Caps the read so a huge library cannot run forever."""
+        items, start, size = [], 0, 100
+        for _ in range(20):
+            page = self._server_json(base, path, **{**params, "X-Plex-Container-Start": start, "X-Plex-Container-Size": size})
+            rows = plex_metadata(page)
+            if not rows:
+                break
+            items.extend(rows)
+            start += len(rows)
+            mc = page.get("MediaContainer") if isinstance(page, dict) else None
+            total = mc.get("totalSize") if isinstance(mc, dict) else None
+            try:
+                total_n = None if isinstance(total, bool) else int(total)
+            except (TypeError, ValueError):
+                total_n = None
+            if (total_n and start >= total_n) or len(rows) < size:
+                break
+        else:
+            log.warning("Stopped reading %s after %d items", path, start)
+        return items
+
+    def watch_activity(self):
+        """Sessions and watch history for the owned server.
+
+        Per-account history is used when Plex sends an account id we can name.
+        Otherwise every play counts as the owner, and library viewCounts fill
+        anything the history feed left out.
+        """
+        base = self.server_base()
+        if not base:
+            raise RuntimeError("no owned Plex server")
+        sessions = self._server_json(base, "/status/sessions")
+        try:
+            accounts = self._server_json(base, "/accounts")
+        except Exception:
+            accounts = {}
+        history = self._paged(base, "/status/sessions/history/all")
+        state = plex_watch_state(sessions, history, accounts)
+        if state["scope"] == "owner":
+            extra = self._owner_views(base)
+            if extra:
+                merged = plex_watch_state(sessions, history + extra, accounts)
+                merged["scope"] = "owner"
+                state = merged
+        return state
+
+    def _owner_views(self, base):
+        """Library items with a viewCount. shortcut: 20 pages per section, raise if a library is larger than that."""
+        try:
+            payload = self._server_json(base, "/library/sections")
+        except Exception as e:
+            log.warning("Plex library sections unavailable: %s", safe_err(e))
+            return []
+        mc = payload.get("MediaContainer") if isinstance(payload, dict) else None
+        dirs = (mc or payload or {}).get("Directory") if isinstance(mc or payload, dict) else None
+        if isinstance(dirs, dict):
+            dirs = [dirs]
+        if not isinstance(dirs, list):
+            return []
+        found = []
+        for section in dirs:
+            if not isinstance(section, dict) or section.get("type") not in ("movie", "show") or not section.get("key"):
+                continue
+            # Episodes carry the season and the view, which a show row does not.
+            kind = "4" if section.get("type") == "show" else "1"
+            try:
+                rows = self._paged(base, f"/library/sections/{section['key']}/all", type=kind, includeGuids=1)
+            except Exception as e:
+                log.warning("Plex library section unavailable: %s", safe_err(e))
+                continue
+            found.extend(r for r in rows if r.get("viewCount") or r.get("lastViewedAt") or r.get("viewedAt"))
+        return found
+
+
+def plain_int(value):
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def parse_time(value):
+    if plain_int(value) is not None:
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            return int(datetime.fromisoformat(value.strip().replace("Z", "+00:00")).timestamp())
+        except ValueError:
+            return None
+    return None
+
+
+def fmt_size(n):
+    try:
+        n = float(n or 0)
+    except (TypeError, ValueError):
+        n = 0
+    if n < 0:
+        n = 0
+    units = ("B", "KB", "MB", "GB", "TB")
+    i = 0
+    while n >= 1024 and i < len(units) - 1:
+        n /= 1024
+        i += 1
+    return f"{int(n)} B" if i == 0 else f"{n:.1f} {units[i]}"
+
+
+def plex_metadata(payload):
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if not isinstance(payload, dict):
+        return []
+    mc = payload.get("MediaContainer") if isinstance(payload.get("MediaContainer"), dict) else payload
+    rows = mc.get("Metadata") or mc.get("Video") or []
+    if isinstance(rows, dict):
+        rows = [rows]
+    return [x for x in rows if isinstance(x, dict)] if isinstance(rows, list) else []
+
+
+def _guid_map(item):
+    found = {}
+    raw = item.get("Guid") or []
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raw = []
+    for g in raw:
+        if not isinstance(g, dict) or not isinstance(g.get("id"), str):
+            continue
+        m = re.match(r"(tvdb|tmdb|imdb)://([^?#]+)", g["id"].strip())
+        if not m:
+            continue
+        kind, value = m.group(1), m.group(2).strip().strip("/")
+        if kind == "imdb":
+            found.setdefault(kind, value)
+        else:
+            num = external_num(value)
+            if num:
+                found.setdefault(kind, num)
+    return found
+
+
+def _account_names(accounts):
+    names = {}
+    rows = accounts
+    if isinstance(accounts, dict):
+        mc = accounts.get("MediaContainer") if isinstance(accounts.get("MediaContainer"), dict) else accounts
+        rows = mc.get("Account") or mc.get("accounts") or []
+    if isinstance(rows, dict):
+        rows = [rows]
+    if not isinstance(rows, list):
+        return names
+    for a in rows:
+        if not isinstance(a, dict) or isinstance(a.get("id"), bool):
+            continue
+        try:
+            aid = int(a["id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        name = a.get("name") or a.get("username") or a.get("title") or ""
+        if isinstance(name, str) and name.strip():
+            names[aid] = name.strip().lower()
+    return names
+
+
+def _play_user(item, names):
+    acct = item.get("accountID")
+    if acct is None and isinstance(item.get("Account"), dict):
+        acct = item["Account"].get("id")
+    if isinstance(acct, bool):
+        acct = None
+    try:
+        user = names.get(int(acct)) if acct is not None else None
+    except (TypeError, ValueError):
+        user = None
+    if user is None and isinstance(item.get("User"), dict):
+        title = item["User"].get("title") or item["User"].get("name")
+        if isinstance(title, str) and title.strip():
+            user = title.strip().lower()
+    return user
+
+
+def _series_tvdb(item):
+    raw = item.get("grandparentGuid")
+    if isinstance(raw, str):
+        m = re.match(r"tvdb://([^?#]+)", raw.strip())
+        if m:
+            return external_num(m.group(1))
+    return None
+
+
+def _watch_record(item, names):
+    guids = _guid_map(item)
+    kind = str(item.get("type") or "").lower()
+    episode = kind == "episode"
+    at = plain_int(item.get("viewedAt"))
+    if at is None:
+        at = plain_int(item.get("lastViewedAt"))
+    return {
+        "kind": "episode" if episode else "movie",
+        "tmdb": None if episode else guids.get("tmdb"),
+        "imdb": "" if episode else (guids.get("imdb") or ""),
+        "tvdb": _series_tvdb(item) if episode else guids.get("tvdb"),
+        "episode_tvdb": guids.get("tvdb") if episode else None,
+        "season": plain_int(item.get("parentIndex")) if episode else None,
+        "episode": plain_int(item.get("index")) if episode else None,
+        "user": _play_user(item, names),
+        "at": at,
+    }
+
+
+def _watch_known(rec):
+    if rec["kind"] == "episode":
+        return bool(rec.get("tvdb") or rec.get("episode_tvdb"))
+    return bool(rec.get("tmdb") or rec.get("imdb"))
+
+
+def plex_watch_state(sessions_payload, history, accounts=None):
+    """Normalize Plex session and history payloads.
+
+    `history` is a payload or a list of metadata dicts. Scope is per-user when
+    any play names an account, and owner otherwise.
+    """
+    names = _account_names(accounts or {})
+    history_rows = history if isinstance(history, list) else plex_metadata(history)
+    sessions = [_watch_record(x, names) for x in plex_metadata(sessions_payload)]
+    plays = [_watch_record(x, names) for x in history_rows]
+    scope = "per-user" if any(p.get("user") for p in plays) or any(s.get("user") for s in sessions) else "owner"
+    return {
+        "scope": scope,
+        "sessions": sessions,
+        "plays": plays,
+        "ambiguous": any(not _watch_known(s) for s in sessions),
+    }
+
+
+WHY_WATCHED = "Watched by everyone who requested it"
+WHY_OWNER = "Watched by you (per-friend watch state isn't available from Plex)"
+WHY_UNPLAYED = "No one has played it since it was added"
+WHY_SEASON = "Season watched by everyone who requested it"
+WHY_SEASON_OWNER = "Season watched by you (per-friend watch state isn't available from Plex)"
+OWNER_WATCH_NOTE = (
+    "Plex isn't sharing each friend's watch history, so a title counts as watched when you "
+    "(the server owner) have watched it."
+)
+TRACKED_RESULTS = {"added", "requested", "auto-requested"}
+
+
+def _old_enough(added, now, days):
+    return plain_int(added) is not None and added <= now - days * 86400
+
+
+def _play_hits(plays, pred):
+    return [p for p in plays if pred(p)]
+
+
+def _watched(plays, scope, requesters, pred):
+    """Whether the watch rule is met, and the latest relevant play time."""
+    hits = _play_hits(plays, pred)
+    if scope == "owner":
+        ats = [p["at"] for p in hits if plain_int(p.get("at")) is not None]
+        return (True, max(ats)) if ats else (False, None)
+    need = {u.lower() for u in requesters or ()}
+    if not need:
+        return False, None
+    last = None
+    for user in need:
+        ats = [p["at"] for p in hits if p.get("user") == user and plain_int(p.get("at")) is not None]
+        if not ats:
+            return False, None
+        last = max(ats) if last is None else max(last, max(ats))
+    return True, last
+
+
+def _movie_play(play, title):
+    if play.get("kind") != "movie":
+        return False
+    if title.get("id") and play.get("tmdb") == title["id"]:
+        return True
+    imdb = (title.get("imdb") or "").lower()
+    return bool(imdb) and (play.get("imdb") or "").lower() == imdb
+
+
+def _episode_play(play, title, episode):
+    if play.get("kind") != "episode":
+        return False
+    if play.get("episode_tvdb") and episode.get("tvdb") and play["episode_tvdb"] == episode["tvdb"]:
+        return True
+    return (play.get("tvdb") == title.get("id") and play.get("season") == episode.get("season")
+            and play.get("episode") == episode.get("episode"))
+
+
+def _busy(sessions, title, season):
+    for s in sessions or []:
+        if title["kind"] == "movie" and _movie_play(s, title):
+            return True
+        if title["kind"] != "show" or s.get("kind") != "episode":
+            continue
+        same = s.get("tvdb") == title.get("id") or any(
+            s.get("episode_tvdb") and e.get("tvdb") == s.get("episode_tvdb") for e in title.get("episodes") or [])
+        if not same:
+            continue
+        if season is None or s.get("season") in (None, season):
+            return True
+    return False
+
+
+def _regular_episodes(title):
+    return [e for e in title.get("episodes") or []
+            if plain_int(e.get("season")) is not None and e["season"] > 0]
+
+
+def _candidate(title, season, size, why, last, file_ids=None):
+    name = title["title"] if season is None else f"{title['title']} S{season:02d}"
+    return {
+        "service": title["service"], "id": title["id"], "season": season, "title": name,
+        "size": int(size or 0), "why": why, "last_watched": last, "arr_id": title.get("arr_id"),
+        "imdb": title.get("imdb") or "", "file_ids": file_ids or [],
+    }
+
+
+def _watched_why(scope, season):
+    if season is None:
+        return WHY_OWNER if scope == "owner" else WHY_WATCHED
+    return WHY_SEASON_OWNER if scope == "owner" else WHY_SEASON
+
+
+def _rule_candidate(title, season, size, watched_ok, last, unplayed, rules, now, scope, file_ids=None):
+    days = rules["watched_days"]
+    if (rules.get("watched") and watched_ok and _old_enough(title.get("added"), now, days)
+            and plain_int(last) is not None and last <= now - days * 86400):
+        return _candidate(title, season, size, _watched_why(scope, season), last, file_ids)
+    # A season is removed only when it has been watched. "Nobody played it" applies to the whole title.
+    if (season is None and rules.get("unplayed") and unplayed
+            and _old_enough(title.get("added"), now, rules["unplayed_days"])):
+        return _candidate(title, None, size, WHY_UNPLAYED, None, file_ids)
+    return None
+
+
+def _blocked(title, wants, keeps, rules):
+    if title.get("result") not in TRACKED_RESULTS:
+        return True
+    if (title["service"], title["id"]) in wants:
+        return True
+    if (title["service"], title["id"], -1) in keeps:
+        return True
+    tag = (rules.get("keep_tag") or "").strip().lower()
+    return bool(tag and tag in {str(t).lower() for t in title.get("tags") or []})
+
+
+def cleanup_target(body):
+    """The keep-list key from an admin request, or None when it is not usable."""
+    if not isinstance(body, dict):
+        return None
+    service = body.get("service")
+    if service not in ("radarr", "sonarr"):
+        return None
+    ext = external_num(body.get("id"))
+    if not ext:
+        return None
+    season = body.get("season", -1)
+    if season is None:
+        season = -1
+    number = plain_int(season) if not isinstance(season, str) else external_num(season)
+    if isinstance(season, str) and season.strip() == "-1":
+        number = -1
+    if number is None or number < -1 or number > 200:
+        return None
+    return service, ext, number
+
+
+def cleanup_candidates(titles, activity, wants, keeps, rules, now):
+    """Titles that may be deleted once the grace period ends. The second value is the watch scope."""
+    activity = activity or {}
+    scope = activity.get("scope") or "owner"
+    if activity.get("ambiguous"):
+        return [], scope
+    plays, sessions = activity.get("plays") or [], activity.get("sessions") or []
+    wants, keeps = wants or set(), keeps or set()
+    out = []
+    for title in titles or []:
+        if _blocked(title, wants, keeps, rules):
+            continue
+        if title["kind"] == "movie":
+            if not title.get("has_file") or _busy(sessions, title, None):
+                continue
+            ok, last = _watched(plays, scope, title.get("requesters"), lambda p, title=title: _movie_play(p, title))
+            unplayed = not any(_movie_play(p, title) for p in plays)
+            cand = _rule_candidate(title, None, title.get("size"), ok, last, unplayed, rules, now, scope)
+            if cand:
+                out.append(cand)
+            continue
+        eps = _regular_episodes(title)
+        whole = None
+        playing = _busy(sessions, title, None)
+        if eps and not playing:
+            all_files = all(e.get("has_file") for e in eps)
+            any_file = any(e.get("has_file") for e in eps)
+            ok, last = False, None
+            if title.get("ended") and all_files:
+                ok, last = True, None
+                for ep in eps:
+                    one, at = _watched(plays, scope, title.get("requesters"),
+                                       lambda p, ep=ep, title=title: _episode_play(p, title, ep))
+                    if not one:
+                        ok, last = False, None
+                        break
+                    if plain_int(at) is not None:
+                        last = at if last is None else max(last, at)
+            unplayed = any_file and not any(_episode_play(p, title, ep) for ep in eps for p in plays)
+            if title.get("ended") and all_files:
+                whole = _rule_candidate(title, None, title.get("size"), ok, last, unplayed, rules, now, scope)
+            elif unplayed:
+                whole = _rule_candidate(title, None, title.get("size"), False, None, True, rules, now, scope)
+        if whole:
+            out.append(whole)
+            continue
+        if not (rules.get("seasons") and rules.get("watched")):
+            continue
+        by_season = {}
+        for ep in eps:
+            by_season.setdefault(ep["season"], []).append(ep)
+        for season, group in sorted(by_season.items()):
+            if (title["service"], title["id"], season) in keeps or _busy(sessions, title, season):
+                continue
+            if not group or not all(e.get("has_file") for e in group):
+                continue
+            ok, last = True, None
+            for ep in group:
+                one, at = _watched(plays, scope, title.get("requesters"),
+                                   lambda p, ep=ep, title=title: _episode_play(p, title, ep))
+                if not one:
+                    ok = False
+                    break
+                if plain_int(at) is not None:
+                    last = at if last is None else max(last, at)
+            if not ok:
+                continue
+            size = sum(e.get("size") or 0 for e in group)
+            cand = _rule_candidate(title, season, size, True, last, False, rules, now, scope,
+                                   [e["file_id"] for e in group if plain_int(e.get("file_id")) is not None])
+            if cand:
+                out.append(cand)
+    return out, scope
+
 
 # --------------------------------------------------------------------------- *arr
 def tag_label(username):
@@ -896,6 +1470,27 @@ class Arr:
         excl = "addImportListExclusion" if self.name == "Sonarr" else "addImportExclusion"
         r = request(self.s, "DELETE", f"{self.base}{path}/{obj['id']}",
                     params={"deleteFiles": "true", excl: "false"}, timeout=120)
+        if r.status_code >= 400:
+            raise ArrError(r.status_code, r.text[:500])
+
+    def delete_episode_files(self, ids):
+        for eid in ids:
+            r = request(self.s, "DELETE", f"{self.base}/episodefile/{int(eid)}", timeout=120)
+            if r.status_code >= 400:
+                raise ArrError(r.status_code, r.text[:500])
+
+    def unmonitor_season(self, series, season):
+        body = dict(series)
+        seasons = []
+        for row in body.get("seasons") or []:
+            if not isinstance(row, dict):
+                continue
+            row = dict(row)
+            if row.get("seasonNumber") == season:
+                row["monitored"] = False
+            seasons.append(row)
+        body["seasons"] = seasons
+        r = request(self.s, "PUT", f"{self.base}/series/{series['id']}", json=body, timeout=60)
         if r.status_code >= 400:
             raise ArrError(r.status_code, r.text[:500])
 
@@ -1077,6 +1672,239 @@ class Syncer:
             ", vacuumed" if vacuumed else "",
         )
         return {**counts, **mem, "vacuumed": vacuumed}
+
+    def _wants_fresh(self, service, now):
+        raw = self.state.get(f"wants_at_{service}")
+        try:
+            return raw is not None and now - int(raw) <= WANTS_FRESH_SECONDS
+        except (TypeError, ValueError):
+            return False
+
+    def _cleanup_rules(self, cfg):
+        return {
+            "watched": cfg.cleanup_watched, "watched_days": cfg.cleanup_watched_days,
+            "unplayed": cfg.cleanup_unplayed, "unplayed_days": cfg.cleanup_unplayed_days,
+            "seasons": cfg.cleanup_seasons, "keep_tag": cfg.cleanup_keep_tag,
+        }
+
+    def _tag_labels(self, arr):
+        labels = {}
+        for row in dicts(arr.get("/tag")):
+            if plain_int(row.get("id")) is not None and isinstance(row.get("label"), str):
+                labels[row["id"]] = row["label"]
+        return labels
+
+    def _cleanup_library(self, cfg):
+        """Tracked titles that are actually in Sonarr or Radarr, with the fields the rules need."""
+        tracked = {(r["service"], r["id"]): r for r in self.state.tracked_rows()}
+        titles = []
+        if cfg.radarr.enabled and self.radarr:
+            labels = self._tag_labels(self.radarr)
+            for movie in dicts(self.radarr.get("/movie")):
+                ext = external_num(movie.get("tmdbId"))
+                row = tracked.get(("radarr", ext))
+                if not row:
+                    continue
+                size = movie.get("sizeOnDisk")
+                if plain_int(size) is None:
+                    media = movie.get("movieFile") if isinstance(movie.get("movieFile"), dict) else {}
+                    size = media.get("size") if plain_int(media.get("size")) is not None else 0
+                titles.append({
+                    "service": "radarr", "id": ext, "arr_id": movie.get("id"), "title": movie.get("title") or row["title"],
+                    "added": parse_time(movie.get("added")), "size": size, "kind": "movie",
+                    "has_file": bool(movie.get("hasFile")), "imdb": movie.get("imdbId") or "",
+                    "tags": [labels[t] for t in movie.get("tags") or [] if t in labels],
+                    "requesters": row["users"], "result": row["result"], "ended": False, "episodes": [],
+                })
+        if cfg.sonarr.enabled and self.sonarr:
+            labels = self._tag_labels(self.sonarr)
+            for series in dicts(self.sonarr.get("/series")):
+                ext = external_num(series.get("tvdbId"))
+                row = tracked.get(("sonarr", ext))
+                if not row:
+                    continue
+                stats = series.get("statistics") if isinstance(series.get("statistics"), dict) else {}
+                size = stats.get("sizeOnDisk") if plain_int(stats.get("sizeOnDisk")) is not None else 0
+                ended = series.get("ended") is True or str(series.get("status") or "").lower() == "ended"
+                episodes = []
+                for ep in dicts(self.sonarr.get("/episode", seriesId=series.get("id"))):
+                    media = ep.get("episodeFile") if isinstance(ep.get("episodeFile"), dict) else {}
+                    ep_size = media.get("size") if plain_int(media.get("size")) is not None else 0
+                    episodes.append({
+                        "season": ep.get("seasonNumber"), "episode": ep.get("episodeNumber"),
+                        "tvdb": ep.get("tvdbId") if plain_int(ep.get("tvdbId")) is not None else None,
+                        "has_file": bool(ep.get("hasFile")),
+                        "file_id": ep.get("episodeFileId") if plain_int(ep.get("episodeFileId")) is not None else None,
+                        "size": ep_size,
+                    })
+                titles.append({
+                    "service": "sonarr", "id": ext, "arr_id": series.get("id"),
+                    "title": series.get("title") or row["title"], "added": parse_time(series.get("added")),
+                    "size": size, "kind": "show", "has_file": bool(episodes), "imdb": series.get("imdbId") or "",
+                    "tags": [labels[t] for t in series.get("tags") or [] if t in labels],
+                    "requesters": row["users"], "result": row["result"], "ended": ended, "episodes": episodes,
+                })
+        return titles
+
+    def run_cleanup(self, now=None, force=False):
+        """Queue watched or unplayed titles, then delete them after the grace period.
+
+        Distinct from maintain(), which only prunes this app's database. Returns None when
+        it already ran today. A failure is not stamped, so the next cycle tries again.
+        """
+        now = time.time() if now is None else now
+        try:
+            last = float(self.state.get("last_cleanup") or 0)
+        except (TypeError, ValueError):
+            last = 0
+        if not force and now - last < MAINTAIN_INTERVAL:
+            return None
+        cfg = Config(self.settings.all())
+        if not (cfg.cleanup_watched or cfg.cleanup_unplayed):
+            return {"skipped": "off"}
+        try:
+            summary = self._cleanup(cfg, now)
+        except Exception as e:
+            err = safe_err(e, self.all_secrets())
+            log.warning("Disk cleanup failed: %s", err)
+            return {"errors": [err]}
+        if summary.get("skipped"):
+            return summary
+        self.state.set("last_cleanup", str(int(now)))
+        self.state.set("cleanup_summary", json.dumps({k: v for k, v in summary.items() if k != "errors"}))
+        return summary
+
+    def _cleanup(self, cfg, now):
+        self.build()
+        cfg = self.cfg
+        tracked = self.state.tracked_rows()
+        if not tracked:
+            return self._cleanup_summary(cfg, now, [], [], 0, None)
+        services = {r["service"] for r in tracked}
+        for service in services:
+            enabled = (service == "radarr" and cfg.radarr.enabled) or (service == "sonarr" and cfg.sonarr.enabled)
+            if enabled and not self._wants_fresh(service, now):
+                log.info("Disk cleanup skipped: %s watchlists are not fresh", service)
+                return {"skipped": "watchlists are not fresh", "freed": 0, "deleted": [], "warned": []}
+        activity = self.plex.watch_activity()
+        if activity.get("ambiguous"):
+            log.info("Disk cleanup skipped: a Plex session could not be matched to a title")
+            return {"skipped": "a playback session could not be matched", "freed": 0, "deleted": [], "warned": []}
+        titles = self._cleanup_library(cfg)
+        candidates, scope = cleanup_candidates(
+            titles, activity, self.state.wanted_pairs(), self.state.cleanup_keeps(), self._cleanup_rules(cfg), now)
+        pending = {(p["service"], p["id"], -1 if p["season"] is None else p["season"]): p
+                   for p in self.state.cleanup_pending_rows()}
+        warned, deleted, freed, errors = [], [], 0, []
+        seen = set()
+        grace = cfg.cleanup_grace_days * 86400
+        for cand in candidates:
+            season = -1 if cand["season"] is None else cand["season"]
+            key = (cand["service"], cand["id"], season)
+            seen.add(key)
+            row = pending.get(key)
+            if row is None:
+                self.state.cleanup_set_pending(cand, now, season)
+                warned.append(cand)
+                continue
+            self.state.cleanup_set_pending(cand, row["warned_at"], season)
+            if now - row["warned_at"] < grace:
+                continue
+            try:
+                if self._cleanup_delete(cand, cfg):
+                    deleted.append(cand)
+                    freed += int(cand.get("size") or 0)
+                    if not cfg.dry_run:
+                        self.state.cleanup_drop_pending(*key)
+            except Exception as e:
+                err = safe_err(e, self.all_secrets())
+                errors.append(f"{cand['title']}: {err}")
+                log.warning("Could not delete '%s': %s", cand["title"], err)
+        for key in pending:
+            if key not in seen:
+                self.state.cleanup_drop_pending(*key)
+        if warned:
+            names = ", ".join(c["title"] for c in warned)
+            warn_keys = ",".join(sorted(
+                f"{c['service']}:{c['id']}:{-1 if c['season'] is None else c['season']}" for c in warned))
+            self.notify(
+                "cleanup", f"Will delete in {cfg.cleanup_grace_days} days: {names}",
+                detail="; ".join(dict.fromkeys(c["why"] for c in warned)),
+                dedupe="cleanup:warn:" + warn_keys,
+            )
+        if deleted:
+            verb = "Would free" if cfg.dry_run else "Freed"
+            ident = ",".join(f"{c['service']}:{c['id']}:{c['season']}" for c in deleted)
+            self.notify(
+                "cleanup", f"{verb} {fmt_size(freed)}",
+                detail=", ".join(c["title"] for c in deleted),
+                dedupe=f"cleanup:{'would' if cfg.dry_run else 'freed'}:{ident}",
+            )
+        log.info("Disk cleanup: %d warned, %d %s, %s", len(warned), len(deleted),
+                 "would delete" if cfg.dry_run else "deleted", fmt_size(freed))
+        summary = self._cleanup_summary(cfg, now, warned, deleted, freed, scope)
+        if errors:
+            summary["errors"] = errors
+        return summary
+
+    def _cleanup_summary(self, cfg, now, warned, deleted, freed, scope):
+        return {
+            "at": int(now), "freed": freed, "dry_run": cfg.dry_run,
+            "deleted": [c["title"] for c in deleted], "warned": [c["title"] for c in warned],
+            "watch_scope": scope or "",
+            "watch_note": OWNER_WATCH_NOTE if scope == "owner" else "",
+        }
+
+    def _cleanup_delete(self, cand, cfg):
+        if cand["season"] is not None:
+            if cfg.dry_run:
+                log.info("[dry-run] would delete '%s' episode files", cand["title"])
+                return True
+            if not self.sonarr:
+                return False
+            series = self.sonarr.find(cand["id"])
+            if not series:
+                return False
+            self.sonarr.unmonitor_season(series, cand["season"])
+            if cand.get("file_ids"):
+                self.sonarr.delete_episode_files(cand["file_ids"])
+            log.info("Deleted episode files for '%s'", cand["title"])
+            return True
+        kind = "movie" if cand["service"] == "radarr" else "show"
+        res = self.tv_delete(kind, cand["id"], cand.get("imdb") or "", cand["title"], source="disk cleanup")
+        return bool(res.get("deleted") or (res.get("dry_run") and res.get("found")))
+
+    def cleanup_view(self):
+        cfg = Config(self.settings.all())
+        try:
+            summary = json.loads(self.state.get("cleanup_summary") or "{}")
+            if not isinstance(summary, dict):
+                summary = {}
+        except Exception:
+            summary = {}
+        grace = cfg.cleanup_grace_days * 86400
+        pending = []
+        for row in self.state.cleanup_pending_rows():
+            warned = row.get("warned_at") or 0
+            pending.append({
+                "service": row["service"], "id": row["id"], "season": row["season"], "title": row["title"],
+                "size": row["size"], "why": row["why"], "last_watched": row["last_watched"],
+                "delete_at": int(warned + grace),
+            })
+        return {
+            "enabled": bool(cfg.cleanup_watched or cfg.cleanup_unplayed),
+            "dry_run": cfg.dry_run,
+            "grace_days": cfg.cleanup_grace_days,
+            "watch_scope": summary.get("watch_scope") or "",
+            "watch_note": summary.get("watch_note") or "",
+            "pending": pending,
+            "kept": self.state.cleanup_kept_rows(),
+            "summary": {
+                "at": summary.get("at"), "freed": summary.get("freed") or 0,
+                "deleted": summary.get("deleted") or [], "warned": summary.get("warned") or [],
+                "dry_run": summary.get("dry_run"),
+            },
+        }
 
     def get_action(self):
         with self.action_lock:
@@ -2227,7 +3055,7 @@ class Syncer:
             return result
 
     # -- deleting a title from a TV (POST /api/tv/delete)
-    def tv_delete(self, kind, ext_id, imdb, title):
+    def tv_delete(self, kind, ext_id, imdb, title, source="a TV"):
         """Remove a movie (Radarr) or show (Sonarr) and its files. The title is
         remembered as deleted, so a watchlist it is still on doesn't bring it
         back; adding it to a watchlist again later does."""
@@ -2243,7 +3071,8 @@ class Syncer:
         real_id = external_num(obj.get(key)) or external_num(ext_id)
         label = obj.get("title") or title or "?"
         if cfg.dry_run:
-            log.info("[dry-run] TV would delete '%s' and its files from %s", label, name)
+            who = "TV" if source == "a TV" else source
+            log.info("[dry-run] %s would delete '%s' and its files from %s", who, label, name)
             return {"service": service, "configured": True, "found": True, "deleted": False, "dry_run": True}
         with self.lock:
             # Remember the deletion first. If we die after Arr has removed the
@@ -2265,7 +3094,7 @@ class Syncer:
             if isinstance(cache, dict):
                 cache.clear()
         self._invalidate_library(kind)
-        log.info("Deleted '%s' and its files from %s (from a TV)", label, name)
+        log.info("Deleted '%s' and its files from %s (from %s)", label, name, source)
         return {"service": service, "configured": True, "found": True, "deleted": True, "title": label}
 
     def _skip_deleted(self, service, ext_id, users):
@@ -2448,7 +3277,7 @@ class Syncer:
         try:
             cfg = Config(self.settings.all())
             enabled = {"added": cfg.notify_added, "downloaded": cfg.notify_downloaded,
-                       "failed": cfg.notify_failed}.get(event)
+                       "failed": cfg.notify_failed, "cleanup": cfg.notify_cleanup}.get(event)
             if not enabled or not (cfg.ntfy_url or cfg.discord_webhook):
                 return
             # Dry-run remembers its own key, so turning dry run off still sends the real event.
@@ -2632,7 +3461,7 @@ class Syncer:
 
 
 def notification_text(event, title, year=None, who="", detail=""):
-    labels = {"added": "Added", "downloaded": "Downloaded", "failed": "Failed"}
+    labels = {"added": "Added", "downloaded": "Downloaded", "failed": "Failed", "cleanup": "Cleanup"}
     name = str(title or "Untitled").strip()[:180] or "Untitled"
     if isinstance(year, str) and year.isdigit():
         year = int(year)
@@ -3024,6 +3853,8 @@ def make_handler(syncer, ui_password):
                 })
             if p == "/api/settings":
                 return self._send(200, syncer.settings.public())
+            if p == "/api/cleanup":
+                return self._send(200, syncer.cleanup_view())
             if p == "/api/tv-errors":
                 return self._send(200, {
                     "logs": syncer.get_tv_logs(),
@@ -3244,6 +4075,16 @@ def make_handler(syncer, ui_password):
                 syncer.settings.update(body)
                 syncer.wake.set()
                 return self._send(200, syncer.settings.public())
+            if p in ("/api/cleanup/keep", "/api/cleanup/unkeep"):
+                target = cleanup_target(body)
+                if not target:
+                    return self._send(400, {"error": "service, id, and season are required"})
+                service, ext_id, season = target
+                if p.endswith("/keep"):
+                    syncer.state.cleanup_keep(service, ext_id, season)
+                else:
+                    syncer.state.cleanup_unkeep(service, ext_id, season)
+                return self._send(200, syncer.cleanup_view())
             m = re.fullmatch(r"/api/users/([^/]+)/(exclude|include)", p)
             if m:
                 name = unquote(m.group(1)).strip()[:100]
@@ -3345,6 +4186,10 @@ def main():
             syncer.maintain()
         except Exception:
             log.exception("Cleanup failed")
+        try:
+            syncer.run_cleanup()
+        except Exception:
+            log.exception("Disk cleanup failed")
         if once:
             break
         interval = syncer.cfg.interval_min if syncer.cfg else 15

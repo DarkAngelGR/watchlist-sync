@@ -2931,5 +2931,353 @@ def health_tests():
 
 health_tests()
 
+def cleanup_tests():
+    now = 1_700_000_000
+    day = 86400
+    rules = {"watched": True, "watched_days": 14, "unplayed": False, "unplayed_days": 90,
+             "seasons": False, "keep_tag": "keep"}
+    last = now - 14 * day
+
+    def movie(**kw):
+        base = {
+            "service": "radarr", "id": 1, "arr_id": 10, "title": "Inception", "added": now - 30 * day,
+            "size": 5 * 1024 ** 3, "tags": [], "requesters": {"aggelos", "maria"}, "kind": "movie",
+            "has_file": True, "imdb": "tt1", "result": "added", "episodes": [], "ended": False,
+        }
+        base.update(kw)
+        return base
+
+    def play(user, at, **kw):
+        rec = {"kind": "movie", "tmdb": 1, "imdb": "tt1", "tvdb": None, "episode_tvdb": None,
+               "user": user, "at": at, "season": None, "episode": None}
+        rec.update(kw)
+        return rec
+
+    def act(plays, sessions=None, scope="per-user", ambiguous=False):
+        return {"scope": scope, "plays": plays, "sessions": sessions or [], "ambiguous": ambiguous}
+
+    both = [play("aggelos", last - day), play("maria", last)]
+    cands, scope = app.cleanup_candidates([movie()], act(both), set(), set(), rules, now)
+    assert scope == "per-user" and len(cands) == 1 and cands[0]["why"] == app.WHY_WATCHED
+    assert cands[0]["last_watched"] == last and cands[0]["season"] is None
+
+    assert app.cleanup_candidates([movie()], act([play("aggelos", last)]), set(), set(), rules, now)[0] == []
+    assert app.cleanup_candidates([movie()], act(both), {("radarr", 1)}, set(), rules, now)[0] == []
+    session = [play(None, None)]
+    assert app.cleanup_candidates([movie()], act(both, session), set(), set(), rules, now)[0] == []
+    assert app.cleanup_candidates([movie(added=now - 10 * day)], act(both), set(), set(), rules, now)[0] == []
+    recent = [play("aggelos", now - day), play("maria", now - day)]
+    assert app.cleanup_candidates([movie()], act(recent), set(), set(), rules, now)[0] == []
+    assert app.cleanup_candidates([movie(tags=["Keep"])], act(both), set(), set(), rules, now)[0] == []
+    assert app.cleanup_candidates([movie()], act(both), set(), {("radarr", 1, -1)}, rules, now)[0] == []
+    assert app.cleanup_candidates([movie(has_file=False)], act(both), set(), set(), rules, now)[0] == []
+    assert app.cleanup_candidates([movie(result="already-present")], act(both), set(), set(), rules, now)[0] == []
+    assert app.cleanup_candidates([movie()], act(both, ambiguous=True), set(), set(), rules, now)[0] == []
+    assert app.cleanup_candidates([movie()], act(both), set(), set(), dict(rules, watched=False), now)[0] == []
+
+    owner, oscope = app.cleanup_candidates([movie()], act([play(None, last)], scope="owner"), set(), set(), rules, now)
+    assert oscope == "owner" and owner[0]["why"] == app.WHY_OWNER
+    assert app.cleanup_candidates([movie()], act([], scope="owner"), set(), set(), rules, now)[0] == []
+
+    unplayed_rules = dict(rules, watched=False, unplayed=True)
+    idle = app.cleanup_candidates([movie(added=now - 90 * day)], act([]), set(), set(), unplayed_rules, now)[0]
+    assert idle[0]["why"] == app.WHY_UNPLAYED and idle[0]["last_watched"] is None
+    assert app.cleanup_candidates([movie(added=now - 90 * day)], act([play("aggelos", last)]), set(), set(), unplayed_rules, now)[0] == []
+    assert app.cleanup_candidates([movie(added=now - 10 * day)], act([]), set(), set(), unplayed_rules, now)[0] == []
+
+    def episode(season, number, tvdb, file_id, size=100):
+        return {"season": season, "episode": number, "tvdb": tvdb, "has_file": True, "file_id": file_id, "size": size}
+
+    def show(**kw):
+        eps = kw.pop("episodes", [episode(1, 1, 11, 1, 1000), episode(1, 2, 12, 2, 1000)])
+        base = {
+            "service": "sonarr", "id": 50, "arr_id": 7, "title": "Breaking Bad", "added": now - 40 * day,
+            "size": 2000, "tags": [], "requesters": {"aggelos"}, "kind": "show", "has_file": True,
+            "imdb": "", "result": "added", "ended": True, "episodes": eps,
+        }
+        base.update(kw)
+        return base
+
+    def eplay(user, at, season, number, episode_tvdb=None):
+        return {"kind": "episode", "tmdb": None, "imdb": "", "tvdb": 50, "episode_tvdb": episode_tvdb,
+                "user": user, "at": at, "season": season, "episode": number}
+
+    watched_eps = [eplay("aggelos", last, 1, 1), eplay("aggelos", last, 1, 2)]
+    whole, _ = app.cleanup_candidates([show()], act(watched_eps), set(), set(), rules, now)
+    assert len(whole) == 1 and whole[0]["season"] is None and whole[0]["size"] == 2000
+    assert app.cleanup_candidates([show(ended=False)], act(watched_eps), set(), set(), rules, now)[0] == []
+    assert app.cleanup_candidates([show()], act(watched_eps[:1]), set(), set(), rules, now)[0] == []
+    missing = [episode(1, 1, 11, 1), episode(1, 2, 12, 2)]
+    missing[1]["has_file"] = False
+    assert app.cleanup_candidates([show(episodes=missing)], act(watched_eps), set(), set(), rules, now)[0] == []
+
+    seasons = [episode(1, 1, 11, 1, 400), episode(2, 1, 21, 2, 500)]
+    rules_s = dict(rules, seasons=True)
+    one_season = app.cleanup_candidates(
+        [show(ended=False, episodes=seasons)], act([eplay("aggelos", last, 1, 1)]), set(), set(), rules_s, now)[0]
+    assert len(one_season) == 1 and one_season[0]["season"] == 1 and one_season[0]["file_ids"] == [1]
+    assert one_season[0]["why"] == app.WHY_SEASON and "S01" in one_season[0]["title"]
+    assert app.cleanup_candidates(
+        [show(ended=False, episodes=seasons)], act([eplay("aggelos", last, 1, 1)]), set(), set(), rules, now)[0] == []
+    assert app.cleanup_candidates(
+        [show(ended=False, episodes=seasons)], act([eplay("aggelos", last, 1, 1)]), set(),
+        {("sonarr", 50, -1)}, rules_s, now)[0] == []
+    both_seasons = [eplay("aggelos", last, 1, 1), eplay("aggelos", last, 2, 1)]
+    kept_one = app.cleanup_candidates(
+        [show(ended=False, episodes=seasons)], act(both_seasons), set(), {("sonarr", 50, 1)}, rules_s, now)[0]
+    assert [c["season"] for c in kept_one] == [2]
+    watching = [eplay(None, None, 1, 1)]
+    while_playing = app.cleanup_candidates(
+        [show(ended=False, episodes=seasons)], act(both_seasons, watching), set(), set(), rules_s, now)[0]
+    assert [c["season"] for c in while_playing] == [2]
+    assert app.cleanup_candidates([show()], act(watched_eps, watching), set(), set(), rules, now)[0] == []
+    only_series = app.cleanup_candidates([show()], act(watched_eps), set(), set(), rules_s, now)[0]
+    assert len(only_series) == 1 and only_series[0]["season"] is None
+    assert app.cleanup_candidates(
+        [show(ended=False, episodes=seasons)], act([eplay("aggelos", last, 1, 1)]), {("sonarr", 50)}, set(), rules_s, now)[0] == []
+    # Nobody played an unfinished show: the whole series is the candidate, not each season.
+    idle_show = app.cleanup_candidates(
+        [show(ended=False, episodes=seasons, added=now - 100 * day)], act([]), set(), set(),
+        dict(rules_s, watched=False, unplayed=True), now)[0]
+    assert len(idle_show) == 1 and idle_show[0]["season"] is None and idle_show[0]["why"] == app.WHY_UNPLAYED
+
+    history = {"MediaContainer": {"Metadata": [
+        {"type": "movie", "viewedAt": last, "accountID": 1, "Guid": [{"id": "tmdb://1"}, {"id": "imdb://tt1"}]},
+        {"type": "episode", "viewedAt": last, "accountID": 2, "parentIndex": 1, "index": 3,
+         "grandparentGuid": "tvdb://50", "Guid": [{"id": "tvdb://999"}]},
+    ]}}
+    accounts = {"MediaContainer": {"Account": [{"id": 1, "name": "Aggelos"}, {"id": 2, "name": "Maria"}]}}
+    sessions = {"MediaContainer": {"Metadata": [
+        {"type": "episode", "parentIndex": 2, "index": 1, "grandparentGuid": "tvdb://50"},
+    ]}}
+    state = app.plex_watch_state(sessions, history, accounts)
+    assert state["scope"] == "per-user" and state["ambiguous"] is False
+    assert state["plays"][0]["user"] == "aggelos" and state["plays"][0]["tmdb"] == 1
+    assert state["plays"][1]["user"] == "maria" and state["plays"][1]["tvdb"] == 50
+    assert state["plays"][1]["episode_tvdb"] == 999 and state["plays"][1]["season"] == 1
+    assert state["sessions"][0]["tvdb"] == 50 and state["sessions"][0]["season"] == 2
+    no_user = app.plex_watch_state(
+        {"MediaContainer": {}},
+        {"MediaContainer": {"Metadata": [{"type": "movie", "viewedAt": last, "Guid": [{"id": "tmdb://1"}]}]}},
+        {"MediaContainer": {}})
+    assert no_user["scope"] == "owner" and no_user["plays"][0]["user"] is None
+    assert app.plex_watch_state(
+        {"MediaContainer": {"Metadata": [{"type": "movie", "title": "Mystery"}]}}, [], {})["ambiguous"] is True
+    head, body = app.notification_text("cleanup", "Will delete in 2 days: Inception", detail=app.WHY_WATCHED)
+    assert head == "Cleanup: Will delete in 2 days: Inception" and body == app.WHY_WATCHED
+    assert app.fmt_size(3 * 1024 ** 3) == "3.0 GB"
+
+    with tempfile.TemporaryDirectory() as td:
+        off = app.Syncer(td)
+        try:
+            assert off.run_cleanup(now=now, force=True)["skipped"] == "off"
+        finally:
+            off.state.db.close()
+
+        sy = app.Syncer(os.path.join(td, "run"))
+        try:
+            sy.settings.update({
+                "plex_token": "t", "dry_run": False, "cleanup_watched": True, "cleanup_watched_days": 14,
+                "cleanup_unplayed": False, "cleanup_grace_days": 2, "cleanup_keep_tag": "keep",
+                "cleanup_seasons": True, "notify_cleanup": True, "ntfy_url": "https://ntfy.example/house",
+                "radarr_url": "http://radarr.local:7878", "radarr_api_key": "k",
+                "sonarr_url": "http://sonarr.local:8989", "sonarr_api_key": "k",
+            })
+            sy.state.mark("radarr", 1, "Inception", {"aggelos", "maria"}, "added")
+            sy.state.mark("sonarr", 50, "Breaking Bad", {"aggelos"}, "added")
+            sy.state.set("wants_at_radarr", str(now - app.WANTS_FRESH_SECONDS - 5))
+            sy.state.set("wants_at_sonarr", str(now - app.WANTS_FRESH_SECONDS - 5))
+            assert sy.run_cleanup(now=now, force=True)["skipped"] == "watchlists are not fresh"
+            assert sy.state.handled_row("radarr", 1)[4] == "added"
+            sy.state.set_wants("radarr", {})
+            sy.state.set_wants("sonarr", {})
+
+            movies = [{"id": 10, "title": "Inception", "tmdbId": 1, "hasFile": True, "sizeOnDisk": 3000,
+                       "added": "2020-01-01T00:00:00Z", "tags": [], "imdbId": "tt1"}]
+            series = [{"id": 7, "title": "Breaking Bad", "tvdbId": 50, "ended": False, "status": "continuing",
+                       "added": "2020-01-01T00:00:00Z", "tags": [3], "statistics": {"sizeOnDisk": 9000},
+                       "seasons": [{"seasonNumber": 1, "monitored": True}, {"seasonNumber": 2, "monitored": True}]}]
+            episodes = [
+                {"seriesId": 7, "seasonNumber": 1, "episodeNumber": 1, "hasFile": True, "episodeFileId": 11,
+                 "tvdbId": 501, "episodeFile": {"size": 100}},
+                {"seriesId": 7, "seasonNumber": 2, "episodeNumber": 1, "hasFile": True, "episodeFileId": 12,
+                 "tvdbId": 502, "episodeFile": {"size": 100}},
+            ]
+            tags = [{"id": 3, "label": "plex-aggelos"}]
+
+            def arr_get(self, path, **params):
+                if path == "/movie":
+                    return movies
+                if path == "/series":
+                    return series
+                if path == "/tag":
+                    return tags
+                if path == "/episode":
+                    assert params.get("seriesId") == 7
+                    return episodes
+                raise AssertionError(path)
+
+            def arr_find(self, ext_id, imdb=None):
+                if self.name == "Radarr":
+                    return {"id": 10, "title": "Inception", "tmdbId": ext_id}
+                return {"id": 7, "title": "Breaking Bad", "tvdbId": ext_id, "seasons": series[0]["seasons"]}
+
+            recorded = []
+
+            def record_request(session, method, url, retries=4, **kw):
+                recorded.append((method, url, kw.get("params"), kw.get("json")))
+                return Resp(200, {})
+
+            activity = {"scope": "per-user", "ambiguous": False, "sessions": [], "plays": [
+                play("aggelos", now - 20 * day), play("maria", now - 20 * day),
+                eplay("aggelos", now - 20 * day, 1, 1, 501),
+            ]}
+            notes = []
+            sy.notify = lambda *a, **k: notes.append((a, k))
+            patches = (
+                patch.object(app.Plex, "watch_activity", lambda self: activity),
+                patch.object(app.Arr, "get", arr_get),
+                patch.object(app.Arr, "find", arr_find),
+                patch("app.request", record_request),
+            )
+            for p in patches:
+                p.start()
+            try:
+                warned = sy.run_cleanup(now=now)
+                assert warned["warned"] == ["Inception", "Breaking Bad S01"] and warned["deleted"] == []
+                assert warned["freed"] == 0 and recorded == []
+                assert notes and notes[0][0][0] == "cleanup" and notes[0][0][1].startswith("Will delete in 2 days:")
+                assert "Inception" in notes[0][0][1] and "Breaking Bad S01" in notes[0][0][1]
+                assert sy.run_cleanup(now=now + 10) is None
+                waiting = sy.run_cleanup(now=now + 2 * day - 10, force=True)
+                assert waiting["deleted"] == [] and recorded == []
+                sy.settings.update({"dry_run": True})
+                preview = sy.run_cleanup(now=now + 2 * day, force=True)
+                assert preview["dry_run"] is True and preview["deleted"] == ["Inception", "Breaking Bad S01"]
+                assert preview["freed"] == 3100 and recorded == []
+                assert sy.state.handled_row("radarr", 1)[4] == "added"
+                assert sy.state.handled_row("sonarr", 50)[4] == "added"
+                assert any(a[0][1].startswith("Would free") for a in notes)
+                sy.settings.update({"dry_run": False})
+                done = sy.run_cleanup(now=now + 2 * day, force=True)
+                assert done["deleted"] == ["Inception", "Breaking Bad S01"] and done["freed"] == 3100
+                assert sy.state.handled_row("radarr", 1)[4] == "deleted"
+                assert sy.state.handled_row("sonarr", 50)[4] == "added"
+                movie_delete = next(c for c in recorded if c[0] == "DELETE" and c[1].endswith("/movie/10"))
+                assert movie_delete[2]["deleteFiles"] == "true"
+                assert any(c[0] == "DELETE" and c[1].endswith("/episodefile/11") for c in recorded)
+                assert not any(c[1].endswith("/episodefile/12") for c in recorded)
+                put = next(c for c in recorded if c[0] == "PUT" and c[1].endswith("/series/7"))
+                seasons_body = {row["seasonNumber"]: row["monitored"] for row in put[3]["seasons"]}
+                assert seasons_body[1] is False and seasons_body[2] is True
+                assert any(a[0][1].startswith("Freed ") for a in notes)
+                assert sy.state.cleanup_pending_rows() == []
+            finally:
+                for p in patches:
+                    p.stop()
+
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), app.make_handler(sy, ""))
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            root = f"http://127.0.0.1:{srv.server_port}"
+            try:
+                page = urllib.request.urlopen(root + "/").read().decode()
+                assert 'name="cleanup_watched"' in page and 'name="notify_cleanup"' in page and "Disk cleanup" in page
+                kept = call_server(root, "/api/cleanup/keep", {"service": "sonarr", "id": 50, "season": 1})
+                assert kept["kept"] and kept["kept"][0]["season"] == 1
+                assert call_server(root, "/api/cleanup/unkeep", {"service": "sonarr", "id": 50, "season": 1})["kept"] == []
+                try:
+                    call_server(root, "/api/cleanup/keep", {"service": "plex", "id": 1})
+                    raise AssertionError("expected 400")
+                except urllib.error.HTTPError as e:
+                    assert e.code == 400
+            finally:
+                srv.shutdown()
+        finally:
+            sy.state.db.close()
+
+        hold = app.Syncer(os.path.join(td, "hold"))
+        try:
+            hold.settings.update({
+                "plex_token": "t", "dry_run": False, "cleanup_watched": True, "cleanup_watched_days": 14,
+                "cleanup_grace_days": 2, "radarr_url": "http://radarr.local:7878", "radarr_api_key": "k",
+                "sonarr_url": "", "notify_cleanup": True, "ntfy_url": "https://ntfy.example/house",
+            })
+            hold.state.mark("radarr", 1, "Inception", {"aggelos"}, "added")
+            hold.state.set_wants("radarr", {})
+            hold.notify = lambda *a, **k: None
+            one = {"scope": "per-user", "ambiguous": False, "sessions": [], "plays": [play("aggelos", now - 20 * day)]}
+            film = [{"id": 10, "title": "Inception", "tmdbId": 1, "hasFile": True, "sizeOnDisk": 3000,
+                     "added": "2020-01-01T00:00:00Z", "tags": [9], "imdbId": "tt1"}]
+
+            def film_get(self, path, **params):
+                if path == "/movie":
+                    return film
+                if path == "/tag":
+                    return [{"id": 9, "label": "keep"}]
+                raise AssertionError(path)
+
+            with patch.object(app.Plex, "watch_activity", lambda self: one), patch.object(app.Arr, "get", film_get):
+                assert hold.run_cleanup(now=now, force=True)["warned"] == []
+            film[0]["tags"] = []
+            with patch.object(app.Plex, "watch_activity", lambda self: one), patch.object(app.Arr, "get", film_get):
+                assert hold.run_cleanup(now=now, force=True)["warned"] == ["Inception"]
+            hold.state.cleanup_keep("radarr", 1, -1)
+            calls = []
+            with patch.object(app.Plex, "watch_activity", lambda self: one), \
+                 patch.object(app.Arr, "get", film_get), \
+                 patch.object(app.Arr, "delete", lambda self, obj: calls.append(obj)):
+                saved = hold.run_cleanup(now=now + 2 * day, force=True)
+            assert saved["deleted"] == [] and calls == [] and hold.state.handled_row("radarr", 1)[4] == "added"
+            view = hold.cleanup_view()
+            assert view["kept"][0]["title"] == "Inception" and view["pending"] == []
+            assert "radarr.local" not in json.dumps(view)
+        finally:
+            hold.state.db.close()
+
+    plex = app.Plex("token", "cid", app.State(os.path.join(tempfile.mkdtemp(), "plex.db")))
+    try:
+        def resources(self, url, **params):
+            assert "resources" in url and "token" not in url
+            return [{"provides": "server", "owned": True, "connections": [
+                {"uri": "https://relay.example", "local": False, "relay": True},
+                {"uri": "http://192.168.1.5:32400", "local": True, "relay": False},
+            ]}]
+        with patch.object(app.Plex, "_get_json", resources):
+            assert plex.server_base() == "http://192.168.1.5:32400"
+        seen = []
+
+        def server_json(self, base, path, **params):
+            seen.append(path)
+            assert base == "http://192.168.1.5:32400" and "token" not in path
+            if path == "/status/sessions":
+                return {"MediaContainer": {"Metadata": []}}
+            if path == "/accounts":
+                return {"MediaContainer": {"Account": [{"id": 1, "name": "aggelos"}]}}
+            if path == "/status/sessions/history/all":
+                return {"MediaContainer": {"Metadata": [], "totalSize": 0}}
+            if path == "/library/sections":
+                return {"MediaContainer": {"Directory": [{"key": "2", "type": "movie"}]}}
+            if path.endswith("/all"):
+                return {"MediaContainer": {"size": 1, "totalSize": 1, "Metadata": [
+                    {"type": "movie", "viewCount": 4, "lastViewedAt": last, "Guid": [{"id": "tmdb://9"}]}]}}
+            raise AssertionError(path)
+
+        plex.server_base = lambda: "http://192.168.1.5:32400"
+        with patch.object(app.Plex, "_server_json", server_json):
+            watched = plex.watch_activity()
+        assert watched["scope"] == "owner" and watched["plays"][0]["tmdb"] == 9
+        assert watched["plays"][0]["at"] == last and "/library/sections" in seen
+    finally:
+        plex.state.db.close()
+    print("cleanup tests OK")
+
+def call_server(root, path, body):
+    req = urllib.request.Request(root + path, method="POST", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req) as r:
+        return json.loads(r.read() or b"{}")
+
+cleanup_tests()
+
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])
 print("ALL OK")
