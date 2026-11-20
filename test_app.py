@@ -1785,6 +1785,20 @@ def watchlist_paging_tests():
             assert [k for k, _, _ in plex.own_watchlist()] == ["same"] * 100
             assert repeats["n"] == 2  # second page repeats the first id and stops
 
+            # Plex sending pages smaller than asked for must not cut the list
+            # short while totalSize says there is more.
+            small = []
+
+            def small_pages(url, **params):
+                start = int(params.get("X-Plex-Container-Start", 0))
+                small.append(start)
+                rows = [{"ratingKey": f"s{i}", "title": "S", "type": "movie"} for i in range(start, min(start + 50, 120))]
+                return {"MediaContainer": {"totalSize": 120, "Metadata": rows}}
+
+            plex._get_json = small_pages
+            assert len(list(plex.own_watchlist())) == 120
+            assert small == [0, 50, 100], small
+
             cursors = []
 
             def graphql(query, variables=None):
@@ -1876,6 +1890,26 @@ def interval_limit_tests():
     print("interval limit tests OK")
 
 interval_limit_tests()
+
+def handled_restore_tests():
+    # A TV delete that Radarr refuses must put the title's old row back,
+    # not erase its history.
+    with tempfile.TemporaryDirectory() as td:
+        st = app.State(os.path.join(td, "state.db"))
+        try:
+            st.mark("radarr", 7, "Seven", {"ann", "bob"}, "added")
+            before = st.handled_row("radarr", 7)
+            st.mark("radarr", 7, "Seven", set(), "deleted")
+            st.restore_row("radarr", 7, before)
+            assert st.handled_row("radarr", 7) == before
+            st.mark("radarr", 8, "Eight", set(), "deleted")
+            st.restore_row("radarr", 8, None)
+            assert st.handled_row("radarr", 8) is None
+        finally:
+            st.db.close()
+    print("handled restore tests OK")
+
+handled_restore_tests()
 
 def auto_fetch_order_tests():
     with tempfile.TemporaryDirectory() as td:

@@ -319,6 +319,19 @@ class State:
         with self.lock, self.db:
             self.db.execute("DELETE FROM handled WHERE service=? AND ext_id=?", (service, ext_id))
 
+    def handled_row(self, service, ext_id):
+        with self.lock:
+            return self.db.execute(
+                "SELECT * FROM handled WHERE service=? AND ext_id=?", (service, ext_id)
+            ).fetchone()
+
+    def restore_row(self, service, ext_id, row):
+        """Put a handled row back as it was (or remove it if there was none)."""
+        if row is None:
+            return self.forget(service, ext_id)
+        with self.lock, self.db:
+            self.db.execute("INSERT OR REPLACE INTO handled VALUES (?,?,?,?,?,?)", tuple(row))
+
     def recent(self, limit=200):
         with self.lock:
             rows = self.db.execute(
@@ -535,18 +548,17 @@ class Plex:
                 break  # nothing usable, or the server ignored the offset and repeated the page
             last_marker = marker
             yield from rows
-            if len(meta) < size:
-                break
-            start += size
+            start += len(meta)
             total = mc.get("totalSize")
-            if isinstance(total, bool) or not isinstance(total, (int, float, str)):
-                continue
             try:
-                total_n = int(total)
+                total_n = None if isinstance(total, bool) else int(total)
             except (TypeError, ValueError):
-                continue
-            if total_n > 0 and start >= total_n:
-                break
+                total_n = None
+            if total_n and total_n > 0:
+                if start >= total_n:
+                    break
+            elif len(meta) < size:
+                break  # no usable total: a short page is the last one
         else:
             log.warning("Stopped reading the owner watchlist after %d items", start)
 
@@ -1917,14 +1929,16 @@ class Syncer:
         with self.lock:
             # Remember the deletion first. If we die after Arr has removed the
             # files, the next sync must not download them again. A failed
-            # delete rolls this back so a down Arr is not stuck as deleted.
+            # delete puts back the row that was there, so a down Arr is not
+            # stuck as deleted and the title keeps its history.
+            before = self.state.handled_row(service, real_id) if real_id else None
             if real_id:
                 self.state.mark(service, real_id, label, self.state.wanters(service, real_id), "deleted")
             try:
                 arr.delete(obj)
             except Exception:
                 if real_id:
-                    self.state.forget(service, real_id)
+                    self.state.restore_row(service, real_id, before)
                 raise
         with self.cache_lock:
             self._queue_cache = None
@@ -2373,6 +2387,26 @@ def make_handler(syncer, ui_password):
             raw = self.rfile.read(n) if n else b"{}"
             return json.loads(raw or b"{}")
 
+        def _too_large(self, message):
+            # Closing with the body still unread makes the OS reset the socket,
+            # and the client sees an aborted connection instead of the 413.
+            # Read and drop a modest body first; a really huge one still gets cut.
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except (ValueError, TypeError):
+                n = 0
+            if 0 < n <= 2 * 1_048_576:
+                try:
+                    self.connection.settimeout(5)
+                    while n > 0:
+                        chunk = self.rfile.read(min(n, 65536))
+                        if not chunk:
+                            break
+                        n -= len(chunk)
+                except OSError:
+                    pass
+            return self._send(413, {"error": message})
+
         def do_GET(self):
             p = self._clean_path()
             if p != "/health" and not self._guard():
@@ -2521,7 +2555,7 @@ def make_handler(syncer, ui_password):
             try:
                 body = self._body()
             except OverflowError:
-                return self._send(413, {"error": "payload too large"})
+                return self._too_large("payload too large")
             except ValueError:
                 return self._send(400, {"error": "bad json"})
             if not isinstance(body, dict):
@@ -2672,7 +2706,7 @@ def make_handler(syncer, ui_password):
             try:
                 size = int(self.headers.get("Content-Length") or 0)
                 if not 0 < size <= 20000:
-                    return self._send(413, {"error": "Recommendation payload size is out of range"})
+                    return self._too_large("Recommendation payload size is out of range")
                 data, allowed = recommendation_input(self._body())
             except (ValueError, RecursionError, OverflowError):
                 return self._send(400, {"error": "Invalid recommendation payload"})
