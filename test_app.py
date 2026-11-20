@@ -1732,5 +1732,129 @@ def guid_grouping_tests():
 
 guid_grouping_tests()
 
+def watchlist_paging_tests():
+    with tempfile.TemporaryDirectory() as td:
+        sy = app.Syncer(td)
+        try:
+            plex = app.Plex("tok", sy.client_id, sy.state)
+            calls = []
+
+            def get_json(url, **params):
+                assert "watchlist/all" in url
+                start = int(params.get("X-Plex-Container-Start", 0))
+                calls.append(start)
+                if start == 0:
+                    meta = [{"title": "skip-me", "type": "show"}, "junk"]
+                    meta += [{"ratingKey": i, "title": f"T{i}", "type": "movie"} for i in range(1, 99)]
+                    # 2 junk + 98 titles = 100. totalSize omitted, and one row has no ratingKey.
+                    assert len(meta) == 100
+                    return {"MediaContainer": {"totalSize": None, "Metadata": meta}}
+                if start == 100:
+                    return {"MediaContainer": {"Metadata": [
+                        {"ratingKey": "last", "title": "Last", "type": "SHOW"},
+                    ]}}
+                raise AssertionError(f"unexpected page {start}")
+
+            plex._get_json = get_json
+            items = list(plex.own_watchlist())
+            assert calls == [0, 100], calls
+            assert [k for k, _, _ in items][0] == "1"
+            assert items[-1][0] == "last" and items[-1][2] == "show"
+            assert len(items) == 99  # 98 numbered + last; the row without ratingKey is skipped
+            assert all(isinstance(t, str) for _, t, _ in items)
+
+            spins = {"n": 0}
+
+            def spin(url, **params):
+                spins["n"] += 1
+                return {"MediaContainer": {"totalSize": 10**9, "Metadata": []}}
+
+            plex._get_json = spin
+            assert list(plex.own_watchlist()) == []
+            assert spins["n"] == 1
+
+            repeats = {"n": 0}
+
+            def repeat(url, **params):
+                repeats["n"] += 1
+                return {"MediaContainer": {"totalSize": 10**9, "Metadata": [
+                    {"ratingKey": "same", "title": "Same", "type": "movie"},
+                ] * 100}}
+
+            plex._get_json = repeat
+            assert [k for k, _, _ in plex.own_watchlist()] == ["same"] * 100
+            assert repeats["n"] == 2  # second page repeats the first id and stops
+
+            cursors = []
+
+            def graphql(query, variables=None):
+                variables = variables or {}
+                cursors.append(variables.get("after"))
+                if variables.get("after") == "c1":
+                    return {"user": {"watchlist": {"nodes": [
+                        {"id": "a", "title": "A", "type": "SHOW"},
+                        {"title": "no-id", "type": "MOVIE"},
+                        "x",
+                    ], "pageInfo": {"hasNextPage": True, "endCursor": "c1"}}}}
+                return {"user": {"watchlist": {"nodes": [
+                    {"id": "b", "title": "B", "type": "movie"},
+                ], "pageInfo": {"hasNextPage": True, "endCursor": "c1"}}}}
+
+            plex._graphql = graphql
+            got = list(plex.friend_watchlist("u"))
+            assert [i[0] for i in got] == ["b", "a"], got
+            assert cursors == [None, "c1"]
+
+            plex._graphql = lambda *a, **k: {"user": None}
+            try:
+                list(plex.friend_watchlist("u"))
+                raise AssertionError("null user should fail the friend's list")
+            except RuntimeError:
+                pass
+
+            plex._graphql = lambda *a, **k: {"allFriendsV2": [
+                {"user": {"id": "ok", "username": "mia"}},
+                {"user": {"id": "", "username": "blank"}},
+                "junk",
+                {"user": {"username": "noid"}},
+            ]}
+            assert plex.friends() == [{"id": "ok", "username": "mia"}]
+
+            sy.build()
+            class P:
+                def owner_name(self):
+                    raise RuntimeError("plex-account-down")
+                def own_watchlist(self):
+                    raise AssertionError("owner list should not be read without a name")
+                def friends(self):
+                    return [{"id": "f1", "username": "mia"}]
+                def server_usernames(self):
+                    return {"mia"}
+                def friend_watchlist(self, uid):
+                    yield "9", "Show", "show"
+            sy.plex = P()
+            items = sy.collect()
+            assert items["9"]["title"] == "Show" and "mia" in items["9"]["users"]
+            assert sy.users[0]["status"] == "error"
+            assert any(u["name"] == "mia" and u["status"] == "ok" for u in sy.users)
+
+            class P2(P):
+                def owner_name(self):
+                    return "owner"
+                def own_watchlist(self):
+                    yield "1", "Owned", "movie"
+                def server_usernames(self):
+                    raise RuntimeError("users xml broke")
+            sy.plex = P2()
+            items = sy.collect()
+            assert items["1"]["title"] == "Owned"
+            assert "9" not in items  # friends skipped rather than opened to everyone
+            assert all(u["role"] != "friend" for u in sy.users)
+        finally:
+            sy.state.db.close()
+    print("watchlist paging tests OK")
+
+watchlist_paging_tests()
+
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])
 print("ALL OK")

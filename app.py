@@ -495,34 +495,92 @@ class Plex:
 
     def own_watchlist(self):
         start, size = 0, 100
-        while True:
-            mc = self._get_json(
+        last_marker = None
+        # A missing totalSize used to stop after the first page (start >= 0). A
+        # null one threw and aborted the cycle. An empty page with a huge
+        # totalSize would keep requesting forever.
+        for _ in range(200):
+            data = self._get_json(
                 f"{self.DISCOVER}/library/sections/watchlist/all",
                 **{"X-Plex-Container-Start": start, "X-Plex-Container-Size": size},
-            ).get("MediaContainer", {})
-            for m in mc.get("Metadata", []) or []:
-                yield str(m["ratingKey"]), m.get("title", "?"), m.get("type", "").lower()
-            start += size
-            if start >= int(mc.get("totalSize", 0)):
+            )
+            mc = data.get("MediaContainer") if isinstance(data, dict) else None
+            if not isinstance(mc, dict):
                 break
+            meta = mc.get("Metadata") or []
+            if not isinstance(meta, list) or not meta:
+                break
+            rows, marker = [], None
+            for m in meta:
+                if not isinstance(m, dict):
+                    continue
+                rk = m.get("ratingKey")
+                if rk in (None, ""):
+                    continue
+                if marker is None:
+                    marker = str(rk)
+                title = m.get("title") if isinstance(m.get("title"), str) else "?"
+                typ = m.get("type") if isinstance(m.get("type"), str) else ""
+                rows.append((str(rk), title, typ.lower()))
+            if marker is None or marker == last_marker:
+                break  # nothing usable, or the server ignored the offset and repeated the page
+            last_marker = marker
+            yield from rows
+            if len(meta) < size:
+                break
+            start += size
+            total = mc.get("totalSize")
+            if isinstance(total, bool) or not isinstance(total, (int, float, str)):
+                continue
+            try:
+                total_n = int(total)
+            except (TypeError, ValueError):
+                continue
+            if total_n > 0 and start >= total_n:
+                break
+        else:
+            log.warning("Stopped reading the owner watchlist after %d items", start)
 
     def friends(self):
         data = self._graphql(self.FRIENDS_QUERY)
-        return [f["user"] for f in data.get("allFriendsV2", []) if f.get("user")]
+        rows = data.get("allFriendsV2") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            return []
+        out = []
+        for f in rows:
+            user = f.get("user") if isinstance(f, dict) else None
+            if isinstance(user, dict) and user.get("id") not in (None, "") and user.get("username"):
+                out.append(user)
+        return out
 
     def friend_watchlist(self, user_uuid):
-        after = None
-        while True:
+        after, seen = None, set()
+        for _ in range(200):
             variables = {"uuid": user_uuid, "first": 100}
             if after:
                 variables["after"] = after
-            wl = self._graphql(self.WATCHLIST_QUERY, variables)["user"]["watchlist"]
-            for n in wl.get("nodes", []):
-                yield str(n["id"]), n.get("title", "?"), n.get("type", "").lower()
-            info = wl.get("pageInfo", {})
-            if not (info.get("hasNextPage") and info.get("endCursor")):
+            data = self._graphql(self.WATCHLIST_QUERY, variables)
+            user = data.get("user") if isinstance(data, dict) else None
+            wl = user.get("watchlist") if isinstance(user, dict) else None
+            if not isinstance(wl, dict):
+                raise RuntimeError("watchlist unavailable")
+            nodes = wl.get("nodes") or []
+            if not isinstance(nodes, list):
                 break
-            after = info["endCursor"]
+            for n in nodes:
+                if not isinstance(n, dict) or n.get("id") in (None, ""):
+                    continue
+                title = n.get("title") if isinstance(n.get("title"), str) else "?"
+                typ = n.get("type") if isinstance(n.get("type"), str) else ""
+                yield str(n["id"]), title, typ.lower()
+            info = wl.get("pageInfo") if isinstance(wl.get("pageInfo"), dict) else {}
+            cursor = info.get("endCursor")
+            if not info.get("hasNextPage") or not cursor or cursor in seen:
+                break
+            seen.add(cursor)
+            after = cursor
+        else:
+            log.warning("Stopped reading a friend watchlist at the page cap")
 
     def server_usernames(self):
         """Usernames/titles of everyone the owner shares a server with."""
@@ -872,23 +930,47 @@ class Syncer:
             it = items.setdefault(rk, {"title": title, "type": typ, "users": set()})
             it["users"].add(user)
 
-        owner = self.plex.owner_name()
+        try:
+            owner = self.plex.owner_name()
+        except Exception as e:
+            log.warning("Could not read the Plex account: %s", safe_err(e, self.all_secrets()))
+            owner = None
         if self.cfg.include_owner:
-            if self.user_ok(owner):
-                n = 0
-                for rk, title, typ in self.plex.own_watchlist():
-                    add(rk, title, typ, owner)
-                    n += 1
-                users.append({"name": owner, "role": "owner", "items": n, "status": "ok"})
-                log.info("Owner %s: %d watchlist items", owner, n)
-            else:
+            if not owner:
+                users.append({"name": "owner", "role": "owner", "items": None, "status": "error"})
+            elif not self.user_ok(owner):
                 users.append({"name": owner, "role": "owner", "items": None, "status": "excluded"})
+            else:
+                try:
+                    n = 0
+                    for rk, title, typ in self.plex.own_watchlist():
+                        add(rk, title, typ, owner)
+                        n += 1
+                    users.append({"name": owner, "role": "owner", "items": n, "status": "ok"})
+                    log.info("Owner %s: %d watchlist items", owner, n)
+                except Exception as e:
+                    users.append({"name": owner, "role": "owner", "items": None, "status": "error"})
+                    log.warning("Could not read %s's watchlist: %s", owner, safe_err(e, self.all_secrets()))
 
         if self.cfg.include_friends:
-            friends = self.plex.friends()
-            allowed = self.plex.server_usernames() if self.cfg.only_server_users else None
+            try:
+                friends = self.plex.friends()
+            except Exception as e:
+                log.warning("Could not list friends: %s", safe_err(e, self.all_secrets()))
+                friends = []
+            allowed = None
+            if friends and self.cfg.only_server_users:
+                try:
+                    allowed = self.plex.server_usernames()
+                except Exception as e:
+                    # Don't treat "couldn't check" as "allow every friend".
+                    log.warning("Could not list server users; skipping friends this cycle: %s",
+                                safe_err(e, self.all_secrets()))
+                    friends = []
             for f in friends:
-                name = f["username"]
+                name = f.get("username") if isinstance(f, dict) else None
+                if not isinstance(name, str) or not name.strip():
+                    continue
                 if allowed is not None and name.lower() not in allowed:
                     continue
                 if not self.user_ok(name):
