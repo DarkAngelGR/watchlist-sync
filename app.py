@@ -1760,7 +1760,8 @@ class Syncer:
             }
             arr.post("/command", body, retries=0)
             self.tv_searches[key] = now + 120
-            self.__dict__.pop("_queue_cache", None)
+            with self.cache_lock:
+                self.__dict__.pop("_queue_cache", None)
             return {"status": "searching"}
 
     def _reconcile_auto(self, arr, attempt):
@@ -1876,8 +1877,11 @@ class Syncer:
             arr.delete(obj)
             if real_id:
                 self.state.mark(service, int(real_id), label, self.state.wanters(service, int(real_id)), "deleted")
-        self._queue_cache = None
-        self.__dict__.get("_collection_cache", {}).clear()
+        with self.cache_lock:
+            self._queue_cache = None
+            cache = self.__dict__.get("_collection_cache")
+            if isinstance(cache, dict):
+                cache.clear()
         self._invalidate_library(kind)
         log.info("Deleted '%s' and its files from %s (from a TV)", label, name)
         return {"service": service, "configured": True, "found": True, "deleted": True, "title": label}

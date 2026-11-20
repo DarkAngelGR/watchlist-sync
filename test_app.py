@@ -1949,5 +1949,69 @@ def exclude_race_tests():
 
 exclude_race_tests()
 
+def cache_lock_tests():
+    with tempfile.TemporaryDirectory() as td:
+        sy = app.Syncer(td)
+        try:
+            sy.settings.update({
+                "dry_run": False,
+                "radarr_url": "http://localhost:7878",
+                "radarr_api_key": "k",
+                "plex_token": "t",
+            })
+            sy._queue_cache = (time.time(), {"items": [1]})
+            entered = []
+            real_lock = sy.cache_lock
+
+            class Wrap:
+                def __enter__(self):
+                    entered.append("lock")
+                    return real_lock.__enter__()
+                def __exit__(self, *args):
+                    entered.append("unlock")
+                    return real_lock.__exit__(*args)
+                def locked(self):
+                    return real_lock.locked()
+
+            sy.cache_lock = Wrap()
+            with patch.object(app.Arr, "find", return_value={"id": 3, "tmdbId": 9, "monitored": True, "hasFile": False}), \
+                 patch.object(app.Arr, "queued", return_value=False), \
+                 patch.object(app.Arr, "active_search_ids", return_value=set()), \
+                 patch.object(app.Arr, "post", return_value={"id": 1}):
+                assert sy.tv_search_again("movie", 9)["status"] == "searching"
+            assert entered == ["lock", "unlock"], entered
+            assert "_queue_cache" not in sy.__dict__
+
+            events = []
+
+            class Spy(dict):
+                def clear(self):
+                    events.append("clear")
+                    dict.clear(self)
+
+            class Wrap2(Wrap):
+                def __enter__(self):
+                    events.append("lock")
+                    return real_lock.__enter__()
+                def __exit__(self, *args):
+                    events.append("unlock")
+                    return real_lock.__exit__(*args)
+
+            sy.cache_lock = Wrap2()
+            sy._collection_cache = Spy({1: (0, {"collection": None})})
+            sy._queue_cache = (1, {"items": []})
+            with patch.object(app.Arr, "find", return_value={"id": 4, "tmdbId": 9, "title": "M"}), \
+                 patch.object(app.Arr, "delete", return_value=None):
+                res = sy.tv_delete("movie", 9, "", "M")
+            assert res["deleted"] is True
+            assert events[events.index("clear") - 1] == "lock", events
+            assert sy._queue_cache is None
+            assert sy._collection_cache == {}
+        finally:
+            sy.state.db.close()
+    print("cache lock tests OK")
+
+cache_lock_tests()
+
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])
 print("ALL OK")
