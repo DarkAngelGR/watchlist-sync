@@ -83,14 +83,17 @@ FIELDS = {
 SECRETS = ("plex_token", "sonarr_api_key", "radarr_api_key", "bazarr_api_key", "tmdb_api_key")
 
 
-def cast(typ, v, default=None):
+def cast(typ, v, default=None, hi=None):
     if typ is bool:
         return as_bool(v)
     if typ is int:
         try:
-            return max(1, int(v))
-        except (ValueError, TypeError):
+            if isinstance(v, bool):
+                raise ValueError
+            n = max(1, int(v))
+        except (ValueError, TypeError, OverflowError):
             return default if default is not None else 1
+        return min(n, hi) if hi is not None else n
     return str(v if v is not None else "").strip()
 
 
@@ -111,6 +114,11 @@ class Settings:
             raw = os.environ.get(env_name)
             d[k] = cast(typ, raw, default) if raw not in (None, "") else default
         d.update(self._saved())
+        # A multi-hundred-digit interval survives in sqlite and then
+        # Event.wait() raises OverflowError on the main thread, which exits
+        # the process. Docker restarts and crashes the same way.
+        if "interval_min" in d:
+            d["interval_min"] = cast(int, d["interval_min"], FIELDS["interval_min"][1], 10080)
         return d
 
     def update(self, changes):
@@ -120,7 +128,8 @@ class Settings:
                 continue
             if k in SECRETS and v in (None, "") and k != "plex_token":
                 continue  # blank secret in the form = keep the existing one
-            saved[k] = cast(FIELDS[k][2], v, FIELDS[k][1])
+            hi = 10080 if k == "interval_min" else None  # one week
+            saved[k] = cast(FIELDS[k][2], v, FIELDS[k][1], hi)
         self.state.set("settings", json.dumps(saved))
 
     def public(self):
@@ -2625,7 +2634,11 @@ def main():
         if once:
             break
         interval = syncer.cfg.interval_min if syncer.cfg else 15
-        syncer.wake.wait(interval * 60)
+        try:
+            syncer.wake.wait(max(1, min(int(interval), 10080)) * 60)
+        except (OverflowError, TypeError, ValueError):
+            log.exception("Sync wait failed")
+            syncer.wake.wait(15 * 60)
         syncer.wake.clear()
 
 

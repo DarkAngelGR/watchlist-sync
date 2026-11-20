@@ -1856,5 +1856,26 @@ def watchlist_paging_tests():
 
 watchlist_paging_tests()
 
+def interval_limit_tests():
+    with tempfile.TemporaryDirectory() as td:
+        st = app.State(os.path.join(td, "state.db"))
+        try:
+            sett = app.Settings(st)
+            sett.update({"interval_min": 10**400, "auto_fetch_free_gib": 10**12})
+            assert sett.all()["interval_min"] == 10080
+            # Only the sync interval is capped. A huge free-space threshold must not
+            # be rewritten into a small one, or auto-fetch would start downloading.
+            assert sett.all()["auto_fetch_free_gib"] == 10**12
+            saved = json.loads(st.get("settings"))
+            assert saved["interval_min"] == 10080
+            # A value already stored before the cap still can't reach Event.wait.
+            st.set("settings", json.dumps({"interval_min": 10**400}))
+            assert sett.all()["interval_min"] == 10080
+        finally:
+            st.db.close()
+    print("interval limit tests OK")
+
+interval_limit_tests()
+
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])
 print("ALL OK")
