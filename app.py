@@ -806,9 +806,18 @@ class Arr:
 def is_anime(series):
     """A Sonarr lookup result is anime if TheTVDB gives it the Anime genre,
     or it's Japanese animation."""
-    genres = {g.lower() for g in series.get("genres") or []}
-    lang = ((series.get("originalLanguage") or {}).get("name") or "").lower()
-    return "anime" in genres or ("animation" in genres and lang == "japanese")
+    if not isinstance(series, dict):
+        return False
+    raw = series.get("genres") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    elif not isinstance(raw, (list, tuple)):
+        raw = []
+    genres = {g.lower() for g in raw if isinstance(g, str)}
+    lang = series.get("originalLanguage")
+    if isinstance(lang, dict):
+        lang = lang.get("name")
+    return "anime" in genres or ("animation" in genres and str(lang or "").lower() == "japanese")
 
 
 def bazarr_probe(url, key):

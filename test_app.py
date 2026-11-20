@@ -2224,5 +2224,15 @@ def queue_shape_tests():
 
 queue_shape_tests()
 
+def anime_shape_tests():
+    assert app.is_anime({"genres": ["Animation"], "originalLanguage": "Japanese"})
+    assert app.is_anime({"genres": "Anime"})
+    assert not app.is_anime({"genres": "Drama"})
+    assert not app.is_anime({"genres": 5, "originalLanguage": {"name": "Japanese"}})
+    assert not app.is_anime(None)
+    print("anime shape tests OK")
+
+anime_shape_tests()
+
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])
 print("ALL OK")
