@@ -886,6 +886,7 @@ class Plex:
     def _paged(self, base, path, **params):
         """Follow Plex container paging. Caps the read so a huge library cannot run forever."""
         items, start, size = [], 0, 100
+        self.last_page_cut = False
         for _ in range(20):
             page = self._server_json(base, path, **{**params, "X-Plex-Container-Start": start, "X-Plex-Container-Size": size})
             rows = plex_metadata(page)
@@ -902,6 +903,7 @@ class Plex:
             if (total_n and start >= total_n) or len(rows) < size:
                 break
         else:
+            self.last_page_cut = True
             log.warning("Stopped reading %s after %d items", path, start)
         return items
 
@@ -920,7 +922,9 @@ class Plex:
             accounts = self._server_json(base, "/accounts")
         except Exception:
             accounts = {}
-        history = self._paged(base, "/status/sessions/history/all")
+        # Newest first, so a capped read drops only the oldest plays.
+        history = self._paged(base, "/status/sessions/history/all", sort="viewedAt:desc")
+        complete = not self.last_page_cut
         state = plex_watch_state(sessions, history, accounts)
         if state["scope"] == "owner":
             extra = self._owner_views(base)
@@ -928,6 +932,8 @@ class Plex:
                 merged = plex_watch_state(sessions, history + extra, accounts)
                 merged["scope"] = "owner"
                 state = merged
+        # A play past the cap would be missing, and "nobody played it" would be wrong.
+        state["history_complete"] = complete
         return state
 
     def _owner_views(self, base):
@@ -1261,6 +1267,10 @@ def cleanup_candidates(titles, activity, wants, keeps, rules, now):
     if activity.get("ambiguous"):
         return [], scope
     plays, sessions = activity.get("plays") or [], activity.get("sessions") or []
+    if activity.get("history_complete") is False and rules.get("unplayed"):
+        # Only the watched rule is safe on a partial history: a missing play can keep a
+        # title, never delete one.
+        rules = {**rules, "unplayed": False}
     wants, keeps = wants or set(), keeps or set()
     out = []
     for title in titles or []:
@@ -2173,7 +2183,9 @@ class Syncer:
             status = "down"
         elif not configured:
             status = "ok"
-        elif any_down or stale or errors:
+        elif any_down or stale:
+            # Per-title sync errors (one show Sonarr can't find) are routine; they are
+            # reported, but alerting on them would make a monitor flap.
             status = "degraded"
         else:
             status = "ok"

@@ -2834,7 +2834,7 @@ def health_tests():
             sy.state.set("last_sync_errors", "2")
             with patch("app.requests.get", up):
                 bad = sy.health_report(now=now)
-            assert bad["status"] == "degraded" and bad["last_sync_errors"] == 2
+            assert bad["status"] == "ok" and bad["last_sync_errors"] == 2  # reported, not an outage
 
             sy._health_cache = None
             sy.state.set("last_sync_errors", "0")
@@ -2896,7 +2896,7 @@ def health_tests():
                     assert "http" not in dumped and "secret" not in dumped and "internal" not in dumped
                     assert raw("/api/settings", server=base_h)[0] == 401
                     sy._health_cache = None
-                    sy.state.set("last_sync_errors", "4")
+                    sy.state.set("last_sync_ok", "1")   # stale sync = degraded (errors alone are not)
                     try:
                         urllib.request.urlopen(base_h + "/health/full")
                         raise AssertionError("expected 503")
@@ -2984,6 +2984,9 @@ def cleanup_tests():
     assert idle[0]["why"] == app.WHY_UNPLAYED and idle[0]["last_watched"] is None
     assert app.cleanup_candidates([movie(added=now - 90 * day)], act([play("aggelos", last)]), set(), set(), unplayed_rules, now)[0] == []
     assert app.cleanup_candidates([movie(added=now - 10 * day)], act([]), set(), set(), unplayed_rules, now)[0] == []
+    # A capped (partial) history can hide a play: the unplayed rule must not delete then.
+    partial = dict(act([]), history_complete=False)
+    assert app.cleanup_candidates([movie(added=now - 90 * day)], partial, set(), set(), unplayed_rules, now)[0] == []
 
     def episode(season, number, tvdb, file_id, size=100):
         return {"season": season, "episode": number, "tvdb": tvdb, "has_file": True, "file_id": file_id, "size": size}
