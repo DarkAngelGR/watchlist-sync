@@ -1006,7 +1006,7 @@ class Syncer:
                 except Exception as e:  # private watchlist etc.
                     users.append({"name": name, "role": "friend", "items": None, "status": "private"})
                     log.warning("Could not read %s's watchlist (is their Watchlist visibility "
-                                "set to Friends?): %s", name, e)
+                                "set to Friends?): %s", name, safe_err(e, self.all_secrets()))
         self.users = users
         return items
 
@@ -1044,8 +1044,11 @@ class Syncer:
                 self._sync_radarr(movies, summary)
             self._nudge_bazarr(summary)
         except Exception as e:
-            log.exception("Sync cycle failed")
-            summary["errors"].append(str(e))
+            # log.exception would write the raw message, and last_run is shown
+            # in the admin UI. A Plex or API error can include a token.
+            err = safe_err(e, self.all_secrets())
+            log.error("Sync cycle failed: %s", err)
+            summary["errors"].append(err)
         finally:
             self.running = False
 
@@ -1138,10 +1141,11 @@ class Syncer:
                                     self.action["deleted"].append(it["title"])
                             log.info("Deleted '%s' and its files (requested by %s)", it["title"], username)
                         except Exception as e:
+                            err = safe_err(e, self.all_secrets())
                             with self.action_lock:
                                 if self.action:
-                                    self.action["errors"].append(f"{it['title']}: {e}")
-                            log.error("Could not delete '%s': %s", it["title"], e)
+                                    self.action["errors"].append(f"{it['title']}: {err}")
+                            log.error("Could not delete '%s': %s", it["title"], err)
                     self._invalidate_library()
                 # titles other people still want: just drop this user's tag
                 if cfg.tag_by_user and not cfg.dry_run:
@@ -1157,7 +1161,7 @@ class Syncer:
                         except Exception as e:
                             with self.action_lock:
                                 if self.action:
-                                    self.action["errors"].append(f"{it['title']} (tag): {e}")
+                                    self.action["errors"].append(f"{it['title']} (tag): {safe_err(e, self.all_secrets())}")
             except Exception as e:
                 # Otherwise the thread dies, the UI is told the job finished, and
                 # nothing explains why nobody was deleted.
@@ -1177,8 +1181,9 @@ class Syncer:
             try:
                 ext = self.plex.guids(rk).get(id_type)
             except Exception as e:
-                log.error("Plex metadata lookup failed for '%s': %s", it["title"], e)
-                summary["errors"].append(f"plex:{it['title']}: {e}")
+                err = safe_err(e, self.all_secrets())
+                log.error("Plex metadata lookup failed for '%s': %s", it["title"], err)
+                summary["errors"].append(f"plex:{it['title']}: {err}")
                 continue
             ext_id = external_num(ext)
             if not ext_id:
@@ -1269,8 +1274,9 @@ class Syncer:
                 summary["added_series"].append(title)
                 log.info("Added %s '%s' (tvdb:%s) requested by %s", kind, title, tvdb, who)
             except Exception as e:
-                log.error("Sonarr: failed on '%s': %s", title, e)
-                summary["errors"].append(f"sonarr:{title}: {e}")
+                err = safe_err(e, self.all_secrets())
+                log.error("Sonarr: failed on '%s': %s", title, err)
+                summary["errors"].append(f"sonarr:{title}: {err}")
         if summary["added_series"]:
             self._invalidate_library("show")
 
@@ -1315,8 +1321,9 @@ class Syncer:
                 summary["added_movies"].append(title)
                 log.info("Added movie '%s' (tmdb:%s) requested by %s", title, tmdb, who)
             except Exception as e:
-                log.error("Radarr: failed on '%s': %s", title, e)
-                summary["errors"].append(f"radarr:{title}: {e}")
+                err = safe_err(e, self.all_secrets())
+                log.error("Radarr: failed on '%s': %s", title, err)
+                summary["errors"].append(f"radarr:{title}: {err}")
         if summary["added_movies"]:
             self._invalidate_library("movie")
 
@@ -2121,8 +2128,9 @@ class Syncer:
                 r.raise_for_status()
                 log.info("Bazarr: triggered %s", task)
             except Exception as e:
-                log.warning("Bazarr: could not trigger %s: %s", task, e)
-                summary["errors"].append(f"bazarr:{task}: {e}")
+                err = safe_err(e, self.all_secrets())
+                log.warning("Bazarr: could not trigger %s: %s", task, err)
+                summary["errors"].append(f"bazarr:{task}: {err}")
 
 
 # --------------------------------------------------------------------------- request origin

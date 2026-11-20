@@ -2234,5 +2234,32 @@ def anime_shape_tests():
 
 anime_shape_tests()
 
+def sync_secret_tests():
+    with tempfile.TemporaryDirectory() as td:
+        sy = app.Syncer(td)
+        try:
+            secret = "plex-secret-xyz"
+            sy.settings.update({
+                "plex_token": secret,
+                "sonarr_url": "http://localhost:8989",
+                "sonarr_api_key": "k",
+            })
+
+            def boom():
+                raise RuntimeError("failed " + secret)
+
+            sy._last_ping = time.time()
+            with patch.object(sy, "collect", boom):
+                summary = sy._run_once()
+            blob = " ".join(summary["errors"])
+            assert secret not in blob, blob
+            assert "[REDACTED]" in blob, blob
+            assert secret not in json.dumps(sy.last_run)
+        finally:
+            sy.state.db.close()
+    print("sync secret tests OK")
+
+sync_secret_tests()
+
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])
 print("ALL OK")
