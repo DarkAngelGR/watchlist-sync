@@ -2201,5 +2201,28 @@ def profile_shape_tests():
 
 profile_shape_tests()
 
+def queue_shape_tests():
+    with tempfile.TemporaryDirectory() as td:
+        sy = app.Syncer(td)
+        try:
+            class Q:
+                def queue_records(self, **params):
+                    return [
+                        {"movieId": 5, "status": "downloading", "size": "1000", "sizeleft": "250",
+                         "movie": {"title": "M", "tmdbId": 5},
+                         "episode": {"seasonNumber": "1", "episodeNumber": "4"}},
+                        {"movieId": 6, "status": "queued", "size": "nope", "sizeleft": True,
+                         "movie": {"title": "N", "tmdbId": 6},
+                         "episode": {"seasonNumber": 1, "episodeNumber": "nope"}},
+                    ]
+            out = {x["tmdb"]: x for x in sy._queue_of(Q(), "movie")}
+            assert out[5]["size"] == 1000 and out[5]["progress"] == 75.0 and out[5]["detail"] == "S01E04", out[5]
+            assert out[6]["size"] == 0 and out[6]["progress"] == 0 and out[6]["detail"] == ""
+        finally:
+            sy.state.db.close()
+    print("queue shape tests OK")
+
+queue_shape_tests()
+
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])
 print("ALL OK")

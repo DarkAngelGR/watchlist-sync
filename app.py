@@ -1387,6 +1387,14 @@ class Syncer:
 
     def _queue_of(self, arr, kind):
         """Group one Sonarr/Radarr queue by movie/series."""
+        def amount(v):
+            # One bad size used to raise and drop this service's whole queue.
+            if isinstance(v, str) and v.strip().isdigit():
+                v = int(v.strip())
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                return 0
+            return max(0, int(v))
+
         rank = {"downloading": 0, "importing": 1, "stalled": 2, "paused": 3, "queued": 4, "failed": 5}
         groups = {}
         params = {"includeEpisode": "true"} if kind == "show" else {}
@@ -1402,8 +1410,8 @@ class Syncer:
                 "poster": self._poster(obj), "size": 0, "sizeleft": 0, "timeleft": None,
                 "status": st, "episodes": [],
             })
-            g["size"] += max(0, rec.get("size") or 0)
-            g["sizeleft"] += max(0, rec.get("sizeleft") or 0)
+            g["size"] += amount(rec.get("size"))
+            g["sizeleft"] += amount(rec.get("sizeleft"))
             t = self._secs(rec.get("timeleft"))
             if t is not None:
                 g["timeleft"] = max(g["timeleft"] or 0, t)
@@ -1411,7 +1419,10 @@ class Syncer:
                 g["status"] = st
             ep = rec.get("episode") if isinstance(rec.get("episode"), dict) else {}
             if ep.get("episodeNumber") is not None:
-                g["episodes"].append("S%02dE%02d" % (ep.get("seasonNumber") or 0, ep["episodeNumber"]))
+                try:
+                    g["episodes"].append("S%02dE%02d" % (int(ep.get("seasonNumber") or 0), int(ep["episodeNumber"])))
+                except (TypeError, ValueError):
+                    pass
         out = []
         for g in groups.values():
             g["progress"] = max(0.0, min(100.0, round(100 * (1 - g["sizeleft"] / g["size"]), 1))) if g["size"] else 0
