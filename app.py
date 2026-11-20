@@ -1787,12 +1787,17 @@ class Syncer:
             if not cfg.radarr.enabled or not cfg.radarr.search:
                 return {"status": "unavailable"}
             arr = Arr("Radarr", cfg.radarr)
-            for attempt in self.state.auto_attempts(trigger):
-                token, ext_id, _, _ = attempt
-                status = self._reconcile_auto(arr, attempt)
-                if token == trigger:
-                    return {"status": status if ext_id == tmdb else "trigger-conflict"}
-                if status == "pending":
+            # auto_attempts also returns other pending rows, in no particular order.
+            # Checking those first reported quota-reached for a trigger that already
+            # had its own result.
+            attempts = list(self.state.auto_attempts(trigger))
+            mine = next((a for a in attempts if a[0] == trigger), None)
+            if mine is not None:
+                _, ext_id, _, _ = mine
+                status = self._reconcile_auto(arr, mine)
+                return {"status": status if ext_id == tmdb else "trigger-conflict"}
+            for attempt in attempts:
+                if self._reconcile_auto(arr, attempt) == "pending":
                     return {"status": "quota-reached"}
 
             if arr.find(tmdb) or arr.queued(tmdb=tmdb):

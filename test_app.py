@@ -1877,5 +1877,37 @@ def interval_limit_tests():
 
 interval_limit_tests()
 
+def auto_fetch_order_tests():
+    with tempfile.TemporaryDirectory() as td:
+        sy = app.Syncer(td)
+        try:
+            sy.settings.update({
+                "auto_fetch": True,
+                "dry_run": False,
+                "radarr_url": "http://localhost:7878",
+                "radarr_api_key": "k",
+                "radarr_search": True,
+            })
+            now = int(time.time())
+            sy.state.db.execute(
+                "INSERT INTO auto_fetch VALUES ('other-pending', 111, ?, 'pending')", (now,))
+            sy.state.record_auto("mine", 222, "added")
+            real = sy.state.auto_attempts
+
+            def other_first(trigger):
+                rows = list(real(trigger))
+                return sorted(rows, key=lambda r: 0 if r[0] == "other-pending" else 1)
+
+            sy.state.auto_attempts = other_first
+            assert other_first("mine")[0][0] == "other-pending"
+            assert sy.tv_auto_fetch(222, "mine")["status"] == "added"
+            # A trigger we have never seen still yields to someone else's fresh pending row.
+            assert sy.tv_auto_fetch(333, "new-one")["status"] == "quota-reached"
+        finally:
+            sy.state.db.close()
+    print("auto-fetch order tests OK")
+
+auto_fetch_order_tests()
+
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])
 print("ALL OK")
