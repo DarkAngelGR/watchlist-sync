@@ -2041,5 +2041,32 @@ def collection_cache_tests():
 
 collection_cache_tests()
 
+def collection_lookup_tests():
+    with tempfile.TemporaryDirectory() as td:
+        sy = app.Syncer(td)
+        try:
+            sy.settings.update({"radarr_url": "http://localhost:7878", "radarr_api_key": "k"})
+
+            def fake_req(self, method, url, params=None, **kw):
+                if "/lookup/" in url:
+                    return Resp(body=[{"collection": {"tmdbId": 9, "title": "Saga"}}])
+                if url.endswith("/collection"):
+                    assert params["tmdbId"] == 9
+                    return Resp(body=[{"title": "Saga", "movies": [
+                        {"tmdbId": 1, "title": "One", "year": 2001, "isExisting": False}]}])
+                if url.endswith("/movie"):
+                    return Resp(body=[{"collection": ["not-a-dict"]}])
+                return Resp(body=[])
+
+            with patch.object(requests.Session, "request", fake_req):
+                out = sy.tv_collection(77)
+            assert out["collection"]["title"] == "Saga", out
+            assert [m["title"] for m in out["collection"]["movies"]] == ["One"]
+        finally:
+            sy.state.db.close()
+    print("collection lookup tests OK")
+
+collection_lookup_tests()
+
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])
 print("ALL OK")

@@ -1475,15 +1475,21 @@ class Syncer:
             return {"collection": None, "reason": "radarr not set up"}
         arr = Arr("Radarr", cfg.radarr)
         get = lambda path, **params: request(arr.s, "GET", arr.base + path, retries=0, params=params, timeout=10)
+        def collection_of(payload):
+            # /movie is a list; lookup is usually one object, but Radarr also
+            # returns a one-element list. collection itself is not always an object.
+            row = next(iter(dicts(payload)), None) or {}
+            found = row.get("collection")
+            return found if isinstance(found, dict) else {}
+
         r = get("/movie", tmdbId=tmdb)
         r.raise_for_status()
-        movie = next(iter(dicts(json_or(r, []))), None)
-        coll = (movie or {}).get("collection") or {}
+        coll = collection_of(json_or(r, []))
         if not coll.get("tmdbId"):
             # Not in Radarr: its lookup still names the collection.
             r = get("/movie/lookup/tmdb", tmdbId=tmdb)
             if r.status_code == 200:
-                coll = json_or(r, {}).get("collection") or {}
+                coll = collection_of(json_or(r, {}))
         if not coll.get("tmdbId"):
             result = {"collection": None}
         else:
