@@ -2106,5 +2106,37 @@ def subtitle_shape_tests():
 
 subtitle_shape_tests()
 
+def delete_rollback_tests():
+    with tempfile.TemporaryDirectory() as td:
+        sy = app.Syncer(td)
+        try:
+            sy.settings.update({"radarr_url": "http://localhost:7878", "radarr_api_key": "k", "dry_run": False})
+            order = []
+
+            def spy_delete(self, obj):
+                order.append(("delete", sy.state.is_handled("radarr", 9)))
+                raise app.ArrError(500, "down")
+
+            with patch.object(app.Arr, "find", return_value={"id": 4, "tmdbId": 9, "title": "M"}), \
+                 patch.object(app.Arr, "delete", spy_delete):
+                try:
+                    sy.tv_delete("movie", 9, "", "M")
+                    raise AssertionError("expected ArrError")
+                except app.ArrError:
+                    pass
+            assert order == [("delete", True)]
+            assert not sy.state.is_handled("radarr", 9)
+
+            with patch.object(app.Arr, "find", return_value={"id": 4, "tmdbId": "9", "title": "M"}), \
+                 patch.object(app.Arr, "delete", return_value=None):
+                res = sy.tv_delete("movie", 9, "", "M")
+            assert res["deleted"] is True
+            assert sy.state.deleted_users("radarr", 9) == set()
+        finally:
+            sy.state.db.close()
+    print("delete rollback tests OK")
+
+delete_rollback_tests()
+
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])
 print("ALL OK")

@@ -1883,15 +1883,23 @@ class Syncer:
         if not obj:
             return {"service": service, "configured": True, "found": False, "deleted": False}
         key = "tmdbId" if kind == "movie" else "tvdbId"
-        real_id = obj.get(key) or ext_id
+        real_id = external_num(obj.get(key)) or external_num(ext_id)
         label = obj.get("title") or title or "?"
         if cfg.dry_run:
             log.info("[dry-run] TV would delete '%s' and its files from %s", label, name)
             return {"service": service, "configured": True, "found": True, "deleted": False, "dry_run": True}
         with self.lock:
-            arr.delete(obj)
+            # Remember the deletion first. If we die after Arr has removed the
+            # files, the next sync must not download them again. A failed
+            # delete rolls this back so a down Arr is not stuck as deleted.
             if real_id:
-                self.state.mark(service, int(real_id), label, self.state.wanters(service, int(real_id)), "deleted")
+                self.state.mark(service, real_id, label, self.state.wanters(service, real_id), "deleted")
+            try:
+                arr.delete(obj)
+            except Exception:
+                if real_id:
+                    self.state.forget(service, real_id)
+                raise
         with self.cache_lock:
             self._queue_cache = None
             cache = self.__dict__.get("_collection_cache")
