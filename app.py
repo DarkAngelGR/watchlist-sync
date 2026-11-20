@@ -1084,10 +1084,17 @@ class Syncer:
         self.wake.set()
 
     def exclude_user(self, username, delete_media):
-        """Block the user now; delete their media in the background."""
+        """Block the user now; delete their media in the background.
+
+        Returns None when another exclusion is still running. The check and the
+        running flag share one lock; the HTTP handler used to check, release,
+        and only then set the flag, so two requests both got through.
+        """
         plan = self.deletion_plan(username)
-        self._set_blocked(username, True)
         with self.action_lock:
+            if self.action and self.action.get("state") == "running":
+                return None
+            self._set_blocked(username, True)
             self.action = {"user": username, "state": "running", "deleted": [], "untagged": [], "errors": [],
                            "total": len(plan["delete"]) if delete_media else 0}
         threading.Thread(target=self._do_exclude, args=(username, plan, delete_media), daemon=True).start()
@@ -2561,10 +2568,9 @@ def make_handler(syncer, ui_password):
                 if m.group(2) == "include":
                     syncer.include_user(name)
                     return self._send(200, {"ok": True})
-                with syncer.action_lock:
-                    if syncer.action and syncer.action.get("state") == "running":
-                        return self._send(409, {"error": "Another exclusion is still running"})
                 plan = syncer.exclude_user(name, bool(body.get("delete")))
+                if plan is None:
+                    return self._send(409, {"error": "Another exclusion is still running"})
                 return self._send(200, {"ok": True, "plan": plan})
             m = re.fullmatch(r"/api/test/(sonarr|radarr|bazarr)", p)
             if m:

@@ -1926,5 +1926,28 @@ def exclude_thread_tests():
 
 exclude_thread_tests()
 
+def exclude_race_tests():
+    with tempfile.TemporaryDirectory() as td:
+        sy = app.Syncer(td)
+        try:
+            sy.action = {"state": "running", "user": "x", "deleted": [], "untagged": [], "errors": [], "total": 0}
+            assert sy.exclude_user("newperson", False) is None
+            assert "newperson" not in sy.settings.all()["user_block"].lower()
+        finally:
+            sy.state.db.close()
+    s.action = {"state": "running", "user": "x", "deleted": [], "untagged": [], "errors": [], "total": 0}
+    try:
+        try:
+            call("/api/users/somebody/exclude", {"delete": False})
+            raise AssertionError("expected 409")
+        except urllib.error.HTTPError as e:
+            assert e.code == 409, e.code
+        assert "somebody" not in s.settings.all()["user_block"].lower()
+    finally:
+        s.action = {"state": "done", "user": "x", "deleted": [], "untagged": [], "errors": [], "total": 0}
+    print("exclude race tests OK")
+
+exclude_race_tests()
+
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])
 print("ALL OK")
