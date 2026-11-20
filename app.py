@@ -40,6 +40,16 @@ PLEXTV = "https://plex.tv"
 PRODUCT = "watchlist-sync"
 VERSION = "1.5.0"
 
+# Rows the sync no longer needs. The 7-day auto-fetch quota keeps a full extra day.
+GUID_KEEP_DAYS = 30
+AUTO_FETCH_KEEP_DAYS = 8
+HANDLED_KEEP_DAYS = 180
+TV_LOG_KEEP_DAYS = 14
+MAINTAIN_INTERVAL = 86400
+VACUUM_INTERVAL = 7 * 86400
+# Ignore wants that a broken sync hasn't refreshed. An empty table is not "everyone left".
+WANTS_FRESH_SECONDS = 2 * 86400
+
 
 # --------------------------------------------------------------------------- settings
 def as_bool(v):
@@ -183,6 +193,9 @@ class State:
         self.lock = threading.Lock()
         with self.lock:
             try:
+                # INCREMENTAL has to be chosen before the first table. Existing files stay as they are.
+                if self.db.execute("SELECT count(*) FROM sqlite_master WHERE type='table'").fetchone()[0] == 0:
+                    self.db.execute("PRAGMA auto_vacuum=INCREMENTAL")
                 self.db.execute("PRAGMA journal_mode=WAL")
                 self.db.execute("PRAGMA synchronous=NORMAL")
                 self.db.execute("PRAGMA busy_timeout=5000")
@@ -191,6 +204,10 @@ class State:
             with self.db:
                 self.db.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)")
                 self.db.execute("CREATE TABLE IF NOT EXISTS guid_cache (rating_key TEXT PRIMARY KEY, guids TEXT)")
+                cols = {row[1] for row in self.db.execute("PRAGMA table_info(guid_cache)")}
+                if "last_used" not in cols:
+                    self.db.execute("ALTER TABLE guid_cache ADD COLUMN last_used INTEGER")
+                    self.db.execute("UPDATE guid_cache SET last_used=?", (int(time.time()),))
                 self.db.execute(
                     "CREATE TABLE IF NOT EXISTS auto_fetch (trigger TEXT PRIMARY KEY, tmdb INTEGER NOT NULL, "
                     "ts INTEGER NOT NULL, status TEXT NOT NULL)"
@@ -217,16 +234,22 @@ class State:
     def cached_guids(self, rk):
         with self.lock:
             row = self.db.execute("SELECT guids FROM guid_cache WHERE rating_key=?", (rk,)).fetchone()
-        if not row:
-            return None
-        try:
-            return json.loads(row[0])
-        except Exception:
-            return None
+            if not row:
+                return None
+            try:
+                guids = json.loads(row[0])
+            except Exception:
+                return None
+            with self.db:
+                self.db.execute("UPDATE guid_cache SET last_used=? WHERE rating_key=?", (int(time.time()), rk))
+            return guids
 
     def cache_guids(self, rk, guids):
         with self.lock, self.db:
-            self.db.execute("INSERT OR REPLACE INTO guid_cache VALUES (?,?)", (rk, json.dumps(guids)))
+            self.db.execute(
+                "INSERT OR REPLACE INTO guid_cache (rating_key, guids, last_used) VALUES (?,?,?)",
+                (rk, json.dumps(guids), int(time.time())),
+            )
 
     def is_handled(self, service, ext_id):
         with self.lock:
@@ -288,6 +311,9 @@ class State:
                 "INSERT OR IGNORE INTO wants VALUES (?,?,?)",
                 [(service, ext_id, u.lower()) for ext_id, it in grouped.items() for u in it["users"]],
             )
+            self.db.execute(
+                "INSERT OR REPLACE INTO kv VALUES (?,?)", (f"wants_at_{service}", str(int(time.time())))
+            )
 
     def wanters(self, service, ext_id):
         with self.lock:
@@ -338,6 +364,44 @@ class State:
                 "SELECT service, ext_id, title, users, result, ts FROM handled ORDER BY ts DESC LIMIT ?", (limit,)
             ).fetchall()
         return [dict(zip(("service", "id", "title", "users", "result", "ts"), r)) for r in rows]
+
+    def prune(self, now=None):
+        """Drop rows the next sync does not need. Returns how many of each went."""
+        now = int(time.time() if now is None else now)
+        guid_cut = now - GUID_KEEP_DAYS * 86400
+        auto_cut = now - AUTO_FETCH_KEEP_DAYS * 86400
+        handled_cut = now - HANDLED_KEEP_DAYS * 86400
+        with self.lock, self.db:
+            guid_n = self.db.execute(
+                "DELETE FROM guid_cache WHERE last_used IS NOT NULL AND last_used < ?", (guid_cut,)
+            ).rowcount
+            auto_n = self.db.execute("DELETE FROM auto_fetch WHERE ts < ?", (auto_cut,)).rowcount
+            handled_n = 0
+            # added / already-present / deleted rows decide whether a title is fetched again.
+            # A deleted row stays while anyone still has the title on a watchlist.
+            for service in ("sonarr", "radarr"):
+                row = self.db.execute("SELECT v FROM kv WHERE k=?", (f"wants_at_{service}",)).fetchone()
+                try:
+                    fresh = row is not None and now - int(row[0]) <= WANTS_FRESH_SECONDS
+                except (TypeError, ValueError):
+                    fresh = False
+                if not fresh:
+                    continue
+                handled_n += self.db.execute(
+                    "DELETE FROM handled WHERE service=? AND ts < ? AND NOT EXISTS ("
+                    "SELECT 1 FROM wants w WHERE w.service=handled.service AND w.ext_id=handled.ext_id)",
+                    (service, handled_cut),
+                ).rowcount
+        return {"guid": guid_n, "auto_fetch": auto_n, "handled": handled_n}
+
+    def vacuum(self):
+        """Give pages back. INCREMENTAL databases do a bounded pass; older files do a full VACUUM."""
+        with self.lock:
+            mode = self.db.execute("PRAGMA auto_vacuum").fetchone()[0]
+            if mode == 2:
+                self.db.execute("PRAGMA incremental_vacuum(200)")
+            else:
+                self.db.execute("VACUUM")
 
 
 def redact_secrets(text, secrets=None):
@@ -857,6 +921,7 @@ class Syncer:
         self.lock = threading.Lock()      # one sync or exclusion at a time
         self.tv_write_lock = threading.RLock()
         self.cache_lock = threading.Lock()
+        self._library_gen = 0
         self.action_lock = threading.Lock()
         self.tv_searches = {}
         self.action = None                # progress/result of the last exclude, shown in the UI
@@ -909,6 +974,64 @@ class Syncer:
     def get_tv_perf(self):
         with self.tv_log_lock:
             return list(reversed(self.tv_perf))
+
+    def prune_tv_state(self, now=None):
+        """Drop TV log rows past retention and rate-limit entries whose window has closed."""
+        now = time.time() if now is None else now
+        cutoff = now - TV_LOG_KEEP_DAYS * 86400
+        with self.tv_log_lock:
+            before = len(self.tv_logs) + len(self.tv_perf)
+            self.tv_logs = collections.deque(
+                (e for e in self.tv_logs if e.get("ts", 0) >= cutoff), maxlen=200)
+            self.tv_perf = collections.deque(
+                (e for e in self.tv_perf if e.get("ts", 0) >= cutoff), maxlen=200)
+            removed = before - len(self.tv_logs) - len(self.tv_perf)
+            window = now - 60
+            stale = 0
+            for ip in list(self.tv_log_rates):
+                times = [t for t in self.tv_log_rates[ip] if t > window]
+                if times:
+                    self.tv_log_rates[ip] = times
+                else:
+                    del self.tv_log_rates[ip]
+                    stale += 1
+        return {"logs": removed, "ips": stale}
+
+    def _watchlists_trusted(self):
+        """True when this cycle actually read a watchlist, so an empty list means the titles are gone."""
+        return any(u.get("status") == "ok" for u in self.users) and all(
+            u.get("status") != "error" for u in self.users)
+
+    def maintain(self, now=None):
+        """Prune old rows at most once a day, from the main loop. None when it is not due yet."""
+        now = time.time() if now is None else now
+        try:
+            last = float(self.state.get("last_maintain") or 0)
+        except (TypeError, ValueError):
+            last = 0
+        if now - last < MAINTAIN_INTERVAL:
+            return None
+        counts = self.state.prune(now)
+        mem = self.prune_tv_state(now)
+        vacuumed = False
+        try:
+            last_vac = float(self.state.get("last_vacuum") or 0)
+        except (TypeError, ValueError):
+            last_vac = 0
+        if now - last_vac >= VACUUM_INTERVAL:
+            try:
+                self.state.vacuum()
+                vacuumed = True
+                self.state.set("last_vacuum", str(int(now)))
+            except Exception as e:
+                log.warning("Cleanup vacuum failed: %s", safe_err(e))
+        self.state.set("last_maintain", str(int(now)))
+        log.info(
+            "Cleanup: guid %d, auto-fetch %d, handled %d, tv logs %d, stale IPs %d%s",
+            counts["guid"], counts["auto_fetch"], counts["handled"], mem["logs"], mem["ips"],
+            ", vacuumed" if vacuumed else "",
+        )
+        return {**counts, **mem, "vacuumed": vacuumed}
 
     def get_action(self):
         with self.action_lock:
@@ -1052,8 +1175,12 @@ class Syncer:
 
             if self.sonarr and shows:
                 self._sync_sonarr(shows, summary)
+            elif self.sonarr and self._watchlists_trusted():
+                self.state.set_wants("sonarr", {})
             if self.radarr and movies:
                 self._sync_radarr(movies, summary)
+            elif self.radarr and self._watchlists_trusted():
+                self.state.set_wants("radarr", {})
             self._nudge_bazarr(summary)
         except Exception as e:
             # log.exception would write the raw message, and last_run is shown
@@ -1569,7 +1696,10 @@ class Syncer:
 
     def _invalidate_library(self, kind=None):
         with self.cache_lock:
-            cache = self.__dict__.get("_library_cache", {})
+            self._library_gen += 1
+            cache = self.__dict__.get("_library_cache")
+            if not isinstance(cache, dict):
+                return
             if kind:
                 cache.pop("movie" if kind == "movie" else "show", None)
             else:
@@ -1583,6 +1713,7 @@ class Syncer:
         key = "movie" if kind == "movie" else "show"
         with self.cache_lock:
             cache = self.__dict__.setdefault("_library_cache", {})
+            gen = self._library_gen
             hit = cache.get(key)
             if not fresh and hit and time.time() - hit[0] < self.LIBRARY_TTL:
                 return hit[1]
@@ -1597,7 +1728,9 @@ class Syncer:
                 files = stats.get("episodeFileCount") or 0
                 out[x.get("tvdbId")] = ("have" if files else "requested", not files or files < (stats.get("episodeCount") or 0))
         with self.cache_lock:
-            cache[key] = (time.time(), out)
+            # A fetch that started before _invalidate_library() must not put that snapshot back.
+            if gen == self._library_gen:
+                cache[key] = (time.time(), out)
         return out
 
     def _lookup_item(self, kind, x, library):
@@ -2742,6 +2875,10 @@ def main():
             syncer.run_once()
         except Exception:
             log.exception("Sync cycle failed")
+        try:
+            syncer.maintain()
+        except Exception:
+            log.exception("Cleanup failed")
         if once:
             break
         interval = syncer.cfg.interval_min if syncer.cfg else 15

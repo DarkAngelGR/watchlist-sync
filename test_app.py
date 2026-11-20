@@ -2295,5 +2295,197 @@ def sync_secret_tests():
 
 sync_secret_tests()
 
+def maintenance_tests():
+    now = int(time.time())
+    with tempfile.TemporaryDirectory() as td:
+        old_path = os.path.join(td, "old.db")
+        raw = app.sqlite3.connect(old_path)
+        raw.execute("CREATE TABLE guid_cache (rating_key TEXT PRIMARY KEY, guids TEXT)")
+        raw.execute("INSERT INTO guid_cache VALUES ('rk', ?)", ('{"tmdb": "5"}',))
+        raw.commit()
+        raw.close()
+        upgraded = app.State(old_path)
+        try:
+            assert upgraded.cached_guids("rk")["tmdb"] == "5"
+            used = upgraded.db.execute("SELECT last_used FROM guid_cache WHERE rating_key='rk'").fetchone()[0]
+            assert used and used >= now
+            cols = {row[1] for row in upgraded.db.execute("PRAGMA table_info(guid_cache)")}
+            assert "last_used" in cols
+        finally:
+            upgraded.db.close()
+
+    with tempfile.TemporaryDirectory() as td:
+        sy = app.Syncer(td)
+        try:
+            assert sy.state.db.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
+            st = sy.state
+            st.cache_guids("fresh", {"tmdb": "1"})
+            st.db.execute(
+                "INSERT INTO guid_cache (rating_key, guids, last_used) VALUES (?,?,?)",
+                ("stale", "{}", now - (app.GUID_KEEP_DAYS + 5) * 86400),
+            )
+            st.db.commit()
+
+            def age_auto(trigger, tmdb, status, ts):
+                st.record_auto(trigger, tmdb, status)
+                st.db.execute("UPDATE auto_fetch SET ts=? WHERE trigger=?", (ts, trigger))
+                st.db.commit()
+
+            age_auto("old-added", 1, "added", now - 9 * 86400)
+            age_auto("week-added", 2, "added", now - 6 * 86400)
+            age_auto("edge", 3, "quota-reached", now - app.AUTO_FETCH_KEEP_DAYS * 86400)
+            age_auto("just-over", 4, "low-space", now - app.AUTO_FETCH_KEEP_DAYS * 86400 - 1)
+            age_auto("pending-new", 5, "pending", now - 3600)
+
+            def age_handled(service, ext_id, title, result, ts):
+                st.mark(service, ext_id, title, {"ada"}, result)
+                st.db.execute(
+                    "UPDATE handled SET ts=? WHERE service=? AND ext_id=?", (ts, service, ext_id))
+                st.db.commit()
+
+            old = now - (app.HANDLED_KEEP_DAYS + 20) * 86400
+            edge_h = now - app.HANDLED_KEEP_DAYS * 86400
+            age_handled("radarr", 1, "Gone added", "added", old)
+            age_handled("radarr", 2, "Still wanted", "added", old)
+            age_handled("radarr", 3, "Deleted stays", "deleted", old)
+            age_handled("radarr", 4, "Deleted left", "deleted", old)
+            age_handled("radarr", 5, "Already there", "already-present", old)
+            age_handled("radarr", 6, "Young gone", "already-present", now - 10 * 86400)
+            age_handled("radarr", 7, "Edge kept", "added", edge_h)
+            age_handled("sonarr", 9, "No fresh wants", "added", old)
+            age_handled("radarr", 8, "Requested gone", "requested", old)
+            st.set_wants("radarr", {
+                2: {"users": {"ada"}},
+                3: {"users": {"ada"}},
+                5: {"users": {"ada"}},
+            })
+
+            sy.tv_logs.append({"ts": now - (app.TV_LOG_KEEP_DAYS + 1) * 86400, "message": "old"})
+            sy.tv_logs.append({"ts": now, "message": "new"})
+            sy.tv_perf.append({"ts": now - (app.TV_LOG_KEEP_DAYS + 2) * 86400, "message": "old-perf"})
+            sy.tv_perf.append({"ts": now, "message": "new-perf"})
+            sy.tv_log_rates["old-ip"] = [now - 120]
+            sy.tv_log_rates["new-ip"] = [now]
+
+            counts = st.prune(now)
+            assert st.cached_guids("fresh")["tmdb"] == "1"
+            assert st.cached_guids("stale") is None
+            left_auto = {row[0] for row in st.db.execute("SELECT trigger FROM auto_fetch")}
+            assert left_auto == {"week-added", "edge", "pending-new"}, left_auto
+            left_ids = {(row[0], row[1]) for row in st.db.execute("SELECT service, ext_id FROM handled")}
+            assert left_ids == {("radarr", 2), ("radarr", 3), ("radarr", 5), ("radarr", 6), ("radarr", 7), ("sonarr", 9)}, left_ids
+            assert counts["guid"] >= 1 and counts["auto_fetch"] == 2 and counts["handled"] == 3
+
+            # A wants refresh older than the freshness window must not look like "everyone removed it".
+            st.db.execute("UPDATE kv SET v=? WHERE k='wants_at_radarr'", (str(now - app.WANTS_FRESH_SECONDS - 5),))
+            st.db.commit()
+            age_handled("radarr", 11, "Stale snapshot", "deleted", old)
+            again = st.prune(now)
+            assert st.handled_row("radarr", 11) is not None
+            assert again["handled"] == 0
+
+            mem = sy.prune_tv_state(now)
+            assert [e["message"] for e in sy.tv_logs] == ["new"]
+            assert [e["message"] for e in sy.tv_perf] == ["new-perf"]
+            assert "old-ip" not in sy.tv_log_rates and sy.tv_log_rates["new-ip"] == [now]
+            assert mem["logs"] == 2 and mem["ips"] == 1
+
+            with patch.object(app.log, "info") as info:
+                first = sy.maintain(now)
+            assert first["vacuumed"] is True
+            assert any(str(c.args[0]).startswith("Cleanup:") for c in info.call_args_list)
+            assert sy.maintain(now + 10) is None
+            st.db.execute(
+                "INSERT INTO guid_cache (rating_key, guids, last_used) VALUES (?,?,?)",
+                ("later", "{}", now - (app.GUID_KEEP_DAYS + 1) * 86400),
+            )
+            st.db.commit()
+            assert sy.maintain(now + 10) is None
+            # Don't read it through cached_guids: that stamps last_used and would keep the row.
+            assert st.db.execute("SELECT guids FROM guid_cache WHERE rating_key='later'").fetchone()[0] == "{}"
+            nxt = sy.maintain(now + app.MAINTAIN_INTERVAL)
+            assert nxt and nxt["vacuumed"] is False and nxt["guid"] >= 1
+            assert st.db.execute("SELECT 1 FROM guid_cache WHERE rating_key='later'").fetchone() is None
+            week = sy.maintain(now + app.MAINTAIN_INTERVAL + app.VACUUM_INTERVAL)
+            assert week["vacuumed"] is True
+
+            # An empty watchlist that was actually read drops wants; a failed read does not.
+            sy.settings.update({
+                "plex_token": "t",
+                "sonarr_url": "http://localhost:8989",
+                "sonarr_api_key": "k",
+                "dry_run": False,
+            })
+            age_handled("sonarr", 42, "Left the list", "deleted", old)
+            st.set_wants("sonarr", {42: {"users": {"ada"}}})
+
+            def collect_ok():
+                sy.users = [{"name": "ada", "role": "owner", "items": 0, "status": "ok"}]
+                return {}
+
+            sy._last_ping = time.time()
+            with patch.object(sy, "collect", collect_ok):
+                sy.run_once()
+            assert sy.state.wanters("sonarr", 42) == set()
+            assert st.prune(int(time.time()))["handled"] >= 1
+            assert st.handled_row("sonarr", 42) is None
+
+            age_handled("sonarr", 43, "Unreadable", "deleted", old)
+            st.set_wants("sonarr", {43: {"users": {"ada"}}})
+
+            def collect_err():
+                sy.users = [{"name": "ada", "role": "owner", "items": None, "status": "error"}]
+                return {}
+
+            with patch.object(sy, "collect", collect_err):
+                sy.run_once()
+            assert sy.state.wanters("sonarr", 43) == {"ada"}
+            assert st.handled_row("sonarr", 43) is not None
+        finally:
+            sy.state.db.close()
+    print("maintenance tests OK")
+
+maintenance_tests()
+
+def library_generation_tests():
+    with tempfile.TemporaryDirectory() as td:
+        sy = app.Syncer(td)
+        try:
+            started = threading.Event()
+            release = threading.Event()
+
+            class Slow:
+                def get(self, path):
+                    started.set()
+                    assert release.wait(3)
+                    return [{"tmdbId": 5, "hasFile": True}]
+
+            before = sy._library_gen
+            worker = threading.Thread(target=lambda: sy._library(Slow(), "movie", fresh=True))
+            worker.start()
+            assert started.wait(2)
+            sy._invalidate_library("movie")
+            assert sy._library_gen == before + 1
+            release.set()
+            worker.join(3)
+            assert not worker.is_alive()
+            assert "movie" not in sy.__dict__.get("_library_cache", {})
+
+            class Fast:
+                def get(self, path):
+                    return [{"tmdbId": 6, "hasFile": False}]
+
+            out = sy._library(Fast(), "movie", fresh=True)
+            assert out[6] == ("requested", True)
+            assert sy._library_cache["movie"][1][6][0] == "requested"
+            sy._invalidate_library()
+            assert "movie" not in sy._library_cache
+            assert sy._library_gen == before + 2
+        finally:
+            sy.state.db.close()
+    print("library generation tests OK")
+
+library_generation_tests()
+
 print("recent:", [(x["title"], x["users"], x["result"]) for x in s.state.recent()])
 print("ALL OK")
