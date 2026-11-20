@@ -255,7 +255,11 @@ class State:
             except Exception:
                 return None
             with self.db:
-                self.db.execute("UPDATE guid_cache SET last_used=? WHERE rating_key=?", (int(time.time()), rk))
+                # At most one write a day per title, not one per lookup.
+                now = int(time.time())
+                self.db.execute(
+                    "UPDATE guid_cache SET last_used=? WHERE rating_key=? AND (last_used IS NULL OR last_used < ?)",
+                    (now, rk, now - 86400))
             return guids
 
     def cache_guids(self, rk, guids):
@@ -391,8 +395,9 @@ class State:
             ).rowcount
             auto_n = self.db.execute("DELETE FROM auto_fetch WHERE ts < ?", (auto_cut,)).rowcount
             handled_n = 0
-            # added / already-present / deleted rows decide whether a title is fetched again.
-            # A deleted row stays while anyone still has the title on a watchlist.
+            # added / already-present rows decide whether a title is fetched again, so they
+            # go only once nobody wants the title. Deleted rows are what stop a re-download
+            # (a friend whose list was unreadable this cycle can still want it): never pruned.
             for service in ("sonarr", "radarr"):
                 row = self.db.execute("SELECT v FROM kv WHERE k=?", (f"wants_at_{service}",)).fetchone()
                 try:
@@ -402,7 +407,7 @@ class State:
                 if not fresh:
                     continue
                 handled_n += self.db.execute(
-                    "DELETE FROM handled WHERE service=? AND ts < ? AND NOT EXISTS ("
+                    "DELETE FROM handled WHERE service=? AND ts < ? AND result != 'deleted' AND NOT EXISTS ("
                     "SELECT 1 FROM wants w WHERE w.service=handled.service AND w.ext_id=handled.ext_id)",
                     (service, handled_cut),
                 ).rowcount
@@ -2529,12 +2534,14 @@ def post_ntfy(url, token, title, message, poster):
     topic = [p for p in parts.path.split("/") if p]
     if not topic:
         raise ValueError("bad ntfy url")
+    # JSON publishing goes to the server base, which may sit under a path (https://host/ntfy/topic).
+    base = f"{parts.scheme}://{parts.netloc}" + "".join("/" + p for p in topic[:-1])
     payload = {"topic": topic[-1], "title": title[:200], "message": (message or title)[:1800]}
     if poster:
         payload["attach"] = poster
         payload["icon"] = poster
     headers = {"Authorization": "Bearer " + token} if token else {}
-    return requests.post(f"{parts.scheme}://{parts.netloc}", json=payload, headers=headers, timeout=10)
+    return requests.post(base, json=payload, headers=headers, timeout=10)
 
 
 def post_discord(url, title, message, poster):

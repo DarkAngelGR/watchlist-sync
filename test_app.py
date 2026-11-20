@@ -1911,6 +1911,18 @@ def handled_restore_tests():
 
 handled_restore_tests()
 
+def ntfy_subpath_tests():
+    from unittest.mock import patch as _p
+    with _p.object(app.requests, "post") as post:
+        app.post_ntfy("https://host.lan/ntfy/house", "", "Added: X", "", "")
+        assert post.call_args.args[0] == "https://host.lan/ntfy"
+        assert post.call_args.kwargs["json"]["topic"] == "house"
+        app.post_ntfy("https://ntfy.sh/house", "", "Added: X", "", "")
+        assert post.call_args.args[0] == "https://ntfy.sh"
+    print("ntfy subpath tests OK")
+
+ntfy_subpath_tests()
+
 def auto_fetch_order_tests():
     with tempfile.TemporaryDirectory() as td:
         sy = app.Syncer(td)
@@ -2373,8 +2385,8 @@ def maintenance_tests():
             left_auto = {row[0] for row in st.db.execute("SELECT trigger FROM auto_fetch")}
             assert left_auto == {"week-added", "edge", "pending-new"}, left_auto
             left_ids = {(row[0], row[1]) for row in st.db.execute("SELECT service, ext_id FROM handled")}
-            assert left_ids == {("radarr", 2), ("radarr", 3), ("radarr", 5), ("radarr", 6), ("radarr", 7), ("sonarr", 9)}, left_ids
-            assert counts["guid"] >= 1 and counts["auto_fetch"] == 2 and counts["handled"] == 3
+            assert left_ids == {("radarr", 2), ("radarr", 3), ("radarr", 4), ("radarr", 5), ("radarr", 6), ("radarr", 7), ("sonarr", 9)}, left_ids
+            assert counts["guid"] >= 1 and counts["auto_fetch"] == 2 and counts["handled"] == 2
 
             # A wants refresh older than the freshness window must not look like "everyone removed it".
             st.db.execute("UPDATE kv SET v=? WHERE k='wants_at_radarr'", (str(now - app.WANTS_FRESH_SECONDS - 5),))
@@ -2427,8 +2439,9 @@ def maintenance_tests():
             with patch.object(sy, "collect", collect_ok):
                 sy.run_once()
             assert sy.state.wanters("sonarr", 42) == set()
-            assert st.prune(int(time.time()))["handled"] >= 1
-            assert st.handled_row("sonarr", 42) is None
+            # Its deleted row stays even then: it is what stops a re-download.
+            st.prune(int(time.time()))
+            assert st.handled_row("sonarr", 42) is not None
 
             age_handled("sonarr", 43, "Unreadable", "deleted", old)
             st.set_wants("sonarr", {43: {"users": {"ada"}}})
